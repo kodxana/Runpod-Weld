@@ -10,7 +10,7 @@
 //! Supports USTAR/GNU ordinary entries, local PAX and GNU long names/links.
 //! Sparse, device, global PAX and unknown semantic extensions are rejected.
 //! Link targets are preserved without resolution, including forward/lower-layer links.
-//! Exactly one gzip member is accepted; compressed suffixes are rejected.
+//! RFC 1952 gzip member sequences are accepted; non-member suffixes are rejected.
 //! All decompressed bytes enter diffID. Tar ends with two whole zero blocks.
 //!
 //! Payload transfer uses 64 KiB buffers. Metadata accounting is cumulative:
@@ -20,8 +20,9 @@
 //! headers (including extensions), not just returned entries. Payload sizes are u64,
 //! bounded by max_uncompressed_bytes and checked framing, without an 8 GiB cap.
 //! Container overhead is also bounded by header/record charges. Gzip header bytes
-//! have their own input cap, including optional names/comments. The decoder may
-//! additionally preallocate an extra field of at most 65,535 bytes before reading it.
+//! have an aggregate input cap across all members, including optional names/comments.
+//! Each member costs at least ten header bytes, bounding empty-member floods too.
+//! The decoder may preallocate an extra field of at most 65,535 bytes before reading it.
 //! The decoder also limits each gzip name/comment field to 65,535 bytes.
 //! Reference: https://github.com/opencontainers/image-spec/blob/v1.1.1/layer.md
 //! Dependency API/source review: flate2 1.1.10 (MSRV 1.67), tar 0.4.46 and
@@ -51,7 +52,7 @@ pub struct Limits {
     pub max_entries: usize,
     /// Logical metadata charge described in the module docs, not an RSS limit.
     pub max_metadata_bytes: u64,
-    /// Entire gzip header including its fixed ten bytes and optional header CRC.
+    /// Sum of all gzip headers, including each fixed ten bytes and optional CRC.
     pub max_gzip_header_bytes: u64,
 }
 
@@ -224,7 +225,7 @@ fn spool<R: Read>(
     let mut output = anonymous_spool(dir, |path| fs::remove_file(path))?;
     #[cfg(not(unix))]
     let mut output = tempfile::tempfile_in(dir)?;
-    let guarded = Guarded {
+    let mut guarded = Guarded {
         inner: BufReader::with_capacity(
             BUFFER_SIZE,
             RetryRead {
@@ -233,41 +234,54 @@ fn spool<R: Read>(
             },
         ),
         cancelled,
-        header_remaining: if gzip {
-            Some(limits.max_gzip_header_bytes)
-        } else {
-            None
-        },
+        header_remaining: None,
     };
-    let size = if gzip {
-        let mut decoder = GzDecoder::new(guarded);
-        // Construction consumes only the header, under a byte budget. If parsing
-        // failed, read() reports the decoder's saved error without lifting the cap.
-        if decoder.header().is_some() {
-            decoder.get_mut().header_remaining = None;
-        } else if decoder.get_ref().header_remaining == Some(0) {
-            return Err(Error::Limit("gzip header bytes"));
+    let mut hash = Sha256::new();
+    let mut size = 0;
+    if gzip {
+        let mut header_remaining = limits.max_gzip_header_bytes;
+        loop {
+            check_cancel(cancelled)?;
+            guarded.header_remaining = Some(header_remaining);
+            let mut decoder = GzDecoder::new(guarded);
+            check_cancel(cancelled)?;
+            // Construction consumes only this member's header. Keep the unused
+            // aggregate budget before lifting the cap for its body and trailer.
+            if decoder.header().is_some() {
+                header_remaining = decoder.get_mut().header_remaining.take().unwrap();
+            } else if decoder.get_ref().header_remaining == Some(0) {
+                return Err(Error::Limit("gzip header bytes"));
+            }
+            copy_hash(
+                &mut decoder,
+                &mut output,
+                &mut hash,
+                &mut size,
+                limits.max_uncompressed_bytes,
+                cancelled,
+            )?;
+            // EOF validates this member's CRC/ISIZE. Preserve prefetched bytes
+            // for the next header; any junk or truncated member must fail there.
+            guarded = decoder.into_inner();
+            let end = guarded.fill_buf().map(|bytes| bytes.is_empty());
+            check_cancel(cancelled)?;
+            if end? {
+                break;
+            }
         }
-        let size = copy_hash(
-            &mut decoder,
+    } else {
+        copy_hash(
+            &mut guarded,
             &mut output,
-            diff_id,
+            &mut hash,
+            &mut size,
             limits.max_uncompressed_bytes,
             cancelled,
         )?;
-        if !decoder.into_inner().fill_buf()?.is_empty() {
-            return Err(Error::Invalid("gzip suffix or concatenated members"));
-        }
-        size
-    } else {
-        copy_hash(
-            &mut { guarded },
-            &mut output,
-            diff_id,
-            limits.max_uncompressed_bytes,
-            cancelled,
-        )?
-    };
+    }
+    if format!("{:x}", hash.finalize()) != diff_id.encoded() {
+        return Err(Error::DiffIdMismatch);
+    }
     output.seek(SeekFrom::Start(0))?;
     let entries = inspect(&mut output, size, limits, cancelled)?;
     output.seek(SeekFrom::Start(0))?;
@@ -343,16 +357,15 @@ impl<R: Read, C: Fn() -> bool> Read for Guarded<'_, R, C> {
 fn copy_hash(
     reader: &mut impl Read,
     output: &mut impl Write,
-    expected: &Sha256Digest,
+    hash: &mut Sha256,
+    size: &mut u64,
     max: u64,
     cancelled: &impl Fn() -> bool,
-) -> Result<u64, Error> {
+) -> Result<(), Error> {
     let mut buffer = [0; BUFFER_SIZE];
-    let mut hash = Sha256::new();
-    let mut size = 0;
     loop {
         check_cancel(cancelled)?;
-        let limit = (max - size).min(BUFFER_SIZE as u64 - 1) as usize + 1;
+        let limit = (max - *size).min(BUFFER_SIZE as u64 - 1) as usize + 1;
         let result = reader.read(&mut buffer[..limit]);
         check_cancel(cancelled)?;
         let n = match result {
@@ -362,17 +375,14 @@ fn copy_hash(
         if n == 0 {
             break;
         }
-        if n as u64 > max - size {
+        if n as u64 > max - *size {
             return Err(Error::Limit("uncompressed bytes"));
         }
-        size += n as u64;
+        *size += n as u64;
         hash.update(&buffer[..n]);
         output.write_all(&buffer[..n])?;
     }
-    if format!("{:x}", hash.finalize()) != expected.encoded() {
-        return Err(Error::DiffIdMismatch);
-    }
-    Ok(size)
+    Ok(())
 }
 
 fn charge(total: &mut u64, amount: u64, limits: Limits) -> Result<(), Error> {
@@ -1078,17 +1088,196 @@ mod tests {
         bad_size[n - 4] ^= 1;
         let mut suffix = encoded.clone();
         suffix.push(0);
-        let mut concat = encoded.clone();
-        concat.extend(gzip(&[]));
         for invalid in [
             corrupt,
             bad_size,
             encoded[..n - 1].to_vec(),
             encoded[..n / 2].to_vec(),
             suffix,
-            concat,
         ] {
             assert!(f.verify(&invalid, true, &digest(&bytes), limits()).is_err());
+            f.clean();
+        }
+    }
+    #[test]
+    fn concatenated_gzip_splits_headers_payload_and_padding() {
+        let f = Fixture::new();
+        let bytes = sample();
+        // Boundaries inside the tar header, payload and end padding, plus empty
+        // leading/intermediate/trailing members. No member is a standalone tar.
+        let cuts = [
+            0,
+            17,
+            17,
+            513,
+            BUFFER_SIZE + 29,
+            bytes.len() - 13,
+            bytes.len(),
+        ];
+        let mut encoded = gzip(&[]);
+        for part in cuts.windows(2) {
+            encoded.extend(gzip(&bytes[part[0]..part[1]]));
+        }
+        encoded.extend(gzip(&[]));
+        let mut layer = f.verify(&encoded, true, &digest(&bytes), limits()).unwrap();
+        assert_eq!(layer.diff_id(), &digest(&bytes));
+        assert_eq!(layer.size(), bytes.len() as u64);
+        assert_eq!(layer.entries().len(), 1);
+        assert_eq!(layer.entries()[0].path, b"data");
+        let mut readback = Vec::new();
+        layer.read_to_end(&mut readback).unwrap();
+        assert_eq!(readback, bytes);
+        let input = ShortReads {
+            inner: Cursor::new(&encoded),
+            calls: 0,
+        };
+        assert!(spool(input, true, &digest(&bytes), &f.spool, limits(), &|| false).is_ok());
+        assert!(matches!(
+            f.verify(&encoded, true, &digest(&bytes[..17]), limits()),
+            Err(Error::DiffIdMismatch)
+        ));
+        let mut l = limits();
+        l.max_uncompressed_bytes = bytes.len() as u64 - 1;
+        assert!(matches!(
+            f.verify(&encoded, true, &digest(&bytes), l),
+            Err(Error::Limit("uncompressed bytes"))
+        ));
+        l.max_uncompressed_bytes += 1;
+        assert!(f.verify(&encoded, true, &digest(&bytes), l).is_ok());
+        drop(layer);
+        f.clean();
+    }
+    #[test]
+    fn concatenated_gzip_rejects_later_corruption_truncation_and_junk() {
+        let f = Fixture::new();
+        let bytes = sample();
+        let first = gzip(&bytes[..513]);
+        let later = gzip(&bytes[513..]);
+        for offset in [8, 4] {
+            let mut bad = later.clone();
+            let n = bad.len();
+            bad[n - offset] ^= 1; // CRC and ISIZE independently.
+            assert!(matches!(
+                f.verify(
+                    &[first.as_slice(), &bad].concat(),
+                    true,
+                    &digest(&bytes),
+                    limits()
+                ),
+                Err(Error::Io(_))
+            ));
+        }
+        for cut in [1, 9, 10, later.len() / 2, later.len() - 8, later.len() - 1] {
+            assert!(matches!(
+                f.verify(
+                    &[first.as_slice(), &later[..cut]].concat(),
+                    true,
+                    &digest(&bytes),
+                    limits()
+                ),
+                Err(Error::Io(_))
+            ));
+        }
+        for suffix in [b"\0".as_slice(), b"not a gzip member", b"\x1f\x8b"] {
+            let bad = [first.as_slice(), &later, suffix].concat();
+            assert!(matches!(
+                f.verify(&bad, true, &digest(&bytes), limits()),
+                Err(Error::Io(_))
+            ));
+        }
+        f.clean();
+    }
+    #[test]
+    fn concatenated_gzip_header_budget_is_aggregate_including_empty_members() {
+        let f = Fixture::new();
+        let bytes = sample();
+        let first = gzip(&bytes);
+        let empty = gzip(&[]);
+        let encoded = [first.as_slice(), &empty, &empty].concat();
+        let mut l = limits();
+        for cap in [0, 9, 10, 19, 20, 29] {
+            l.max_gzip_header_bytes = cap;
+            assert!(matches!(
+                f.verify(&encoded, true, &digest(&bytes), l),
+                Err(Error::Limit("gzip header bytes"))
+            ));
+        }
+        l.max_gzip_header_bytes = 30;
+        assert!(f.verify(&encoded, true, &digest(&bytes), l).is_ok());
+        for flag in [8, 16] {
+            let mut huge = empty.clone();
+            huge[3] |= flag; // FNAME or FCOMMENT in a later member.
+            huge.splice(10..10, std::iter::repeat_n(b'x', 5000).chain([0]));
+            assert!(matches!(
+                f.verify(
+                    &[first.as_slice(), &huge].concat(),
+                    true,
+                    &digest(&bytes),
+                    limits()
+                ),
+                Err(Error::Limit("gzip header bytes"))
+            ));
+        }
+        // Each individual header fits 30 bytes, but their sum does not.
+        let mut named = empty;
+        named[3] |= 8;
+        named.splice(10..10, b"long-enough-name\0".iter().copied());
+        assert!(matches!(
+            f.verify(
+                &[first.as_slice(), &named].concat(),
+                true,
+                &digest(&bytes),
+                l
+            ),
+            Err(Error::Limit("gzip header bytes"))
+        ));
+        f.clean();
+    }
+    #[test]
+    fn concatenated_gzip_cancellation_at_every_check() {
+        let f = Fixture::new();
+        let bytes = sample();
+        let mut later = gzip(&bytes[513..]);
+        later[3] |= 8;
+        later.splice(10..10, b"later-name\0".iter().copied());
+        let encoded = [gzip(&bytes[..513]), gzip(&[]), later].concat();
+        let checks = Cell::new(0);
+        let count = || {
+            checks.set(checks.get() + 1);
+            false
+        };
+        drop(
+            spool(
+                encoded.as_slice(),
+                true,
+                &digest(&bytes),
+                &f.spool,
+                limits(),
+                &count,
+            )
+            .unwrap(),
+        );
+        // Sweep headers, empty-member transitions, payload and tar inspection.
+        for stop in 1..=checks.get() {
+            let calls = Cell::new(0);
+            let cancel = || {
+                calls.set(calls.get() + 1);
+                calls.get() >= stop
+            };
+            assert!(
+                matches!(
+                    spool(
+                        encoded.as_slice(),
+                        true,
+                        &digest(&bytes),
+                        &f.spool,
+                        limits(),
+                        &cancel
+                    ),
+                    Err(Error::Cancelled)
+                ),
+                "check {stop}"
+            );
             f.clean();
         }
     }
@@ -1635,7 +1824,8 @@ mod tests {
             copy_hash(
                 &mut Cursor::new(b"abc"),
                 &mut NoSpace,
-                &digest(b"abc"),
+                &mut Sha256::new(),
+                &mut 0,
                 3,
                 &|| false
             ),
@@ -1644,7 +1834,14 @@ mod tests {
         let mut input = Cursor::new(vec![0; BUFFER_SIZE * 2]);
         let mut output = Vec::new();
         assert!(matches!(
-            copy_hash(&mut input, &mut output, &digest(&[]), 10, &|| false),
+            copy_hash(
+                &mut input,
+                &mut output,
+                &mut Sha256::new(),
+                &mut 0,
+                10,
+                &|| false
+            ),
             Err(Error::Limit(_))
         ));
         assert_eq!(input.position(), 11);

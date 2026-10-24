@@ -35,7 +35,7 @@ The internal `oci::BlobStore` supports verified SHA-256 blob ingestion and reads
 
 `image::load_layout` selects an unambiguous Linux/amd64 OCI image from a local layout and verifies its manifest, config and compressed layer blobs within caller-supplied limits. It preserves inherited image configuration. Uncompressed diff IDs are declarations only until layer decompression verifies them; successful metadata loading does not establish a valid or runnable rootfs.
 
-`layer::verify` adds bounded decompression, uncompressed diff-ID verification and a read-only seekable temporary spool with validated entry offsets. It supports USTAR/GNU headers, local PAX metadata, long names, exact fractional timestamps, binary xattrs and unresolved hardlink records. File sizes use checked `u64` bounds; configured byte budgets still apply. It currently accepts one gzip member and rejects global PAX, sparse/special files and unsupported metadata encodings. Verification does not create links or extract a rootfs.
+`layer::verify` adds bounded decompression, uncompressed diff-ID verification and a read-only seekable temporary spool with validated entry offsets. It supports USTAR/GNU headers, local PAX metadata, long names, exact fractional timestamps, binary xattrs and unresolved hardlink records. File sizes use checked `u64` bounds; configured byte budgets still apply. It accepts concatenated gzip members with shared output and aggregate header budgets, and validates every member trailer. Gzip name/comment fields remain limited to 65,535 bytes each. It rejects global PAX, sparse/special files and unsupported metadata encodings. Verification does not create links or extract a rootfs.
 
 ```sh
 cargo fmt --all -- --check
