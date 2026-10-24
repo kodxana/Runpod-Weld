@@ -7,19 +7,19 @@
 //! Success is not a durable cache publication. Blocking I/O needs caller timeouts;
 //! cancellation is cooperative between reads and before returning the capability.
 //!
-//! Narrow format policy: POSIX USTAR regular files, directories and symlinks only.
-//! PAX/GNU extensions (including base-256 numbers), sparse files, hardlinks,
-//! devices and unknown types are rejected. USTAR octal sizes are below 8 GiB.
-//! Symlink text is preserved, including absolute and `..` targets: future extraction
-//! MUST resolve it within the image root. Archive paths themselves cannot escape.
-//! Exactly one gzip member is accepted; any compressed suffix (even zeros or another
-//! member) is rejected. All decompressed bytes, including tar padding, enter diffID.
-//! Tar requires two zero end blocks and only whole zero blocks afterward.
+//! Supports USTAR/GNU ordinary entries, local PAX and GNU long names/links.
+//! Sparse, device, global PAX and unknown semantic extensions are rejected.
+//! Link targets are preserved without resolution, including forward/lower-layer links.
+//! Exactly one gzip member is accepted; compressed suffixes are rejected.
+//! All decompressed bytes enter diffID. Tar ends with two whole zero blocks.
 //!
-//! Payload transfer uses 64 KiB buffers. Metadata is NOT constant-memory: a Vec of
-//! entries plus a duplicate-path set is bounded by `max_entries` and a logical byte
-//! budget charging 512 bytes per header plus twice the canonical path and once the link text.
-//! Allocator/container overhead is additionally O(max_entries). Gzip header bytes
+//! Payload transfer uses 64 KiB buffers. Metadata accounting is cumulative:
+//! every physical header costs 512 bytes; extension payloads cost twice their size,
+//! every PAX record costs 128 bytes, and effective strings are charged before copying.
+//! Overwritten/deleted records are not refunded. max_entries bounds physical nonzero
+//! headers (including extensions), not just returned entries. Payload sizes are u64,
+//! bounded by max_uncompressed_bytes and checked framing, without an 8 GiB cap.
+//! Container overhead is also bounded by header/record charges. Gzip header bytes
 //! have their own input cap, including optional names/comments. The decoder may
 //! additionally preallocate an extra field of at most 65,535 bytes before reading it.
 //! The decoder also limits each gzip name/comment field to 65,535 bytes.
@@ -32,7 +32,7 @@ use crate::oci::{BlobStore, Descriptor, Sha256Digest};
 use flate2::bufread::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     fs::File,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -47,6 +47,7 @@ pub struct Limits {
     pub max_blob_bytes: u64,
     /// Includes headers, payload, entry padding and all tar end padding.
     pub max_uncompressed_bytes: u64,
+    /// Physical nonzero headers, including PAX/GNU extension headers.
     pub max_entries: usize,
     /// Logical metadata charge described in the module docs, not an RSS limit.
     pub max_metadata_bytes: u64,
@@ -97,6 +98,7 @@ pub enum EntryKind {
     File,
     Directory,
     Symlink,
+    Hardlink,
 }
 
 /// Byte paths use POSIX separators and are canonical relative paths; the root
@@ -112,7 +114,33 @@ pub struct Entry {
     pub mode: u32,
     pub uid: u64,
     pub gid: u64,
-    pub mtime: u64,
+    pub mtime: Timestamp,
+    pub atime: Option<Timestamp>,
+    pub ctime: Option<Timestamp>,
+    pub uname: Vec<u8>,
+    pub gname: Vec<u8>,
+    pub xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Supported informational PAX records (currently comment).
+    pub pax_records: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+/// Exact signed decimal seconds. Fraction contains ASCII digits, with trailing
+/// zeros removed; negative applies to the entire magnitude, including -0.fraction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Timestamp {
+    pub negative: bool,
+    pub seconds: u64,
+    pub fraction: Vec<u8>,
+}
+impl Timestamp {
+    fn integer(value: i128) -> Result<Self, Error> {
+        Ok(Self {
+            negative: value < 0,
+            seconds: u64::try_from(value.unsigned_abs())
+                .map_err(|_| Error::Invalid("timestamp overflow"))?,
+            fraction: Vec::new(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -347,155 +375,451 @@ fn copy_hash(
     Ok(size)
 }
 
+fn charge(total: &mut u64, amount: u64, limits: Limits) -> Result<(), Error> {
+    *total = total
+        .checked_add(amount)
+        .filter(|n| *n <= limits.max_metadata_bytes)
+        .ok_or(Error::Limit("metadata bytes"))?;
+    Ok(())
+}
+
+// Decode every byte, including the sign bit below the base-256 marker. Never
+// truncate a wide field to the low eight bytes as some convenience APIs do.
+fn number(field: &[u8]) -> Result<i128, Error> {
+    if field.first().is_some_and(|b| b & 0x80 != 0) {
+        let mut n = if field[0] & 0x40 != 0 { -1i128 } else { 0 };
+        for (i, byte) in field.iter().enumerate() {
+            let (base, digit) = if i == 0 {
+                (128, byte & 0x7f)
+            } else {
+                (256, *byte)
+            };
+            n = n
+                .checked_mul(base)
+                .and_then(|n| n.checked_add(digit as i128))
+                .ok_or(Error::Invalid("base-256 overflow"))?;
+        }
+        return Ok(n);
+    }
+    let mut n = 0i128;
+    let mut digits = false;
+    let mut ended = false;
+    for &b in field {
+        match b {
+            b'0'..=b'7' if !ended => {
+                digits = true;
+                n = n
+                    .checked_mul(8)
+                    .and_then(|n| n.checked_add((b - b'0') as i128))
+                    .ok_or(Error::Invalid("octal overflow"))?;
+            }
+            0 => ended = true,
+            b' ' => {
+                if digits {
+                    ended = true;
+                }
+            }
+            _ => return Err(Error::Invalid("non-octal or ambiguous tar numeric field")),
+        }
+    }
+    Ok(n)
+}
+fn unsigned(field: &[u8]) -> Result<u64, Error> {
+    u64::try_from(number(field)?).map_err(|_| Error::Invalid("negative or overflowing tar number"))
+}
+fn decimal(bytes: &[u8]) -> Result<u64, Error> {
+    if bytes.is_empty() {
+        return Err(Error::Invalid("empty decimal"));
+    }
+    bytes.iter().try_fold(0u64, |n, b| {
+        if !b.is_ascii_digit() {
+            return Err(Error::Invalid("invalid decimal"));
+        }
+        n.checked_mul(10)
+            .and_then(|n| n.checked_add((b - b'0') as u64))
+            .ok_or(Error::Invalid("decimal overflow"))
+    })
+}
+fn timestamp(bytes: &[u8]) -> Result<Timestamp, Error> {
+    let negative = bytes.starts_with(b"-");
+    let bytes = if negative { &bytes[1..] } else { bytes };
+    let dot = bytes.iter().position(|b| *b == b'.');
+    let (whole, fraction) = match dot {
+        Some(i) => (&bytes[..i], &bytes[i + 1..]),
+        None => (bytes, &b""[..]),
+    };
+    if dot.is_some() && fraction.is_empty() || !fraction.iter().all(u8::is_ascii_digit) {
+        return Err(Error::Invalid("invalid timestamp fraction"));
+    }
+    let seconds = decimal(whole)?;
+    let end = fraction
+        .iter()
+        .rposition(|b| *b != b'0')
+        .map_or(0, |i| i + 1);
+    Ok(Timestamp {
+        negative: negative && (seconds != 0 || end != 0),
+        seconds,
+        fraction: fraction[..end].to_vec(),
+    })
+}
+fn string(field: &[u8]) -> Result<&[u8], Error> {
+    let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    if field[end..].iter().any(|b| *b != 0) {
+        return Err(Error::Invalid("nonzero bytes after tar string terminator"));
+    }
+    Ok(&field[..end])
+}
+fn framing(offset: u64, length: u64, size: u64) -> Result<(u64, u64), Error> {
+    let end = offset
+        .checked_add(length)
+        .ok_or(Error::Invalid("tar size overflow"))?;
+    let next = end
+        .checked_add((512 - length % 512) % 512)
+        .filter(|n| *n <= size)
+        .ok_or(Error::Invalid("truncated tar payload"))?;
+    Ok((end, next))
+}
+fn pax(
+    payload: &[u8],
+    records: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    metadata: &mut u64,
+    limits: Limits,
+) -> Result<(), Error> {
+    let mut rest = payload;
+    while !rest.is_empty() {
+        charge(metadata, 128, limits)?;
+        let space = rest
+            .iter()
+            .position(|b| *b == b' ')
+            .ok_or(Error::Invalid("PAX record length"))?;
+        let len = usize::try_from(decimal(&rest[..space])?)
+            .map_err(|_| Error::Invalid("PAX length overflow"))?;
+        if len <= space + 2 || len > rest.len() || rest[len - 1] != b'\n' {
+            return Err(Error::Invalid("PAX record framing"));
+        }
+        let record = &rest[space + 1..len - 1];
+        let eq = record
+            .iter()
+            .position(|b| *b == b'=')
+            .ok_or(Error::Invalid("PAX assignment"))?;
+        let (key, value) = (&record[..eq], &record[eq + 1..]);
+        if key.is_empty() || key.iter().any(|b| matches!(b, 0 | b'\n')) {
+            return Err(Error::Invalid("PAX key"));
+        }
+        if key.starts_with(b"GNU.sparse.") || matches!(key, b"SCHILY.realsize" | b"SUN.holesdata") {
+            return Err(Error::Invalid("sparse PAX extension"));
+        }
+        if let Some(name) = key.strip_prefix(b"SCHILY.xattr.") {
+            if name.is_empty() {
+                return Err(Error::Invalid("empty xattr name"));
+            }
+        } else if !matches!(
+            key,
+            b"path"
+                | b"linkpath"
+                | b"size"
+                | b"uid"
+                | b"gid"
+                | b"mtime"
+                | b"atime"
+                | b"ctime"
+                | b"uname"
+                | b"gname"
+                | b"comment"
+        ) {
+            return Err(Error::Invalid("unsupported PAX key or xattr encoding"));
+        }
+        // Empty values delete an earlier override, restoring the raw-header value.
+        // For xattrs/informational records they remove the attribute entirely.
+        if value.is_empty() {
+            records.remove(key);
+        } else {
+            records.insert(key.to_vec(), value.to_vec());
+        }
+        rest = &rest[len..];
+    }
+    Ok(())
+}
+fn effective<'a>(
+    raw: &'a [u8],
+    pax: Option<&'a Vec<u8>>,
+    gnu: Option<&'a Vec<u8>>,
+) -> Result<&'a [u8], Error> {
+    if let (Some(p), Some(g)) = (pax, gnu)
+        && p != g
+    {
+        return Err(Error::Invalid("conflicting PAX and GNU text"));
+    }
+    Ok(pax.or(gnu).map_or(raw, Vec::as_slice))
+}
+
 fn inspect(
     file: &mut File,
     size: u64,
     limits: Limits,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<Entry>, Error> {
+    if size > limits.max_uncompressed_bytes {
+        return Err(Error::Limit("uncompressed bytes"));
+    }
     let mut entries = Vec::new();
     let mut paths = BTreeSet::new();
-    let mut metadata = 0u64;
+    let mut metadata = 0;
+    let mut headers = 0usize;
     let mut offset = 0u64;
-    let mut ended = false;
     let mut zero_blocks = 0u64;
+    let mut pending = false;
+    let mut records = BTreeMap::new();
+    let mut long_name = None;
+    let mut long_link = None;
     while offset < size {
         check_cancel(cancelled)?;
+        offset = offset
+            .checked_add(512)
+            .filter(|n| *n <= size)
+            .ok_or(Error::Invalid("partial tar block"))?;
         let mut block = [0u8; 512];
         file.read_exact(&mut block)?;
-        offset += 512;
         if block == [0; 512] {
-            ended = true;
             zero_blocks += 1;
             continue;
         }
-        if ended {
+        if zero_blocks != 0 {
             return Err(Error::Invalid("nonzero data after tar end marker"));
         }
-        if entries.len() >= limits.max_entries {
+        if headers >= limits.max_entries {
             return Err(Error::Limit("entry count"));
         }
-        let header = tar::Header::from_byte_slice(&block);
-        if &block[257..263] != b"ustar\0" || &block[263..265] != b"00" {
-            return Err(Error::Invalid("only POSIX USTAR headers are supported"));
-        }
-        let checksum: u32 = block
+        headers += 1;
+        charge(&mut metadata, 512, limits)?;
+        let checksum: u64 = block
             .iter()
             .enumerate()
             .map(|(i, b)| {
                 if (148..156).contains(&i) {
                     32
                 } else {
-                    *b as u32
+                    *b as u64
                 }
             })
             .sum();
-        if header.cksum()? != checksum {
+        if unsigned(&block[148..156])? != checksum {
             return Err(Error::Invalid("tar header checksum"));
         }
-        // Reject binary numeric extensions: the tar crate's u64 accessor can
-        // discard high bytes of a wider base-256 field. Also reject hidden tails.
-        for range in [100..108, 108..116, 116..124, 124..136, 136..148, 148..156] {
-            let field = &block[range];
-            if !matches!(field.last(), Some(0 | b' '))
-                || field.iter().any(|b| !matches!(b, b'0'..=b'7' | b' ' | 0))
-                || field
-                    .iter()
-                    .position(|b| *b == 0)
-                    .is_some_and(|nul| field[nul..].iter().any(|b| !matches!(b, 0 | b' ')))
-            {
-                return Err(Error::Invalid("non-octal or ambiguous tar numeric field"));
+        let gnu = &block[257..265] == b"ustar  \0";
+        if !gnu && &block[257..265] != b"ustar\x0000" {
+            return Err(Error::Invalid("unsupported tar header format"));
+        }
+        let raw_size = unsigned(&block[124..136])?;
+        let flag = block[156];
+        if flag == b'S' {
+            return Err(Error::Invalid("GNU sparse entry"));
+        }
+        if gnu {
+            if block[369..].iter().any(|b| *b != 0) {
+                return Err(Error::Invalid("GNU sparse or reserved fields"));
             }
-        }
-        if block[329..345]
-            .iter()
-            .any(|b| !matches!(b, 0 | b'0' | b' '))
-        {
-            return Err(Error::Invalid("device numbers on unsupported entry"));
-        }
-        // Reject hidden string suffixes rather than letting different readers
-        // interpret different paths. USTAR has no extensions in its reserved tail.
-        for range in [0..100, 157..257, 265..297, 297..329, 345..500] {
-            let field = &block[range];
-            if let Some(nul) = field.iter().position(|b| *b == 0)
-                && field[nul..].iter().any(|b| *b != 0)
-            {
-                return Err(Error::Invalid(
-                    "nonzero bytes after USTAR string terminator",
-                ));
-            }
-        }
-        if block[500..].iter().any(|b| *b != 0) {
+        } else if block[500..].iter().any(|b| *b != 0) {
             return Err(Error::Invalid("USTAR reserved bytes"));
         }
-        let kind = match header.entry_type().as_byte() {
-            0 | b'0' => EntryKind::File,
-            b'5' => EntryKind::Directory,
-            b'2' => EntryKind::Symlink,
-            _ => {
+        if matches!(flag, b'x' | b'g' | b'L' | b'K') {
+            if flag == b'g' {
                 return Err(Error::Invalid(
-                    "tar entry type (extensions, sparse, hardlinks and special files unsupported)",
+                    "global PAX unsupported (including semantic fields)",
                 ));
             }
+            let (end, next) = framing(offset, raw_size, size)?;
+            charge(
+                &mut metadata,
+                raw_size
+                    .checked_mul(2)
+                    .ok_or(Error::Limit("metadata bytes"))?,
+                limits,
+            )?;
+            let len =
+                usize::try_from(raw_size).map_err(|_| Error::Limit("extension allocation"))?;
+            let mut payload = vec![0; len];
+            file.read_exact(&mut payload)?;
+            if flag == b'x' {
+                pax(&payload, &mut records, &mut metadata, limits)?;
+            } else {
+                let text = string(&payload)?;
+                if text.is_empty() {
+                    return Err(Error::Invalid("empty GNU long text"));
+                }
+                let target = if flag == b'L' {
+                    &mut long_name
+                } else {
+                    &mut long_link
+                };
+                *target = Some(text.to_vec());
+            }
+            pending = true;
+            check_padding(file, end, next)?;
+            offset = next;
+            continue;
+        }
+        let kind = match flag {
+            0 | b'0' => EntryKind::File,
+            b'1' => EntryKind::Hardlink,
+            b'2' => EntryKind::Symlink,
+            b'5' => EntryKind::Directory,
+            _ => return Err(Error::Invalid("unsupported tar entry type")),
         };
-        let length = header.size()?;
-        if kind != EntryKind::File && length != 0 {
+        let mut length = records
+            .get(b"size".as_slice())
+            .map_or(Ok(raw_size), |v| decimal(v))?;
+        if kind == EntryKind::Hardlink {
+            length = 0;
+        } else if kind != EntryKind::File && length != 0 {
             return Err(Error::Invalid("payload on non-regular entry"));
         }
-        let path = canonical_path(&header.path_bytes(), kind)?;
-        let link = header.link_name_bytes().map(|s| s.into_owned());
-        if (kind == EntryKind::Symlink) != link.as_ref().is_some_and(|s| !s.is_empty()) {
+        let (end, next) = framing(offset, length, size)?;
+        let raw_name = string(&block[..100])?;
+        let prefix = if gnu {
+            &b""[..]
+        } else {
+            string(&block[345..500])?
+        };
+        charge(
+            &mut metadata,
+            (raw_name.len() + prefix.len() + 1) as u64,
+            limits,
+        )?;
+        let mut raw_path = Vec::new();
+        if !prefix.is_empty() {
+            raw_path.extend_from_slice(prefix);
+            raw_path.push(b'/');
+        }
+        raw_path.extend_from_slice(raw_name);
+        let name = effective(
+            &raw_path,
+            records.get(b"path".as_slice()),
+            long_name.as_ref(),
+        )?;
+        let link = effective(
+            string(&block[157..257])?,
+            records.get(b"linkpath".as_slice()),
+            long_link.as_ref(),
+        )?;
+        charge(
+            &mut metadata,
+            (name.len() as u64)
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(link.len() as u64))
+                .ok_or(Error::Limit("metadata bytes"))?,
+            limits,
+        )?;
+        let path = canonical_path(name, kind)?;
+        if link.contains(&0)
+            || matches!(kind, EntryKind::Symlink | EntryKind::Hardlink) != !link.is_empty()
+        {
             return Err(Error::Invalid(
-                "missing symlink target or link text on non-symlink",
+                "missing link target or link text on non-link",
             ));
         }
         validate_whiteout(&path, kind, length)?;
-        let charge = 512 + 2 * path.len() as u64 + link.as_ref().map_or(0, |s| s.len() as u64);
-        metadata = metadata
-            .checked_add(charge)
-            .ok_or(Error::Limit("metadata bytes"))?;
-        if metadata > limits.max_metadata_bytes {
-            return Err(Error::Limit("metadata bytes"));
-        }
         if !paths.insert(path.clone()) {
             return Err(Error::Invalid("duplicate normalized tar path"));
         }
-        let entry = Entry {
+        let mode = u32::try_from(unsigned(&block[100..108])?)
+            .map_err(|_| Error::Invalid("mode overflow"))?;
+        if mode > 0o7777 {
+            return Err(Error::Invalid("unsupported tar mode bits"));
+        }
+        if unsigned(&block[329..337])? != 0 || unsigned(&block[337..345])? != 0 {
+            return Err(Error::Invalid("device numbers on unsupported entry"));
+        }
+        let uid = records
+            .get(b"uid".as_slice())
+            .map_or_else(|| unsigned(&block[108..116]), |v| decimal(v))?;
+        let gid = records
+            .get(b"gid".as_slice())
+            .map_or_else(|| unsigned(&block[116..124]), |v| decimal(v))?;
+        // Decimal fractions and xattr names are copied into the public metadata.
+        for (key, value) in &records {
+            if matches!(key.as_slice(), b"mtime" | b"atime" | b"ctime") {
+                charge(&mut metadata, value.len() as u64, limits)?;
+            }
+            if let Some(name) = key.strip_prefix(b"SCHILY.xattr.") {
+                charge(&mut metadata, name.len() as u64, limits)?;
+            }
+        }
+        let mtime = records.get(b"mtime".as_slice()).map_or_else(
+            || Timestamp::integer(number(&block[136..148])?),
+            |v| timestamp(v),
+        )?;
+        let time =
+            |key: &[u8], range: std::ops::Range<usize>| -> Result<Option<Timestamp>, Error> {
+                if let Some(v) = records.get(key) {
+                    return timestamp(v).map(Some);
+                }
+                if gnu {
+                    return Timestamp::integer(number(&block[range])?).map(Some);
+                }
+                Ok(None)
+            };
+        let atime = time(b"atime", 345..357)?;
+        let ctime = time(b"ctime", 357..369)?;
+        let uname = records
+            .get(b"uname".as_slice())
+            .map_or(string(&block[265..297])?, Vec::as_slice);
+        let gname = records
+            .get(b"gname".as_slice())
+            .map_or(string(&block[297..329])?, Vec::as_slice);
+        charge(&mut metadata, (uname.len() + gname.len()) as u64, limits)?;
+        let mut entry = Entry {
             path,
-            link_target: link,
+            link_target: if link.is_empty() {
+                None
+            } else {
+                Some(link.to_vec())
+            },
             kind,
             data_offset: offset,
             size: length,
-            mode: header.mode()?,
-            uid: header.uid()?,
-            gid: header.gid()?,
-            mtime: header.mtime()?,
+            mode,
+            uid,
+            gid,
+            mtime,
+            atime,
+            ctime,
+            uname: uname.to_vec(),
+            gname: gname.to_vec(),
+            xattrs: BTreeMap::new(),
+            pax_records: BTreeMap::new(),
         };
-        if entry.mode > 0o7777 {
-            return Err(Error::Invalid("unsupported tar mode bits"));
+        for (key, value) in std::mem::take(&mut records) {
+            if let Some(name) = key.strip_prefix(b"SCHILY.xattr.") {
+                entry.xattrs.insert(name.to_vec(), value);
+            } else if key == b"comment" {
+                entry.pax_records.insert(key, value);
+            }
         }
-        let padded = length
-            .checked_add(511)
-            .map(|v| v / 512 * 512)
-            .ok_or(Error::Invalid("tar size overflow"))?;
-        let next = offset
-            .checked_add(padded)
-            .filter(|v| *v <= size)
-            .ok_or(Error::Invalid("truncated tar payload"))?;
-        // Payload was already streamed and hashed. Seek over it, but check padding.
-        file.seek(SeekFrom::Start(offset + length))?;
-        let padding = (padded - length) as usize;
-        file.read_exact(&mut block[..padding])?;
-        if block[..padding].iter().any(|b| *b != 0) {
-            return Err(Error::Invalid("nonzero tar entry padding"));
-        }
+        long_name = None;
+        long_link = None;
+        pending = false;
+        check_padding(file, end, next)?;
         offset = next;
         entries.push(entry);
+    }
+    if pending {
+        return Err(Error::Invalid("dangling tar extensions"));
     }
     if zero_blocks < 2 {
         return Err(Error::Invalid("missing two-block tar end marker"));
     }
     Ok(entries)
+}
+fn check_padding(file: &mut File, end: u64, next: u64) -> Result<(), Error> {
+    file.seek(SeekFrom::Start(end))?;
+    let mut padding = [0; 512];
+    let len = (next - end) as usize;
+    file.read_exact(&mut padding[..len])?;
+    if padding[..len].iter().any(|b| *b != 0) {
+        return Err(Error::Invalid("nonzero tar entry padding"));
+    }
+    Ok(())
 }
 
 fn canonical_path(raw: &[u8], kind: EntryKind) -> Result<Vec<u8>, Error> {
@@ -719,7 +1043,7 @@ mod tests {
             assert_eq!(layer.size(), bytes.len() as u64);
             let entry = &layer.entries()[0];
             assert_eq!(
-                (&entry.path[..], entry.uid, entry.gid, entry.mtime),
+                (&entry.path[..], entry.uid, entry.gid, entry.mtime.seconds),
                 (&b"data"[..], 123, 456, 789)
             );
             let offset = entry.data_offset;
@@ -956,6 +1280,262 @@ mod tests {
         assert!(f.verify(&bytes, false, &digest(&bytes), limits()).is_err());
         f.clean();
     }
+    fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let body = [key, b"=", value, b"\n"].concat();
+        let mut len = body.len() + 2;
+        loop {
+            let next = len.to_string().len() + 1 + body.len();
+            if next == len {
+                break;
+            }
+            len = next;
+        }
+        [format!("{len} ").as_bytes(), &body].concat()
+    }
+    fn extension(kind: u8, payload: Vec<u8>) -> (tar::Header, Vec<u8>) {
+        (
+            header("extension", kind, payload.len() as u64, None),
+            payload,
+        )
+    }
+    fn binary(field: &mut [u8], value: u64) {
+        field.fill(0);
+        let len = field.len();
+        field[len - 8..].copy_from_slice(&value.to_be_bytes());
+        field[0] |= 0x80;
+    }
+    #[test]
+    fn pax_size_overrides_only_ordinary_entry_and_preserves_sentinel() {
+        let f = Fixture::new();
+        let bytes = archive(vec![
+            extension(b'x', pax_record(b"size", b"513")),
+            extension(b'x', pax_record(b"uid", b"999")),
+            (header("overridden", b'0', 0, None), vec![7; 513]),
+            (header("sentinel", b'0', 1, None), vec![42]),
+        ]);
+        let mut layer = f.verify(&bytes, false, &digest(&bytes), limits()).unwrap();
+        assert_eq!(layer.entries()[0].size, 513);
+        assert_eq!(layer.entries()[0].uid, 999);
+        assert_eq!(layer.entries()[1].path, b"sentinel");
+        let offset = layer.entries()[1].data_offset;
+        layer.seek(SeekFrom::Start(offset)).unwrap();
+        let mut one = [0];
+        layer.read_exact(&mut one).unwrap();
+        assert_eq!(one, [42]);
+    }
+    #[test]
+    fn pax_binary_xattrs_exact_signed_times_and_deletion() {
+        let f = Fixture::new();
+        let payload = [
+            pax_record(b"SCHILY.xattr.user.bin", b"a\n\0=b"),
+            pax_record(b"SCHILY.xattr.user.removed", b"value"),
+            pax_record(b"SCHILY.xattr.user.removed", b""),
+            pax_record(b"path", b"old"),
+            pax_record(b"path", b"new"),
+            pax_record(b"uid", b"555"),
+            pax_record(b"uid", b""),
+            pax_record(b"mtime", b"-0.000000000123400"),
+        ]
+        .concat();
+        let bytes = archive(vec![
+            extension(b'x', payload),
+            (header("raw", b'0', 0, None), vec![]),
+        ]);
+        let layer = f.verify(&bytes, false, &digest(&bytes), limits()).unwrap();
+        let e = &layer.entries()[0];
+        assert_eq!(e.path, b"new");
+        assert_eq!(e.uid, 123);
+        assert_eq!(e.xattrs.get(b"user.bin".as_slice()).unwrap(), b"a\n\0=b");
+        assert_eq!(e.xattrs.len(), 1);
+        assert_eq!(
+            e.mtime,
+            Timestamp {
+                negative: true,
+                seconds: 0,
+                fraction: b"0000000001234".to_vec()
+            }
+        );
+        assert_eq!(timestamp(b"-12.5").unwrap().seconds, 12);
+        assert_eq!(timestamp(b"0.000").unwrap(), Timestamp::integer(0).unwrap());
+    }
+    #[test]
+    fn gnu_layout_long_records_and_hardlinks_preserve_targets() {
+        let f = Fixture::new();
+        let mut h = tar::Header::new_gnu();
+        h.set_path("short").unwrap();
+        h.set_size(999);
+        h.set_mode(0o644);
+        h.set_uid(1);
+        h.set_gid(2);
+        h.set_mtime(3);
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_link_name("rawtarget").unwrap();
+        h.as_mut_bytes()[345..357].copy_from_slice(b"00000000004\0");
+        h.as_mut_bytes()[357..369].copy_from_slice(b"00000000005\0");
+        h.set_cksum();
+        let name = vec![b'n'; 300];
+        let target = b"lower/or/forward";
+        let bytes = archive(vec![
+            extension(b'L', [name.as_slice(), b"\0"].concat()),
+            extension(b'K', [target.as_slice(), b"\0"].concat()),
+            (h, vec![]),
+            (header("sentinel", b'0', 0, None), vec![]),
+        ]);
+        let layer = f.verify(&bytes, false, &digest(&bytes), limits()).unwrap();
+        let e = &layer.entries()[0];
+        assert_eq!(e.kind, EntryKind::Hardlink);
+        assert_eq!(e.size, 0);
+        assert_eq!(e.path, name);
+        assert_eq!(e.link_target.as_deref(), Some(target.as_slice()));
+        assert_eq!(e.atime.as_ref().unwrap().seconds, 4);
+        assert_eq!(e.ctime.as_ref().unwrap().seconds, 5);
+        assert_eq!(layer.entries()[1].path, b"sentinel");
+    }
+    #[test]
+    fn mixed_extensions_agree_or_fail_and_effective_paths_are_validated() {
+        let f = Fixture::new();
+        for (gnu, pax_path, good) in [
+            ("same", "same", true),
+            ("first", "second", false),
+            ("../bad", "../bad", false),
+            (".wh.bad", ".wh.bad", false),
+        ] {
+            let bytes = archive(vec![
+                extension(b'L', [gnu.as_bytes(), b"\0"].concat()),
+                extension(b'x', pax_record(b"path", pax_path.as_bytes())),
+                (header("raw", b'0', 1, None), vec![1]),
+            ]);
+            assert_eq!(
+                f.verify(&bytes, false, &digest(&bytes), limits()).is_ok(),
+                good
+            );
+        }
+        let bytes = archive(vec![
+            (header("same", b'0', 0, None), vec![]),
+            extension(b'x', pax_record(b"path", b"./same")),
+            (header("different", b'0', 0, None), vec![]),
+        ]);
+        assert!(matches!(
+            f.verify(&bytes, false, &digest(&bytes), limits()),
+            Err(Error::Invalid("duplicate normalized tar path"))
+        ));
+    }
+    #[test]
+    fn base256_checks_entire_field_and_signed_time() {
+        assert_eq!(number(&[0xff; 12]).unwrap(), -1);
+        assert_eq!(number(&[0xff; 17]).unwrap(), -1);
+        let mut huge = [0u8; 17];
+        huge[0] = 0x81;
+        assert!(matches!(
+            number(&huge),
+            Err(Error::Invalid("base-256 overflow"))
+        ));
+        let mut high = [0u8; 12];
+        high[0] = 0x80;
+        high[1] = 1;
+        assert!(unsigned(&high).is_err());
+        let f = Fixture::new();
+        let mut h = header("binary", b'0', 0, None);
+        binary(&mut h.as_mut_bytes()[108..116], 1u64 << 40);
+        h.as_mut_bytes()[136..148].fill(0xff);
+        h.set_cksum();
+        let bytes = archive(vec![(h, vec![])]);
+        let layer = f.verify(&bytes, false, &digest(&bytes), limits()).unwrap();
+        assert_eq!(layer.entries()[0].uid, 1u64 << 40);
+        assert_eq!(layer.entries()[0].mtime, Timestamp::integer(-1).unwrap());
+        let mut h = header("bad", b'0', 0, None);
+        h.as_mut_bytes()[124..136].copy_from_slice(&high);
+        h.set_cksum();
+        let bytes = archive(vec![(h, vec![])]);
+        assert!(f.verify(&bytes, false, &digest(&bytes), limits()).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn inspect_large_sparse_backing_file_without_hashing_payload() {
+        // Tests framing only. verify() still reads/hashes every byte; this sparse
+        // backing file is not a sparse tar entry and does not mint VerifiedLayer.
+        let mut file = tempfile::tempfile().unwrap();
+        let length = (1u64 << 33) + 513;
+        let mut h = header("large", b'0', 0, None);
+        binary(&mut h.as_mut_bytes()[124..136], length);
+        h.set_cksum();
+        file.write_all(h.as_bytes()).unwrap();
+        let next = 512 + length.div_ceil(512) * 512;
+        file.seek(SeekFrom::Start(next)).unwrap();
+        file.write_all(header("sentinel", b'0', 0, None).as_bytes())
+            .unwrap();
+        file.write_all(&[0; 1024]).unwrap();
+        file.rewind().unwrap();
+        let size = next + 1536;
+        let mut l = limits();
+        l.max_uncompressed_bytes = size;
+        let entries = inspect(&mut file, size, l, &|| false).unwrap();
+        assert_eq!(entries[0].size, length);
+        assert_eq!(entries[1].path, b"sentinel");
+        assert_eq!(entries[1].data_offset, next + 512);
+    }
+    #[test]
+    fn extensions_are_bounded_even_when_overwritten_and_reject_semantic_loss() {
+        let f = Fixture::new();
+        let repeated = [
+            pax_record(b"comment", b"a"),
+            pax_record(b"comment", b"b"),
+            pax_record(b"comment", b""),
+        ]
+        .concat();
+        let bytes = archive(vec![
+            extension(b'x', repeated.clone()),
+            (header("raw", b'0', 0, None), vec![]),
+        ]);
+        let mut l = limits();
+        l.max_metadata_bytes = 512 + repeated.len() as u64 * 2 + 128 * 2;
+        assert!(matches!(
+            f.verify(&bytes, false, &digest(&bytes), l),
+            Err(Error::Limit("metadata bytes"))
+        ));
+        l = limits();
+        l.max_entries = 1;
+        assert!(matches!(
+            f.verify(&bytes, false, &digest(&bytes), l),
+            Err(Error::Limit("entry count"))
+        ));
+        for key in [
+            b"GNU.sparse.size".as_slice(),
+            b"SCHILY.realsize",
+            b"SUN.holesdata",
+            b"LIBARCHIVE.xattr.user.foo",
+            b"SCHILY.acl.access",
+            b"unknown",
+        ] {
+            let bytes = archive(vec![
+                extension(b'x', pax_record(key, b"1")),
+                (header("raw", b'0', 0, None), vec![]),
+            ]);
+            assert!(f.verify(&bytes, false, &digest(&bytes), limits()).is_err());
+        }
+        for kind in [b'x', b'g', b'L', b'K'] {
+            let payload = if kind == b'x' || kind == b'g' {
+                pax_record(b"uid", b"1")
+            } else {
+                b"text\0".to_vec()
+            };
+            let bytes = archive(vec![extension(kind, payload)]);
+            assert!(f.verify(&bytes, false, &digest(&bytes), limits()).is_err());
+        }
+        for payload in [
+            b"99 path=a\n".as_slice(),
+            b"9 path=a!",
+            b"0 path=a\n",
+            b"12 path=a\n",
+        ] {
+            let bytes = archive(vec![
+                extension(b'x', payload.to_vec()),
+                (header("raw", b'0', 0, None), vec![]),
+            ]);
+            assert!(f.verify(&bytes, false, &digest(&bytes), limits()).is_err());
+        }
+    }
+
     struct ShortReads<R> {
         inner: R,
         calls: usize,

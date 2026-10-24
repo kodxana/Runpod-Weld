@@ -1,0 +1,238 @@
+{
+  "producer": "CPython 3.12.3 stdlib tarfile (PAX_FORMAT/GNU_FORMAT/USTAR_FORMAT); explicit byte mutations for adversarial cases",
+  "fixtures": {
+    "pax": {
+      "bytes": 10240,
+      "sha256": "ccfa4934ed51b616fa436ec0bace66dc78e1b953596207187de36252c4fe6bf3",
+      "expected": [
+        {
+          "path": "deep/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+          "link": "",
+          "kind": "0",
+          "size": 11,
+          "uid": 1099511627776,
+          "gid": 1099511627783,
+          "mtime": "789",
+          "pax": {
+            "mtime": "-1.250000001"
+          }
+        },
+        {
+          "path": "symlink",
+          "link": "../tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+          "kind": "2",
+          "size": 0,
+          "uid": 123,
+          "gid": 456,
+          "mtime": "789",
+          "pax": {
+            "mtime": "-0.000000001"
+          }
+        },
+        {
+          "path": "sentinel",
+          "link": "",
+          "kind": "0",
+          "size": 8,
+          "uid": 123,
+          "gid": 456,
+          "mtime": "789",
+          "pax": {}
+        }
+      ]
+    },
+    "gnu": {
+      "bytes": 10240,
+      "sha256": "39cb5c7b1360fe1f5ae57bc97a83258c5ae14d28c045b725879134cb18c55c53",
+      "expected": [
+        {
+          "path": "ordinary",
+          "link": "",
+          "kind": "0",
+          "size": 3,
+          "uid": 123,
+          "gid": 456,
+          "mtime": "-2",
+          "pax": {}
+        },
+        {
+          "path": "deep/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+          "link": "",
+          "kind": "0",
+          "size": 4,
+          "uid": 1099511627776,
+          "gid": 1099511627783,
+          "mtime": "789",
+          "pax": {}
+        },
+        {
+          "path": "symlink",
+          "link": "../tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+          "kind": "2",
+          "size": 0,
+          "uid": 123,
+          "gid": 456,
+          "mtime": "789",
+          "pax": {}
+        },
+        {
+          "path": "sentinel",
+          "link": "",
+          "kind": "0",
+          "size": 8,
+          "uid": 123,
+          "gid": 456,
+          "mtime": "789",
+          "pax": {}
+        }
+      ]
+    },
+    "hardlinks": {
+      "bytes": 10240,
+      "sha256": "acb7960c87d40f99a5ab28f690d2ac7ff65d482ee1dfa997b725b2f5c44901c4",
+      "expected": [
+        {
+          "path": "forward",
+          "link": "later",
+          "kind": "1",
+          "size": 0,
+          "uid": 123,
+          "gid": 456,
+          "mtime": "789",
+          "pax": {}
+        },
+        {
+          "path": "lower",
+          "link": "lower-layer/file",
+          "kind": "1",
+          "size": 0,
+          "uid": 123,
+          "gid": 456,
+          "mtime": "789",
+          "pax": {}
+        },
+        {
+          "path": "later",
+          "link": "",
+          "kind": "0",
+          "size": 6,
+          "uid": 123,
+          "gid": 456,
+          "mtime": "789",
+          "pax": {}
+        },
+        {
+          "path": "backward",
+          "link": "later",
+          "kind": "1",
+          "size": 0,
+          "uid": 123,
+          "gid": 456,
+          "mtime": "789",
+          "pax": {}
+        }
+      ]
+    },
+    "pax-size": {
+      "bytes": 4608,
+      "sha256": "1600c67181434a0c6ba28057419eb19fbec3eb5e57765036b0d650dac4dd1558",
+      "expected": {
+        "effective": {
+          "raw_size": 1,
+          "size": 513,
+          "data_offset": 1536
+        },
+        "sentinel_offset": 3072
+      }
+    },
+    "pax-binary-xattr": {
+      "bytes": 3072,
+      "sha256": "2e4e886647f5b7b3f558506e810d687d15d810ffda204bd12883ebae661c198c",
+      "expected": {
+        "xattr_name": "user.binary",
+        "xattr_value_hex": "6c696e65310a6c696e6532006b65793d76616c7565ff",
+        "path": "sentinel"
+      }
+    },
+    "bad-pax-zero": {
+      "bytes": 3072,
+      "sha256": "5705c4c1d44236fccaa9924d2d2532f7100502fda232f2f612b309045be2c62e",
+      "expected": "reject malformed PAX record"
+    },
+    "bad-pax-short": {
+      "bytes": 3072,
+      "sha256": "aadbcb49225011615205d5d7a3a5fe1d2a08c893f2e3e971ac452508c8e53f75",
+      "expected": "reject malformed PAX record"
+    },
+    "bad-pax-overrun": {
+      "bytes": 3072,
+      "sha256": "4e0587b421cfe9625359230acd2d81db615a1474994b69b33ed4cf0bcd9d3935",
+      "expected": "reject malformed PAX record"
+    },
+    "bad-pax-nondigit": {
+      "bytes": 3072,
+      "sha256": "f5257dd004595e241d8712d330796d59cca30e1b966fe0bd6656ff86df851ce8",
+      "expected": "reject malformed PAX record"
+    },
+    "bad-pax-overflow": {
+      "bytes": 3072,
+      "sha256": "3cb4f842e260f4d2a325be0e74048a3823e23b91973bb7901da82deff4317dd7",
+      "expected": "reject malformed PAX record"
+    },
+    "bad-pax-no-newline": {
+      "bytes": 3072,
+      "sha256": "f62669265fa260d1e94284b417918b6f2ac5afc9cbe6a3831de2885ce9a3be8e",
+      "expected": "reject malformed PAX record"
+    },
+    "bad-pax-no-equals": {
+      "bytes": 3072,
+      "sha256": "12402f9d8d8e93e6a5b14b1af3da267f1cd444a499c62367b58c6c5259605267",
+      "expected": "reject malformed PAX record"
+    },
+    "dangling-x": {
+      "bytes": 2048,
+      "sha256": "c56545b9dbf82a00f3c244d35521ac0ab4afbea22f2e13bf9d53099cc581a36d",
+      "expected": "reject dangling extension"
+    },
+    "dangling-L": {
+      "bytes": 2048,
+      "sha256": "934277704312ff37bb86782ac55e11562b30b1aca47451492e37a41072706183",
+      "expected": "reject dangling extension"
+    },
+    "dangling-K": {
+      "bytes": 2048,
+      "sha256": "733a04a5ebc4662415b07852a9c7465fa1c8a650f37e13e8e2a3fa01f2f962a8",
+      "expected": "reject dangling extension"
+    },
+    "global-semantic": {
+      "bytes": 3072,
+      "sha256": "4e4587010721b505b8c2bee8be0b95c43fc71aa127ff8d7b4c741732781e1d53",
+      "expected": "reject global path"
+    },
+    "pax-sparse": {
+      "bytes": 3072,
+      "sha256": "0d7f0f5492110761f5398e4d59f6c48ead9f9fda0a0920be4b333210b60a8159",
+      "expected": "reject sparse metadata"
+    },
+    "gnu-sparse": {
+      "bytes": 1536,
+      "sha256": "624da3118b13c9efa1c40133f1621880a1108591dcef13ed0171fccae7f40397",
+      "expected": "reject GNU sparse type"
+    },
+    "base256-overflow-size": {
+      "bytes": 1536,
+      "sha256": "62f74f1a94c168388b24aa97879f30e79de9e67fc92001fa379caf658233f37d",
+      "expected": "reject full-width 2**64 numeric overflow"
+    },
+    "base256-overflow-mtime": {
+      "bytes": 1536,
+      "sha256": "856f6e3e290d139aaf54f15480b1a4d393cf337091522565a53d6ece138c8bef",
+      "expected": "reject full-width 2**64 numeric overflow"
+    },
+    "metadata-flood": {
+      "bytes": 14336,
+      "sha256": "044503415fadf7241c7234caf1589c7300be365b4fc32345e2ef65266212dbdd",
+      "expected": "accept with ample metadata budget; reject with 4096-byte metadata budget"
+    }
+  }
+}
