@@ -2,6 +2,7 @@
 pub mod build;
 pub mod build_plan;
 pub mod capabilities;
+pub mod context;
 pub mod devices;
 pub mod dockerfile;
 pub mod executor;

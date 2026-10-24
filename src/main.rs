@@ -21,7 +21,14 @@ Usage:
 Experimental build: Linux amd64, single stage, local OCI bases or scratch.
 Bindings match literal FROM names; --base-ref selects an OCI ref annotation.
 Without --base-ref the layout must have an unambiguous image selection.
-No COPY, multistage, registry pull/push or container run command yet.
+Local COPY supports plain/JSON paths, directory merges and multiple sources
+(destination must end in /), relative to WORKDIR. Basic $NAME/${NAME} expansion
+and Docker word quotes are supported; JSON embedded quotes/backslashes rejected.
+Sources must be context-relative: no globs, parent paths, explicit symlinks,
+COPY flags/--from, or nonempty .dockerignore. No multistage, registry pull/push
+or container run command yet. COPY bytes/entries/metadata accumulate across steps
+under the rootfs/layer limits; rootfs is also checked after each step.
+Syntax/ignore checks precede mutation; later filesystem failures may follow RUN.
 Defaults: rootfs 268435456 bytes; layer/replay 268435456 bytes;
 metadata 16777216 bytes per subsystem; 100000 entries; 1024 descriptors;
 RUN timeout 300 seconds (maximum 86400). Budgets accept positive decimal bytes.
@@ -400,7 +407,7 @@ fn summary(report: &serde_json::Value) -> String {
             result.push_str(&format!("Warning: {warning}\n"));
         }
     }
-    result.push_str("Experimental build supports single-stage local OCI or scratch only; no COPY, multistage, pull or push. RUN resources require external enforcement. Use --json for raw observations.\n");
+    result.push_str("Experimental build supports single-stage local OCI or scratch with restricted local COPY; no multistage, pull or push. See build --help for COPY restrictions. RUN resources require external enforcement. Use --json for raw observations.\n");
     result
 }
 

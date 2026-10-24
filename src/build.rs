@@ -1,6 +1,8 @@
 //! Minimal, trusted/stable Linux amd64 builds from local OCI bindings or scratch.
-//! Supports one stage: FROM, RUN, ARG, ENV, WORKDIR, JSON CMD/ENTRYPOINT, EXPOSE.
-//! COPY, custom shells, USER/OnBuild and complex expansion fail closed. RUN exec
+//! Supports one stage: FROM, RUN, local COPY, ARG, ENV, WORKDIR, JSON
+//! CMD/ENTRYPOINT, EXPOSE.
+//! Local COPY is supported; flags/stages, custom shells, USER/OnBuild and complex
+//! expansion fail closed. RUN exec
 //! form uses `/bin/sh -c 'exec ...'` with every argv element literally quoted.
 //! This is not a sandbox. Caller owns stable ancestors and trusted image/commands;
 //! no concurrent writers, mounts or external hardlinks are allowed. WORKDIR
@@ -13,7 +15,7 @@
 
 use crate::{
     build_plan::{self, Base, InstructionKind as I, Protocol, Run},
-    export, image, layer,
+    context, export, image, layer,
     oci::{BlobStore, Descriptor},
     rootfs,
 };
@@ -77,6 +79,10 @@ pub struct BuildResult {
 
 enum Step {
     Directory(String),
+    Copy {
+        sources: Vec<String>,
+        destination: String,
+    },
     Run {
         command: String,
         workdir: String,
@@ -192,6 +198,51 @@ fn path(current: &str, value: &str) -> Result<String> {
     Ok(format!("/{}", parts.join("/")))
 }
 
+fn copy_words(
+    paths: &build_plan::Arguments,
+    vars: &BTreeMap<String, String>,
+    cap: usize,
+) -> Result<Vec<String>> {
+    match paths {
+        build_plan::Arguments::Words(words) => {
+            words.iter().map(|w| expand(&w.raw, vars, cap)).collect()
+        }
+        build_plan::Arguments::Json(words) => words
+            .iter()
+            .map(|w| {
+                // Reject ambiguous shell quoting after JSON decoding rather than
+                // silently interpreting JSON quotes as Docker word delimiters.
+                if w.contains(['\'', '"', '\\']) {
+                    return Err("COPY JSON embedded quotes/backslashes unsupported".into());
+                }
+                expand(w, vars, cap)
+            })
+            .collect(),
+    }
+}
+
+fn copy_path(value: &str, absolute: bool) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.starts_with('/') != absolute
+        || value.bytes().any(|b| b"\0*?[$\\".contains(&b))
+        || value.split('/').any(|p| p == "..")
+        || value.split('/').count() > 128
+    {
+        return Err("COPY requires literal context-relative sources and bounded image destinations; no glob, parent, or unresolved variable syntax".into());
+    }
+    Ok(())
+}
+
+fn copy_ignore(context: &Path) -> Result<()> {
+    match fs::symlink_metadata(context.join(".dockerignore")) {
+        Ok(m) if m.is_file() && m.len() == 0 => Ok(()),
+        Ok(_) => Err("COPY requires absent or empty regular .dockerignore".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn array(config: &Value, key: &str) -> Result<Vec<String>> {
     match config.get(key) {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -300,7 +351,32 @@ fn preflight(
         vars.extend(env.clone()); // ENV shadows ARG, including empty values.
         match &i.kind {
             I::From { .. } => (),
-            I::Copy { .. } => return Err(format!("line {}: COPY unsupported", i.line).into()),
+            I::Copy { from, paths } => {
+                if from.is_some() {
+                    return Err("COPY --from unsupported".into());
+                }
+                let mut values = copy_words(paths, &vars, cap)?;
+                let dest = values.pop().ok_or("COPY destination missing")?;
+                for source in &values {
+                    copy_path(source, false)?;
+                }
+                if dest.is_empty() || (values.len() > 1 && !dest.ends_with('/')) {
+                    return Err("COPY multiple sources require a trailing slash destination".into());
+                }
+                let mut destination = path(&wd, &dest)?;
+                if dest.ends_with('/') && !destination.ends_with('/') {
+                    destination.push('/');
+                }
+                copy_path(&destination, true)?;
+                charge = charge
+                    .checked_add(destination.len())
+                    .and_then(|n| values.iter().try_fold(n, |n, s| n.checked_add(s.len())))
+                    .ok_or("plan budget overflow")?;
+                steps.push(Step::Copy {
+                    sources: values,
+                    destination,
+                });
+            }
             I::Arg { name, default } => {
                 let default = default
                     .as_deref()
@@ -499,7 +575,7 @@ pub fn build(
     {
         let empty = BTreeMap::new();
         match &instruction.kind {
-            I::Copy { .. } => return Err("COPY unsupported".into()),
+            I::Copy { from: Some(_), .. } => return Err("COPY --from unsupported".into()),
             I::Arg {
                 default: Some(s), ..
             } => {
@@ -561,6 +637,9 @@ pub fn build(
         .map(|m| m.config.clone())
         .unwrap_or_else(|| json!({"os":"linux", "architecture":"amd64", "config":{}}));
     let (config, steps) = preflight(source, options, config)?;
+    if steps.iter().any(|s| matches!(s, Step::Copy { .. })) {
+        copy_ignore(&options.context)?;
+    }
     #[cfg(target_os = "linux")]
     if steps.iter().any(|s| matches!(s, Step::Run { .. })) && unsafe { libc::geteuid() } != 0 {
         return Err("RUN worker requires root".into());
@@ -593,9 +672,40 @@ pub fn build(
             root_budget(&root, options.limits, &cancelled)?;
         }
     }
+    let mut copied = context::Summary::default();
     for (index, step) in steps.iter().enumerate() {
         check(&cancelled)?;
         match step {
+            Step::Copy {
+                sources,
+                destination,
+            } => {
+                let limits = options.limits;
+                let summary = context::copy_local(
+                    &options.context,
+                    &root,
+                    &sources.iter().map(String::as_str).collect::<Vec<_>>(),
+                    destination,
+                    context::Limits {
+                        max_bytes: limits
+                            .max_rootfs_bytes
+                            .min(limits.layer.max_uncompressed_bytes)
+                            .saturating_sub(copied.bytes_written),
+                        max_entries: limits
+                            .max_rootfs_entries
+                            .min(limits.layer.max_entries)
+                            .saturating_sub(copied.entries),
+                        max_metadata_bytes: limits
+                            .layer
+                            .max_metadata_bytes
+                            .saturating_sub(copied.metadata_bytes),
+                    },
+                    &cancelled,
+                )?;
+                copied.bytes_written += summary.bytes_written;
+                copied.entries += summary.entries;
+                copied.metadata_bytes += summary.metadata_bytes;
+            }
             Step::Directory(p) => {
                 directory(&root, p)?;
             }
@@ -831,7 +941,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let o = options(t.path());
         for source in [
-            "FROM scratch\nWORKDIR /made\nCOPY a b\n",
+            "FROM scratch\nWORKDIR /made\nCOPY --badflag a b\n",
             "FROM scratch\nFROM scratch\n",
             "FROM scratch\nWORKDIR /made\nENV A=${UNSET:-bad}\n",
             "FROM scratch\nWORKDIR /made\nWORKDIR ../bad\n",
@@ -842,6 +952,36 @@ mod tests {
         }
         assert!(build("FROM scratch", &o, || true).is_err());
         assert!(!o.work.exists());
+    }
+    #[test]
+    fn copy_entry_and_metadata_budgets_are_cumulative() {
+        for budget in ["entries", "metadata"] {
+            let t = tempfile::tempdir().unwrap();
+            let mut o = options(t.path());
+            fs::write(o.context.join("a"), "data").unwrap();
+            if budget == "entries" {
+                o.limits.layer.max_entries = 1;
+            } else {
+                // One entry fits (512 + source + destination), two do not.
+                o.limits.layer.max_metadata_bytes = 600;
+            }
+            let error = build("FROM scratch\nCOPY a /a\nCOPY a /a\n", &o, || false)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Limit"), "{error}");
+            assert_eq!(fs::read(o.work.join("rootfs/a")).unwrap(), b"data");
+            assert!(!o.output.exists());
+        }
+    }
+
+    #[test]
+    fn later_copy_filesystem_failure_can_follow_earlier_mutation() {
+        let t = tempfile::tempdir().unwrap();
+        let o = options(t.path());
+        fs::write(o.context.join("a"), "data").unwrap();
+        assert!(build("FROM scratch\nCOPY a /a\nCOPY missing /b\n", &o, || false).is_err());
+        assert_eq!(fs::read(o.work.join("rootfs/a")).unwrap(), b"data");
+        assert!(!o.output.exists());
     }
     #[test]
     fn inherited_semantics_and_literal_expansion() {

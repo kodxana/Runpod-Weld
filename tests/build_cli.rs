@@ -16,7 +16,12 @@ fn run_worker_is_independent_of_launch_directory() {
     let context = temp.path().join("context");
     fs::create_dir(&context).unwrap();
     let dockerfile = context.join("Dockerfile");
-    fs::write(&dockerfile, "FROM alpine\nRUN printf ok > /weld-marker\n").unwrap();
+    fs::write(context.join("script"), "printf ok > /weld-marker\n").unwrap();
+    fs::write(
+        &dockerfile,
+        "FROM alpine\nCOPY script /script\nRUN sh /script\n",
+    )
+    .unwrap();
     for (index, cwd) in [temp.path(), std::path::Path::new("/")].iter().enumerate() {
         let work = temp.path().join(format!("work-{index}"));
         let result = cli()
@@ -72,7 +77,7 @@ fn help_explains_experimental_limits() {
         "single stage",
         "--base-ref",
         "no memory or disk quota",
-        "No COPY",
+        "Local COPY",
         "not a sandbox",
     ] {
         assert!(text.contains(expected), "{expected}");
@@ -181,7 +186,7 @@ fn unsupported_copy_does_not_create_build_directories() {
     let context = temp.path().join("context");
     fs::create_dir(&context).unwrap();
     let dockerfile = context.join("Dockerfile");
-    fs::write(&dockerfile, "FROM scratch\nCOPY a /a\n").unwrap();
+    fs::write(&dockerfile, "FROM scratch\nCOPY --from=other a /a\n").unwrap();
     let output = temp.path().join("output");
     let work = temp.path().join("work");
     let result = cli()
@@ -196,7 +201,138 @@ fn unsupported_copy_does_not_create_build_directories() {
         .output()
         .unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("COPY unsupported"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("COPY --from"));
     assert!(!work.exists());
     assert!(!output.exists());
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn local_copy_build(context: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let parent = context.parent().unwrap();
+    cli()
+        .arg("build")
+        .arg("-f")
+        .arg(context.join("Dockerfile"))
+        .arg("--output")
+        .arg(parent.join("output"))
+        .arg("--work-dir")
+        .arg(parent.join("work"))
+        .args(extra)
+        .arg(context)
+        .output()
+        .unwrap()
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn local_copy_plain_json_merge_multiple_and_expansion() {
+    let temp = tempfile::tempdir().unwrap();
+    let context = temp.path().join("context");
+    fs::create_dir_all(context.join("first/nested")).unwrap();
+    fs::create_dir(context.join("second")).unwrap();
+    for (name, value) in [
+        ("first/nested/a", "a"),
+        ("second/b", "b"),
+        ("space name", "space"),
+        ("other", "other"),
+        ("plain", "plain"),
+    ] {
+        fs::write(context.join(name), value).unwrap();
+    }
+    fs::write(
+        context.join("Dockerfile"),
+        concat!(
+            "FROM scratch\nARG SRC=plain\nENV DEST=app\nWORKDIR /$DEST\n",
+            "COPY first ./\nCOPY [\"second\", \"./\"]\n",
+            "COPY \"space name\" 'other' files/\nCOPY [\"$SRC\", \"json/\"]\n",
+            "COPY \"${SRC}\" expanded\n"
+        ),
+    )
+    .unwrap();
+    let result = local_copy_build(&context, &[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let root = temp.path().join("work/rootfs/app");
+    for (name, value) in [
+        ("nested/a", "a"),
+        ("b", "b"),
+        ("files/space name", "space"),
+        ("files/other", "other"),
+        ("json/plain", "plain"),
+        ("expanded", "plain"),
+    ] {
+        assert_eq!(fs::read_to_string(root.join(name)).unwrap(), value);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn all_copy_syntax_and_ignore_are_checked_before_mutation() {
+    for tail in [
+        "COPY ../escape /x",
+        "COPY /absolute /x",
+        "COPY *.txt /x",
+        "COPY plain /../x",
+        "COPY plain other /x",
+        "COPY '$SRC' /x",
+        "COPY \\$SRC /x",
+        "COPY ${SRC:-plain} /x",
+        "COPY plain $UNSET",
+        "COPY [\"quote'file\", \"/x\"]",
+        "COPY --chown=1 plain /x",
+        "FROM scratch\nCOPY --from=0 /x /x",
+        "IGNORE",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let context = temp.path().join("context");
+        fs::create_dir(&context).unwrap();
+        fs::write(context.join("plain"), "ok").unwrap();
+        let tail = if tail == "IGNORE" {
+            fs::write(context.join(".dockerignore"), "plain\n").unwrap();
+            "COPY plain /x"
+        } else {
+            tail
+        };
+        // A valid earlier COPY and RUN must not execute before later syntax rejection.
+        fs::write(
+            context.join("Dockerfile"),
+            format!("FROM scratch\nARG SRC=plain\nCOPY plain /first\nRUN touch /ran\n{tail}\n"),
+        )
+        .unwrap();
+        let result = local_copy_build(&context, &[]);
+        assert!(!result.status.success(), "{tail}");
+        assert!(
+            !temp.path().join("work").exists(),
+            "{tail}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!temp.path().join("output").exists());
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn copy_byte_budget_is_cumulative_even_for_overwrites() {
+    for limit in ["--max-rootfs-bytes", "--max-layer-bytes"] {
+        let temp = tempfile::tempdir().unwrap();
+        let context = temp.path().join("context");
+        fs::create_dir(&context).unwrap();
+        fs::write(context.join("plain"), "123456").unwrap();
+        fs::write(
+            context.join("Dockerfile"),
+            "FROM scratch\nCOPY plain /same\nCOPY plain /same\n",
+        )
+        .unwrap();
+        let result = local_copy_build(&context, &[limit, "10"]);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Limit"));
+        assert_eq!(
+            fs::read(temp.path().join("work/rootfs/same")).unwrap(),
+            b"123456"
+        );
+        assert!(!temp.path().join("output").exists());
+    }
 }

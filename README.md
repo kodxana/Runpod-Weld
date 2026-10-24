@@ -2,7 +2,7 @@
 
 `rpweld` is a standalone Rust project for building OCI/Docker images inside ordinary Runpod Pods. It has no Kaniko runtime dependency.
 
-**Development preview:** experimental single-stage builds from local OCI images or scratch are available on Linux amd64. Registry pull/push, COPY, multistage builds and a container run command are not implemented. Trusted workloads only; this is not a security sandbox.
+**Development preview:** experimental single-stage builds from local OCI images or scratch are available on Linux amd64. Registry pull/push, multistage builds and a container run command are not implemented. Trusted workloads only; this is not a security sandbox.
 
 ## Build and inspect
 
@@ -20,7 +20,7 @@ Resource inspection reads cgroup v1/v2 membership, visible ancestor limits and u
 
 ## Experimental image build
 
-Supported instructions: FROM, RUN (shell or JSON), ARG, ENV, WORKDIR, JSON CMD/ENTRYPOINT and EXPOSE. Unsupported features fail before execution. Base images must be supplied as local OCI layouts; explicit USER and inherited nonempty User/OnBuild are rejected. WORKDIR traversal through symlinks is currently unsupported.
+Supported instructions: FROM, RUN (shell or JSON), local COPY (plain or JSON), ARG, ENV, WORKDIR, JSON CMD/ENTRYPOINT and EXPOSE. Unsupported features fail before execution. Base images must be supplied as local OCI layouts; explicit USER and inherited nonempty User/OnBuild are rejected. WORKDIR traversal through symlinks is currently unsupported.
 
 ```sh
 # Given a local Alpine OCI layout in ./base-layout and context/Dockerfile:
@@ -32,6 +32,8 @@ rpweld build -f context/Dockerfile --base alpine=./base-layout \
 ```
 
 Output is an OCI layout with a flattened, uncompressed layer. Work/output paths must be new and disjoint from the context and bases. Failed builds retain partial directories; do not reuse them. Optional `--host-dns` supplies temporary resolver configuration and restores it before export. Run `rpweld build --help` for base reference selection and budget controls.
+
+Local COPY supports directory merges and WORKDIR-relative destinations with cumulative budgets. Stage copies, flags, glob patterns, source symlink traversal and nonempty/nonregular `.dockerignore` files are rejected. Supported timestamps and xattrs are preserved; unsupported attributes/ACLs fail preflight. Copying is nontransactional: a later filesystem failure can leave earlier instructions executed and a partial work directory.
 
 Defaults allow 256 MiB rootfs/layer sizes, 16 MiB metadata per subsystem and a 300-second RUN timeout. These are development limits, not suitable defaults for ComfyUI. They do not enforce RUN memory or disk quotas. End-to-end Alpine builds have been checked in WSL; this integrated build path still needs ordinary Runpod validation.
 
