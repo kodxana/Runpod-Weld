@@ -10,6 +10,9 @@
 //! the verified entry count; payloads use a fixed 64 KiB buffer. ctime, sub-ns
 //! timestamps, symlink xattrs/non-0777 modes and special hardlink targets are
 //! explicitly unsupported. Kernel ownership/xattr failures propagate.
+//! Before mutation, descriptor budgeting may raise the process-wide soft NOFILE
+//! limit within its existing hard limit, leaving it raised. Callers must serialize
+//! limit changes and avoid concurrent descriptor growth; this is no FD reservation.
 use crate::layer::VerifiedLayer;
 use std::{fmt, io, path::Path};
 
@@ -80,6 +83,55 @@ mod linux {
     };
     fn check(c: &impl Fn() -> bool) -> Result<(), Error> {
         if c() { Err(Error::Cancelled) } else { Ok(()) }
+    }
+    fn descriptor_budget(entries: &[Entry], c: &impl Fn() -> bool) -> Result<(), Error> {
+        // shortcut: pins still scale with entries; images exceeding the hard limit
+        // need a different identity-preserving replay design, not dropped pins.
+        // 256 resolution FDs OR 257 recursive deletion FDs + readdir, with
+        // headroom for source/destination, target pins and temporary duplicates.
+        let mut required: libc::rlim_t = 272;
+        let overflow = || Error::Unsupported("rootfs descriptor budget overflow");
+        for e in entries {
+            check(c)?;
+            let pins = if split(&e.path).1.starts_with(b".wh.") {
+                1 // One parent per marker, including opaque markers.
+            } else {
+                match e.kind {
+                    EntryKind::Directory => 1,
+                    EntryKind::Symlink | EntryKind::Hardlink => 2,
+                    EntryKind::File => 0,
+                }
+            };
+            required = required.checked_add(pins).ok_or_else(overflow)?;
+        }
+        // Includes root, host and the verified spool, plus the enumeration FD.
+        // Counting all open FDs also safely overestimates those above soft NOFILE.
+        for fd in std::fs::read_dir("/proc/self/fd")? {
+            check(c)?;
+            fd?;
+            required = required.checked_add(1).ok_or_else(overflow)?;
+        }
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        cv(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) })?;
+        let mut limits = unsafe { limits.assume_init() };
+        if required > limits.rlim_max {
+            return Err(io::Error::other(format!(
+                "descriptor budget requires {required} FDs, exceeding RLIMIT_NOFILE hard limit {} (soft {}); root unchanged; pinned descriptors scale with layer entries",
+                limits.rlim_max, limits.rlim_cur
+            )).into());
+        }
+        check(c)?;
+        if required > limits.rlim_cur {
+            limits.rlim_cur = required;
+            // Keep the hard limit exactly as observed; never request privileges.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+                return Err(io::Error::other(format!(
+                    "cannot raise RLIMIT_NOFILE soft limit to descriptor budget {required} (hard {}); root unchanged: {}",
+                    limits.rlim_max, io::Error::last_os_error()
+                )).into());
+            }
+        }
+        Ok(())
     }
     fn cs(b: &[u8]) -> Result<CString, Error> {
         CString::new(b).map_err(|_| Error::Invalid("NUL in path or xattr"))
@@ -510,6 +562,7 @@ mod linux {
             check(c)?;
             validate(e)?;
         }
+        descriptor_budget(layer.entries(), c)?;
         let mut out = Summary::default();
         // Pin every whiteout parent before any deletion, making marker order inert.
         let mut deletes = Vec::new();
@@ -532,15 +585,16 @@ mod linux {
                 Err(e) => return Err(e),
             };
             if name == b".wh..wh..opq" {
-                for n in names(d.as_raw_fd(), c)? {
-                    deletes.push((d.try_clone()?, n));
-                }
+                let children = names(d.as_raw_fd(), c)?;
+                deletes.push((d, children));
             } else {
-                deletes.push((d, name[4..].to_vec()));
+                deletes.push((d, vec![name[4..].to_vec()]));
             }
         }
-        for (d, n) in deletes {
-            remove(d.as_raw_fd(), &n, 0, c)?;
+        for (d, children) in deletes {
+            for n in children {
+                remove(d.as_raw_fd(), &n, 0, c)?;
+            }
         }
         let mut dirs = Vec::new();
         let mut symlinks = Vec::new();
@@ -842,8 +896,8 @@ mod tests {
             layer::Limits {
                 max_blob_bytes: 10_000_000,
                 max_uncompressed_bytes: 10_000_000,
-                max_entries: 1000,
-                max_metadata_bytes: 1_000_000,
+                max_entries: 10_000,
+                max_metadata_bytes: 10_000_000,
                 max_gzip_header_bytes: 1024,
             },
             || false,
@@ -1136,6 +1190,9 @@ mod tests {
     }
     #[test]
     fn deferred_symlink_pins_survive_alias_replacement() {
+        if isolated_fd_inspection("deferred_symlink_pins_survive_alias_replacement") {
+            return;
+        }
         use std::os::fd::RawFd;
         for replacement_symlink in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
@@ -1219,6 +1276,9 @@ mod tests {
 
     #[test]
     fn later_symlink_hardlink_metadata_survives_replaced_alias() {
+        if isolated_fd_inspection("later_symlink_hardlink_metadata_survives_replaced_alias") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let mut h = link("d/h", "s", true);
@@ -1306,16 +1366,158 @@ mod tests {
         ));
         assert_eq!(fs::read(root.join("keep")).unwrap(), b"keep");
         let mut l = verified(vec![file("large", &vec![7; 1_000_000])]);
-        let calls = Cell::new(0);
         assert!(matches!(
             apply_layer(root, &mut l, || {
-                let n = calls.get() + 1;
-                calls.set(n);
-                n >= 12
+                fs::metadata(root.join("large")).is_ok_and(|m| m.len() >= 65536)
             }),
             Err(Error::Cancelled)
         ));
         assert!(fs::metadata(root.join("large")).unwrap().len() < 1_000_000);
+    }
+    // Raw FD observations must not race unrelated tests opening/closing/reusing FDs.
+    fn isolated_fd_inspection(name: &str) -> bool {
+        const KEY: &str = "RPWELD_ISOLATED_FD_INSPECTION";
+        if std::env::var(KEY).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("rootfs::tests::{name}"), "--nocapture"])
+            .env(KEY, name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[test]
+    fn descriptor_budget_subprocess() {
+        const CHILD: &str = "RPWELD_ROOTFS_FD_BUDGET_CHILD";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in ["raise", "insufficient", "cancel", "opaque", "unchanged"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "rootfs::tests::descriptor_budget_subprocess",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, case)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        fn limits() -> libc::rlimit {
+            let mut value = std::mem::MaybeUninit::uninit();
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, value.as_mut_ptr()) },
+                0
+            );
+            unsafe { value.assume_init() }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("keep"), b"unchanged").unwrap();
+        let mut entries = vec![file(".wh.keep", b"")];
+        if case == "opaque" {
+            fs::create_dir(root.join("lower")).unwrap();
+            for i in 0..1500 {
+                fs::write(root.join(format!("lower/{i}")), b"").unwrap();
+            }
+            entries = vec![file("lower/.wh..wh..opq", b"")];
+        } else if case == "unchanged" {
+            entries = vec![file("small", b"ok")];
+        } else {
+            for i in 0..1250 {
+                entries.push(directory(&format!("d{i}")));
+                entries.push(link(&format!("d{i}/s"), "missing", false));
+                entries.push(link(&format!("h{i}"), &format!("d{i}/s"), true));
+            }
+        }
+        let mut layer = verified(entries);
+        // Existing non-rootfs descriptors must contribute to the budget.
+        let _held: Vec<_> = (0..96)
+            .map(|_| fs::File::open("/dev/null").unwrap())
+            .collect();
+        let hard = if case == "raise" { 16_384 } else { 1024 };
+        assert!(
+            limits().rlim_max >= hard,
+            "test needs hard NOFILE >= {hard}"
+        );
+        assert_eq!(
+            unsafe {
+                libc::setrlimit(
+                    libc::RLIMIT_NOFILE,
+                    &libc::rlimit {
+                        rlim_cur: 1024,
+                        rlim_max: hard,
+                    },
+                )
+            },
+            0
+        );
+        // Cancel during preflight, after the initial cancellation check.
+        let calls = Cell::new(0);
+        let result = apply_layer(root, &mut layer, || {
+            calls.set(calls.get() + 1);
+            case == "cancel" && calls.get() >= 10
+        });
+        match case.as_str() {
+            "insufficient" | "cancel" => {
+                let error = result.unwrap_err();
+                if case == "cancel" {
+                    assert!(matches!(error, Error::Cancelled));
+                } else {
+                    let message = error.to_string();
+                    assert!(message.contains("descriptor budget requires"), "{message}");
+                    assert!(message.contains("hard limit 1024"), "{message}");
+                    assert!(message.contains("root unchanged"), "{message}");
+                }
+                assert_eq!(fs::read(root.join("keep")).unwrap(), b"unchanged");
+                assert_eq!(fs::read_dir(root).unwrap().count(), 1);
+                assert_eq!(limits().rlim_cur, 1024);
+            }
+            "raise" => {
+                result.unwrap();
+                let raised = limits().rlim_cur;
+                assert!(raised > 6250 && raised < hard);
+                // Replay must preserve pinned inode identity and metadata too.
+                apply_layer(root, &mut layer, || false).unwrap();
+                assert_eq!(limits().rlim_cur, raised);
+                for i in 0..1250 {
+                    let s = fs::symlink_metadata(root.join(format!("d{i}/s"))).unwrap();
+                    let h = fs::symlink_metadata(root.join(format!("h{i}"))).unwrap();
+                    assert_eq!(s.ino(), h.ino());
+                    assert_eq!(s.nlink(), 2);
+                    assert_eq!(s.mtime(), 123);
+                    assert_eq!(
+                        fs::metadata(root.join(format!("d{i}"))).unwrap().mode() & 0o7777,
+                        0o755
+                    );
+                }
+            }
+            "opaque" => {
+                result.unwrap();
+                assert_eq!(fs::read_dir(root.join("lower")).unwrap().count(), 0);
+                assert_eq!(limits().rlim_cur, 1024);
+            }
+            "unchanged" => {
+                result.unwrap();
+                assert_eq!(limits().rlim_cur, 1024);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(limits().rlim_max, hard);
     }
     #[test]
     fn host_root_and_symlink_aliases_refused_and_loop_bounded() {
