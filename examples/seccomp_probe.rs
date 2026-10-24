@@ -1,5 +1,9 @@
 //! Experimental Linux x86_64 feasibility probe, NOT a sandbox or apt broker.
 //! Run as root: cargo +1.90.0 run --release --example seccomp_probe
+//! Optional diagnostic: append -- --proc-mem-fscreds (default: process_vm_readv).
+//! proc status columns: https://www.kernel.org/doc/html/latest/filesystems/proc.html
+//! Access checks: https://github.com/torvalds/linux/blob/master/kernel/ptrace.c
+//! mem open: https://github.com/torvalds/linux/blob/master/fs/proc/base.c
 //! Single-threaded executable only: the post-fork path uses stack data and libc,
 //! no Rust allocation, formatting, unwinding, or destructors before exec/_exit.
 //! UAPI: https://github.com/torvalds/linux/blob/master/include/uapi/linux/seccomp.h
@@ -22,6 +26,7 @@ mod linux {
     use libc::*;
     use std::{
         ffi::CString,
+        io::Read,
         mem::{size_of, size_of_val, zeroed},
         ptr,
         time::{Duration, Instant},
@@ -215,7 +220,123 @@ mod linux {
             ))
         }
     }
-    unsafe fn broker(fd: i32, pid: i32) -> Result<i32, String> {
+    fn target_ids(status: &str, field: &str) -> Result<u32, String> {
+        let mut lines = status.lines().filter_map(|line| line.strip_prefix(field));
+        let line = lines.next().ok_or_else(|| format!("missing {field}"))?;
+        if lines.next().is_some() {
+            return Err(format!("duplicate {field}"));
+        }
+        let mut words = line.split_ascii_whitespace();
+        let mut ids = [0u32; 4];
+        for id in &mut ids {
+            let word = words.next().ok_or_else(|| format!("short {field}"))?;
+            if !word.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("invalid {field}"));
+            }
+            *id = word.parse().map_err(|_| format!("invalid {field}"))?;
+            if *id == u32::MAX {
+                return Err(format!("invalid sentinel in {field}"));
+            }
+        }
+        if words.next().is_some() || ids[0] != ids[1] || ids[0] != ids[2] {
+            return Err(format!(
+                "cannot match real/effective/saved {field}: {ids:?}"
+            ));
+        }
+        // FSCREDS selects the caller's IDs, not the target's fourth (filesystem) column.
+        Ok(ids[0])
+    }
+    fn proc_mem_path(pid: i32, address: u64, path: &mut [u8]) -> Result<(), String> {
+        let offset = off_t::try_from(address).map_err(|_| "pathname address exceeds off_t")?;
+        let mut status = String::new();
+        std::fs::File::open(format!("/proc/{pid}/status"))
+            .and_then(|f| f.take(16385).read_to_string(&mut status))
+            .map_err(|e| format!("proc-mem-fscreds cannot read target status: {e}"))?;
+        if status.len() > 16384 || !status.ends_with('\n') {
+            return Err("proc-mem-fscreds target status exceeds bound or is incomplete".into());
+        }
+        let uid = target_ids(&status, "Uid:")?;
+        let gid = target_ids(&status, "Gid:")?;
+        let mem = CString::new(format!("/proc/{pid}/mem")).unwrap();
+        unsafe {
+            // Raw syscalls affect only this thread. No fallible Rust work or early returns
+            // between switching and verification of restoration, even if either set fails.
+            let old_gid = syscall(SYS_setfsgid, u32::MAX) as u32;
+            let old_uid = syscall(SYS_setfsuid, u32::MAX) as u32;
+            if old_gid == u32::MAX || old_uid == u32::MAX {
+                return Err(
+                    "proc-mem-fscreds unable to query previous filesystem credentials".into(),
+                );
+            }
+            syscall(SYS_setfsgid, gid);
+            syscall(SYS_setfsuid, uid);
+            let actual_gid = syscall(SYS_setfsgid, u32::MAX) as u32;
+            let actual_uid = syscall(SYS_setfsuid, u32::MAX) as u32;
+            let matched = actual_gid == gid && actual_uid == uid;
+            let fd = if matched {
+                open(mem.as_ptr(), O_RDONLY | O_CLOEXEC)
+            } else {
+                -1
+            };
+            let open_error = errno();
+            syscall(SYS_setfsuid, old_uid);
+            syscall(SYS_setfsgid, old_gid);
+            let restored_uid = syscall(SYS_setfsuid, u32::MAX) as u32;
+            let restored_gid = syscall(SYS_setfsgid, u32::MAX) as u32;
+            if restored_uid != old_uid || restored_gid != old_gid {
+                if fd >= 0 {
+                    close(fd);
+                }
+                // Never continue to another scenario/device open with uncertain credentials.
+                let msg = b"{\"strategy\":\"proc-mem-fscreds\",\"status\":\"fatal\",\"reason\":\"filesystem credential restoration verification failed\"}\n";
+                write(STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+                _exit(1);
+            }
+            if !matched {
+                return Err(format!(
+                    "proc-mem-fscreds unable to set fsuid/fsgid={uid}/{gid}; observed={actual_uid}/{actual_gid}; previous credentials restored"
+                ));
+            }
+            if fd < 0 {
+                return Err(format!(
+                    "proc-mem-fscreds unable to open /proc/{pid}/mem errno={open_error} with fsuid/fsgid={uid}/{gid}; previous credentials restored; matching IDs do not bypass dumpability/LSM checks"
+                ));
+            }
+            let count = pread(fd, path.as_mut_ptr().cast(), path.len(), offset);
+            let read_error = if count < 0 { errno() } else { 0 };
+            close(fd);
+            if count != path.len() as isize {
+                return Err(format!(
+                    "proc-mem-fscreds unable to read complete pathname: pread bytes={count} errno={read_error}; previous credentials restored"
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    #[test]
+    fn status_ids_require_four_valid_columns_and_matching_target_ids() {
+        assert_eq!(
+            target_ids("Uid:\t1234 1234 1234 99\n", "Uid:").unwrap(),
+            1234
+        );
+        assert_eq!(target_ids("Gid:\t0 0 0 0\n", "Gid:").unwrap(), 0);
+        for bad in [
+            "",
+            "Uid: 1 1 1\n",
+            "Uid: 1 1 1 1 1\n",
+            "Uid: 1 2 1 1\n",
+            "Uid: 1 1 2 1\n",
+            "Uid: -1 1 1 1\n",
+            "Uid: +1 1 1 1\n",
+            "Uid: 4294967296 1 1 1\n",
+            "Uid: 1 1 1 4294967295\n",
+            "Uid: 1 1 1 1\nUid: 1 1 1 1\n",
+        ] {
+            assert!(target_ids(bad, "Uid:").is_err(), "{bad:?}");
+        }
+    }
+    unsafe fn broker(fd: i32, pid: i32, proc_mem_fscreds: bool) -> Result<i32, String> {
         unsafe {
             poll_in(fd)?;
             let mut n = Notif::default();
@@ -237,20 +358,24 @@ mod linux {
                     return Err("unexpected notification".into());
                 }
                 let mut path = [0u8; 10];
-                let local = iovec {
-                    iov_base: path.as_mut_ptr().cast(),
-                    iov_len: path.len(),
-                };
-                let remote = iovec {
-                    iov_base: n.data.args[1] as *mut c_void,
-                    iov_len: path.len(),
-                };
-                let read = process_vm_readv(pid, &local, 1, &remote, 1, 0);
-                if read != path.len() as isize {
-                    return Err(format!(
-                        "process_vm_readv bytes={read} errno={} (EACCES/EPERM means unsupported credentials/dumpability)",
-                        errno()
-                    ));
+                if proc_mem_fscreds {
+                    proc_mem_path(pid, n.data.args[1], &mut path)?;
+                } else {
+                    let local = iovec {
+                        iov_base: path.as_mut_ptr().cast(),
+                        iov_len: path.len(),
+                    };
+                    let remote = iovec {
+                        iov_base: n.data.args[1] as *mut c_void,
+                        iov_len: path.len(),
+                    };
+                    let read = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+                    if read != path.len() as isize {
+                        return Err(format!(
+                            "process_vm_readv bytes={read} errno={} (EACCES/EPERM means unsupported credentials/dumpability)",
+                            errno()
+                        ));
+                    }
                 }
                 if path.as_slice() != PATH {
                     return Err("pathname is not exact /dev/null".into());
@@ -338,6 +463,19 @@ mod linux {
                 verify(fd);
             }
         }
+        let proc_mem_fscreds = match args.get(1).map(String::as_str) {
+            None => false,
+            Some("--proc-mem-fscreds") if args.len() == 2 => true,
+            _ => {
+                eprintln!("usage: seccomp_probe [--proc-mem-fscreds]");
+                std::process::exit(2);
+            }
+        };
+        let strategy = if proc_mem_fscreds {
+            "proc-mem-fscreds"
+        } else {
+            "process_vm_readv"
+        };
         unsafe {
             let mut action: sigaction = zeroed();
             action.sa_sigaction = timeout as *const () as usize;
@@ -389,7 +527,7 @@ mod linux {
                         return Err(format!("fork errno={}", errno()));
                     }
                     listener = receive_listener(sockets[0])?;
-                    let outcome = broker(listener, pid);
+                    let outcome = broker(listener, pid, proc_mem_fscreds);
                     // Even a denial must return to the child and produce a result.
                     poll_in(sockets[0])?;
                     if recv(sockets[0], child_packet.as_mut_ptr().cast(), 16, 0) != 16 {
@@ -411,6 +549,7 @@ mod linux {
                 println!(
                     "{}",
                     serde_json::json!({"scenario": name,
+                    "strategy": strategy,
                     "status": if ok { "supported" } else { "unsupported" },
                     "injected_fd": result.as_ref().ok(), "reason": result.err(),
                     "child_stage": child_packet[0], "child_errno": child_packet[1],
@@ -420,6 +559,7 @@ mod linux {
             println!(
                 "{}",
                 serde_json::json!({"experimental": true, "all_required_supported": all_ok,
+                "strategy": strategy,
                 "scope": "single openat /dev/null per scenario; no mknod, library integration, or apt claim"})
             );
             std::process::exit(if all_ok { 0 } else { 1 });

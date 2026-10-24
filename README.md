@@ -65,3 +65,20 @@ sh tests/private_root_smoke.sh target/debug/examples ROOTFS STATE_DIR
 This installs packages into ROOTFS, builds a Python virtual environment and a C program, and checks nonroot device access. It is not part of ordinary unit tests.
 
 `cargo run --locked --release --example seccomp_probe` is a separate Linux x86-64 root-only diagnostic for seccomp notification and real-device FD injection. It tests root execution and credential transitions, emits JSON per scenario, and exits nonzero if any scenario is unsupported. It is not wired into the executor: root-only injection success does not establish package-manager or nonroot compatibility.
+
+The optional `--proc-mem-fscreds` argument tests pathname reads with matching filesystem credentials. Nondumpable credential transitions can still deny access. `cargo run --locked --release --example ptrace_credentials` separately tests register-only dumpability restoration with real credential changes.
+
+## Experimental GPU private-root runner
+
+```sh
+cargo build --locked --release --example trace_root
+target/release/examples/trace_root ROOTFS STATE_DIR 60 'echo hello >/dev/null'
+python3 tests/traced_root_smoke.py target/release/examples/trace_root ROOTFS STATE_DIR
+python3 tests/trace_cancel.py target/release/examples/trace_root ROOTFS STATE_DIR
+```
+
+This Linux x86-64 experiment requires root inside the Pod, chroot, credential-changing capabilities and permitted ptrace. It uses Rust syscall tracing to expose selected absolute device paths and `/proc` descendants inside a disposable rootfs without mounts or device creation. It restores process dumpability across credential transitions; package-manager UIDs remain real. The smoke test installs Ubuntu packages, creates a Python virtualenv, compiles C and checks UID transitions and timeout behavior. Supply a fresh Ubuntu rootfs and working DNS before running it.
+
+The runner exposes the outer Pod's device/proc interfaces and changes process introspection permissions. It is for trusted workloads only. Threads, concurrent shared address spaces, exact `/dev` and `/proc` paths, and group stops are unsupported; relative paths retain native chroot behavior. Directory descriptors are retained across application close requests. These restrictions preclude general Docker compatibility. No image build/export command uses this experiment yet.
+
+For signal-return, vfork and descriptor-lifecycle regressions, compile `tests/trace_lifecycle.c` statically, place it in the disposable rootfs and execute it through `trace_root`. These integration tests are opt-in and require a Linux test environment.
