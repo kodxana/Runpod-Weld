@@ -18,6 +18,17 @@ Linux is the runtime target. On other platforms, `doctor` reports inspection as 
 
 Resource inspection reads cgroup v1/v2 membership, visible ancestor limits and usage, CPU quota, affinity and cpusets. Unknown restrictions remain unknown. The observations are not reserved resources or per-build enforcement, and cannot guarantee protection from OOM in a shared Pod.
 
+## Dockerfile compatibility scan
+
+```sh
+rpweld scan Dockerfile
+rpweld scan path/to/Dockerfile --json
+```
+
+The initial planned profile excludes explicit `USER` instructions, including `USER root`. The scanner reports physical line numbers and detects features needing review, such as instruction flags, external frontends, remote ADD and multistage syntax. Possible heredocs stop scanning and mark the remainder uninspected. It does not rewrite Dockerfiles.
+
+Exit 0 means no known issues were found by these partial static checks. Exit 2 means errors, required review, incomplete scanning, or an input error. Neither outcome establishes build support: the builder is still under development, and base-image configuration and package-manager behavior are not inspected. Inputs must be regular UTF-8 files no larger than 1 MiB.
+
 ## Development checks
 
 ```sh
