@@ -4,6 +4,7 @@ pub mod capabilities;
 pub mod devices;
 pub mod dockerfile;
 pub mod executor;
+pub mod export;
 pub mod image;
 pub mod layer;
 pub mod oci;
