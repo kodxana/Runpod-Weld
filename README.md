@@ -33,6 +33,8 @@ Exit 0 means no known issues were found by these partial static checks. Exit 2 m
 
 The internal `oci::BlobStore` supports verified SHA-256 blob ingestion and reads with fixed buffers, explicit size limits and cooperative cancellation. It publishes only verified content and rejects existing corrupt blobs. Store directories must be caller-owned and stable; blocking input reads need their own timeout. This is the artifact foundation, not yet OCI layer extraction, image export or a build command.
 
+`image::load_layout` selects an unambiguous Linux/amd64 OCI image from a local layout and verifies its manifest, config and compressed layer blobs within caller-supplied limits. It preserves inherited image configuration. Uncompressed diff IDs are declarations only until layer decompression verifies them; successful metadata loading does not establish a valid or runnable rootfs.
+
 ```sh
 cargo fmt --all -- --check
 cargo test --locked --all-targets
