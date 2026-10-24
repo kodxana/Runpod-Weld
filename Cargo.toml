@@ -1,0 +1,19 @@
+[package]
+name = "rpweld"
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.90"
+description = "Runpod Weld: a Rust image builder for ordinary Runpod Pods"
+repository = "https://github.com/kodxana/Runpod-Weld"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true

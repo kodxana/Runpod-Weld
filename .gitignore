@@ -1,0 +1,9 @@
+.research-private/
+__pycache__/
+/target/
+/.local-tools/
+/research/
+/docs/planning/
+/PLAN.md
+/TASKS.md
+/compatibility-results/

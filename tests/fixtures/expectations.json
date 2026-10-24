@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "fixtures": {
+    "basic": {
+      "base": "alpine", "network": false,
+      "files": {"weld/input.txt": {"text": "context survives\n", "uid": 0, "gid": 0}, "weld/result.txt": {"text": "hello\n"}},
+      "absent": ["weld/context/ignored.txt"],
+      "config": {"WorkingDir": "/weld", "Cmd": ["/bin/cat", "/weld/result.txt"]},
+      "env": ["WELD_MESSAGE=hello"]
+    },
+    "multistage": {
+      "base": "alpine", "network": false,
+      "files": {"artifact": {"text": "stage output\n", "uid": 0, "gid": 0}},
+      "absent": ["stage-only", "source.txt", "bin/sh"],
+      "config": {"Cmd": ["/artifact"]}
+    },
+    "nonroot": {
+      "base": "alpine", "network": false,
+      "files": {"owned/proof": {"text": "nonroot\n", "uid": 1234, "gid": 1234}, "root-only": {"text": "root only\n", "uid": 0, "gid": 0, "mode": "0600"}},
+      "config": {"User": "1234:1234", "WorkingDir": "/owned", "Cmd": ["/bin/cat", "/owned/proof"]}
+    },
+    "whiteout-config": {
+      "base": "alpine", "network": false,
+      "files": {"weld/tree/new": {"text": "new\n"}, "weld/recreated": {"text": "replacement\n"}},
+      "absent": ["weld/deleted", "weld/tree/old"],
+      "config": {"WorkingDir": "/weld", "Entrypoint": ["/bin/cat"], "Cmd": ["/weld/recreated"], "StopSignal": "SIGTERM"},
+      "env": ["WELD_CONFIG=preserved"],
+      "labels": {"org.runpod.weld.fixture": "whiteout-config"},
+      "ports": ["8080/tcp"]
+    },
+    "default-apt": {
+      "base": "ubuntu", "network": true,
+      "files": {"apt-proof": {"text": "default apt install and removal succeeded\n"}},
+      "absent": ["usr/bin/hello"],
+      "config": {"Cmd": ["/bin/cat", "/apt-proof"]}
+    }
+  }
+}
