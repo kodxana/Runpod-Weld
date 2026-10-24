@@ -1,4 +1,5 @@
 //! Core components of Runpod Weld. Image building is under development.
+pub mod build;
 pub mod build_plan;
 pub mod capabilities;
 pub mod devices;

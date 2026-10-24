@@ -103,6 +103,7 @@ impl WorkerOptions {
     }
 
     // Last assignment wins, including builder updates appended to the base Env.
+    #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
     fn environment(&self) -> Vec<&str> {
         let mut values = std::collections::BTreeMap::new();
         for entry in &self.env {

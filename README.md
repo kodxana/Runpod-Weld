@@ -2,7 +2,7 @@
 
 `rpweld` is a standalone Rust project for building OCI/Docker images inside ordinary Runpod Pods. It has no Kaniko runtime dependency.
 
-**Development preview:** image building, registry push and container execution are not implemented yet. The current CLI inspects the environment and reports cgroup-aware CPU and memory observations.
+**Development preview:** experimental single-stage builds from local OCI images or scratch are available on Linux amd64. Registry pull/push, COPY, multistage builds and a container run command are not implemented. Trusted workloads only; this is not a security sandbox.
 
 ## Build and inspect
 
@@ -17,6 +17,23 @@ cargo build --locked --release
 Linux is the runtime target. On other platforms, `doctor` reports inspection as unsupported. It does not infer Pod allocations from host RAM or CPU counts.
 
 Resource inspection reads cgroup v1/v2 membership, visible ancestor limits and usage, CPU quota, affinity and cpusets. Unknown restrictions remain unknown. The observations are not reserved resources or per-build enforcement, and cannot guarantee protection from OOM in a shared Pod.
+
+## Experimental image build
+
+Supported instructions: FROM, RUN (shell or JSON), ARG, ENV, WORKDIR, JSON CMD/ENTRYPOINT and EXPOSE. Unsupported features fail before execution. Base images must be supplied as local OCI layouts; explicit USER and inherited nonempty User/OnBuild are rejected. WORKDIR traversal through symlinks is currently unsupported.
+
+```sh
+# Given a local Alpine OCI layout in ./base-layout and context/Dockerfile:
+# FROM alpine
+# RUN printf hello > /hello
+# CMD ["/bin/cat", "/hello"]
+rpweld build -f context/Dockerfile --base alpine=./base-layout \
+  --output ./new-image --work-dir ./new-work ./context
+```
+
+Output is an OCI layout with a flattened, uncompressed layer. Work/output paths must be new and disjoint from the context and bases. Failed builds retain partial directories; do not reuse them. Optional `--host-dns` supplies temporary resolver configuration and restores it before export. Run `rpweld build --help` for base reference selection and budget controls.
+
+Defaults allow 256 MiB rootfs/layer sizes, 16 MiB metadata per subsystem and a 300-second RUN timeout. These are development limits, not suitable defaults for ComfyUI. They do not enforce RUN memory or disk quotas. End-to-end Alpine builds have been checked in WSL; this integrated build path still needs ordinary Runpod validation.
 
 ## Dockerfile compatibility scan
 
