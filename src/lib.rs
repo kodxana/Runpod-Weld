@@ -7,3 +7,4 @@ pub mod image;
 pub mod layer;
 pub mod oci;
 pub mod resources;
+pub mod rootfs;
