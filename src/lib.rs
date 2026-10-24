@@ -4,5 +4,6 @@ pub mod devices;
 pub mod dockerfile;
 pub mod executor;
 pub mod image;
+pub mod layer;
 pub mod oci;
 pub mod resources;
