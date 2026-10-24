@@ -152,6 +152,12 @@ fn summary(report: &serde_json::Value) -> String {
 }
 
 fn main() {
+    // The tracer owns process-wide signal and child-reaping state. Dispatch only
+    // in a fresh executable, before the builder initializes threads or children.
+    let mut worker_args = std::env::args_os().skip(1);
+    if worker_args.next().as_deref() == Some(std::ffi::OsStr::new("__trace-worker")) {
+        rpweld::trace_worker::worker_entry(worker_args);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(error) = execute(&args, &mut io::stdout().lock()) {
         eprintln!("rpweld: {error}");
