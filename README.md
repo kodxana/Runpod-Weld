@@ -31,6 +31,8 @@ Exit 0 means no known issues were found by these partial static checks. Exit 2 m
 
 ## Development checks
 
+The internal `oci::BlobStore` supports verified SHA-256 blob ingestion and reads with fixed buffers, explicit size limits and cooperative cancellation. It publishes only verified content and rejects existing corrupt blobs. Store directories must be caller-owned and stable; blocking input reads need their own timeout. This is the artifact foundation, not yet OCI layer extraction, image export or a build command.
+
 ```sh
 cargo fmt --all -- --check
 cargo test --locked --all-targets
