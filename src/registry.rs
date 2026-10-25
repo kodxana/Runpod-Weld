@@ -287,14 +287,17 @@ mod linux {
 
     /// Resolve a verified base without touching credentials on cache hits.
     /// Fetch writes only to disposable staging; published generations are immutable.
+    /// Caller must retain the borrowed lease while using the returned path.
     pub fn cached_base(
         store: &Path,
+        lease: &crate::store_lease::StoreLease,
         raw: &str,
         refresh_tags: bool,
         limits: crate::image::Limits,
         cancel: impl Fn() -> bool,
         fetch: impl FnOnce(&str, &Path) -> Result<()>,
     ) -> Result<PathBuf> {
+        crate::store_access::validate_root(store, lease).map_err(err)?;
         let reference = super::reference(raw, true)?;
         let source_digest = reference.split_once('@').map(|(_, d)| d.to_owned());
         let root = private_dir(&store.join("base-cache-v1"))?;
@@ -486,9 +489,13 @@ mod linux {
                     .map_err(err)?,
             })
         }
-        fn command(&self) -> Result<Command> {
+        fn command(&self, lease: Option<&crate::store_lease::StoreLease>) -> Result<Command> {
             // Never resolve an executable from a build context or a caller's PATH.
-            let mut cmd = Command::new("/usr/bin/skopeo");
+            let mut cmd = if let Some(lease) = lease {
+                crate::lease_process::command("/usr/bin/skopeo", Some(lease)).map_err(err)?
+            } else {
+                Command::new("/usr/bin/skopeo")
+            };
             if !Path::new("/usr/bin/skopeo").is_file() {
                 return Err("registry backend missing: install the Weld Debian package (includes the Skopeo dependency)".into());
             }
@@ -531,9 +538,12 @@ mod linux {
             password: Option<&[u8]>,
             input: bool,
             progress: bool,
+            guarded: bool,
             cancelled: &impl Fn() -> bool,
         ) -> Result<()> {
-            cmd.process_group(0);
+            if !guarded {
+                cmd.process_group(0);
+            }
             cmd.stdin(if password.is_some() {
                 Stdio::piped()
             } else if input {
@@ -556,24 +566,7 @@ mod linux {
             });
             // Drain capped diagnostics without forwarding untrusted registry text/secrets.
             cmd.stderr(Stdio::piped());
-            let mut child = cmd
-                .spawn()
-                .map_err(|_| "could not start packaged Skopeo backend")?;
-            let stderr = child.stderr.take().unwrap();
-            let reader = std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let mut r = stderr;
-                let mut buf = [0; 4096];
-                while let Ok(n) = r.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    if bytes.len() < 65536 {
-                        bytes.extend_from_slice(&buf[..n.min(65536 - bytes.len())]);
-                    }
-                }
-                bytes
-            });
+            let (mut child, reader) = spawn_with_diagnostics(&mut cmd)?;
             if let Some(password) = password {
                 let mut stdin = child.stdin.take().unwrap();
                 if stdin
@@ -589,34 +582,45 @@ mod linux {
                     return Err("could not deliver password to registry backend".into());
                 }
             }
-            let start = Instant::now();
-            let status = loop {
-                if cancelled() || start.elapsed() > Duration::from_secs(910) {
-                    unsafe {
-                        libc::kill(-(child.id() as i32), libc::SIGKILL);
-                    }
-                    let _ = child.kill();
-                    let _ = child.wait();
+            let status = if guarded {
+                // Wait through ECHILD before auth TempDir drop or reader join.
+                let (status, stopped) =
+                    crate::lease_process::wait(&mut child, cancelled, Duration::from_secs(910))
+                        .map_err(err)?;
+                if stopped {
                     let _ = reader.join();
                     return Err(
                         "registry operation cancelled or timed out; local image retained".into(),
                     );
                 }
-                match child.try_wait() {
-                    Ok(Some(s)) => break s,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => {
+                status
+            } else {
+                let start = Instant::now();
+                loop {
+                    if cancelled() || start.elapsed() > Duration::from_secs(910) {
+                        unsafe {
+                            libc::kill(-(child.id() as i32), libc::SIGKILL);
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
                         let _ = reader.join();
-                        return Err("registry process wait failed".into());
+                        return Err(
+                            "registry operation cancelled or timed out; local image retained"
+                                .into(),
+                        );
+                    }
+                    match child.try_wait() {
+                        Ok(Some(s)) => break s,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                        Err(_) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = reader.join();
+                            return Err("registry process wait failed".into());
+                        }
                     }
                 }
             };
-            // A helper must not leave descendants holding the diagnostic pipe.
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
             let diagnostic =
                 String::from_utf8_lossy(&reader.join().unwrap_or_default()).to_ascii_lowercase();
             if status.success() {
@@ -642,11 +646,13 @@ mod linux {
         }
         pub fn pull(
             &self,
+            lease: &crate::store_lease::StoreLease,
             reference: &str,
             destination: &Path,
             cancelled: &impl Fn() -> bool,
         ) -> Result<()> {
-            let mut cmd = self.command()?;
+            crate::store_access::validate_path(destination, Some(lease)).map_err(err)?;
+            let mut cmd = self.command(Some(lease))?;
             cmd.args([
                 "copy",
                 "--src-tls-verify=true",
@@ -660,24 +666,66 @@ mod linux {
             }
             cmd.arg(format!("docker://{reference}"))
                 .arg(oci(destination)?);
-            self.run(cmd, None, false, true, cancelled)
+            self.run(cmd, None, false, true, true, cancelled)
         }
         pub fn push(
             &self,
+            lease: &crate::store_lease::StoreLease,
             reference: &str,
             source: &Path,
             cancelled: &impl Fn() -> bool,
         ) -> Result<()> {
-            let mut cmd = self.command()?;
+            crate::store_access::validate_path(source, Some(lease)).map_err(err)?;
+            let mut cmd = self.command(Some(lease))?;
             cmd.args(["copy", "--dest-tls-verify=true", "--authfile"])
                 .arg(&self.auth);
             if let Some(c) = &self.cert {
                 cmd.arg("--dest-cert-dir").arg(c);
             }
             cmd.arg(oci(source)?).arg(format!("docker://{reference}"));
-            self.run(cmd, None, false, true, cancelled)
+            self.run(cmd, None, false, true, true, cancelled)
         }
     }
+    // Reserve the diagnostic reader before any workload exists. Resource
+    // exhaustion must not unwind/drop auth files beside a live guarded transfer.
+    fn spawn_with_diagnostics(
+        cmd: &mut Command,
+    ) -> Result<(std::process::Child, std::thread::JoinHandle<Vec<u8>>)> {
+        let (send, receive) = std::sync::mpsc::sync_channel::<std::process::ChildStderr>(1);
+        let reader = std::thread::Builder::new()
+            .name("registry-diagnostics".into())
+            .spawn(move || {
+                let Ok(mut r) = receive.recv() else {
+                    return Vec::new();
+                };
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                while let Ok(n) = r.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if bytes.len() < 65536 {
+                        bytes.extend_from_slice(&buf[..n.min(65536 - bytes.len())]);
+                    }
+                }
+                bytes
+            })
+            .map_err(|_| "could not start registry diagnostic reader")?;
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(stderr) = child.stderr.take() {
+                    let _ = send.send(stderr);
+                }
+                Ok((child, reader))
+            }
+            Err(_) => {
+                drop(send);
+                let _ = reader.join();
+                Err("could not start packaged Skopeo backend".into())
+            }
+        }
+    }
+
     fn oci(p: &Path) -> Result<String> {
         let s = p.to_str().ok_or("OCI path must be UTF-8")?;
         if s.contains(':') {
@@ -782,7 +830,7 @@ mod linux {
         let path = auth_path(options)?;
         let _lock = lock(&path.with_extension("lock"))?;
         let transport = Transport::new(options)?;
-        let mut cmd = transport.command()?;
+        let mut cmd = transport.command(None)?;
         cmd.args(["login", "--tls-verify=true", "--authfile"])
             .arg(&transport.auth);
         if let Some(c) = &transport.cert {
@@ -818,6 +866,7 @@ mod linux {
             password.as_ref().map(|p| p.0.as_slice()),
             password_stdin,
             false,
+            false,
             cancelled,
         )?;
         let bytes =
@@ -828,11 +877,11 @@ mod linux {
         let path = auth_path(options)?;
         let _lock = lock(&path.with_extension("lock"))?;
         let transport = Transport::new(options)?;
-        let mut cmd = transport.command()?;
+        let mut cmd = transport.command(None)?;
         cmd.args(["logout", "--authfile"])
             .arg(&transport.auth)
             .arg(host);
-        transport.run(cmd, None, false, false, cancelled)?;
+        transport.run(cmd, None, false, false, false, cancelled)?;
         atomic_write(
             &path,
             &read_private(&transport.auth, AUTH_CAP)?
@@ -845,7 +894,14 @@ mod linux {
             Sha256::digest(reference.as_bytes())
         ))
     }
-    pub fn save_tag(store: &Path, reference: &str, image: &Path) -> Result<()> {
+    pub fn save_tag(
+        store: &Path,
+        lease: &crate::store_lease::StoreLease,
+        reference: &str,
+        image: &Path,
+    ) -> Result<()> {
+        crate::store_access::validate_root(store, lease).map_err(err)?;
+        crate::store_access::validate_path(image, Some(lease)).map_err(err)?;
         let path = tag_path(store, reference);
         let _lock = lock(&path.with_extension("lock"))?;
         let image = fs::canonicalize(image).map_err(err)?;
@@ -855,7 +911,13 @@ mod linux {
                 .map_err(err)?,
         )
     }
-    pub fn tagged_image(store: &Path, reference: &str) -> Result<PathBuf> {
+    /// Retain the borrowed lease through verification and transfer of this path.
+    pub fn tagged_image(
+        store: &Path,
+        lease: &crate::store_lease::StoreLease,
+        reference: &str,
+    ) -> Result<PathBuf> {
+        crate::store_access::validate_root(store, lease).map_err(err)?;
         let bytes = read_private(&tag_path(store, reference), AUTH_CAP)?
             .ok_or("local tag not found; build with -t first")?;
         let v: serde_json::Value =
@@ -867,7 +929,24 @@ mod linux {
         if !p.is_absolute() {
             return Err("invalid local image path".into());
         }
+        crate::store_access::validate_path(&p, Some(lease)).map_err(err)?;
         Ok(p)
+    }
+    #[cfg(test)]
+    mod diagnostic_tests {
+        use super::*;
+        #[test]
+        fn spawn_failure_and_capped_drain_finish() {
+            let mut absent = Command::new("/no-such-weld-registry-backend");
+            absent.stderr(Stdio::piped());
+            assert!(spawn_with_diagnostics(&mut absent).is_err());
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", "head -c 131072 /dev/zero >&2"])
+                .stderr(Stdio::piped());
+            let (mut child, reader) = spawn_with_diagnostics(&mut cmd).unwrap();
+            assert!(child.wait().unwrap().success());
+            assert_eq!(reader.join().unwrap().len(), 65536);
+        }
     }
 }
 

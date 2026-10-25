@@ -68,7 +68,8 @@ pub(crate) fn key(
     Ok(format!("{:x}", hash.finalize()))
 }
 
-pub(crate) fn lookup(path: &Path) -> Result<bool> {
+pub(crate) fn lookup(path: &Path, lease: Option<&crate::store_lease::StoreLease>) -> Result<bool> {
+    crate::store_access::validate_path(path, lease)?;
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(true),
         Ok(_) => Err("cache entry must be a real directory".into()),
@@ -79,11 +80,13 @@ pub(crate) fn lookup(path: &Path) -> Result<bool> {
 
 pub(crate) fn publish(
     source: &Path,
+    lease: Option<&crate::store_lease::StoreLease>,
     destination: &Path,
     targets: Option<&[Vec<Vec<u8>>]>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
-    if lookup(destination)? {
+    crate::store_access::validate_path(source, lease)?;
+    if lookup(destination, lease)? {
         return Ok(());
     }
     let temporary = tempfile::Builder::new()
@@ -123,14 +126,19 @@ pub(crate) fn publish(
             let _ = temporary.keep();
             Ok(())
         }
-        Err(_) if lookup(destination)? => Ok(()), // A concurrent successful build won publication.
+        Err(_) if lookup(destination, lease)? => Ok(()), // A concurrent successful build won publication.
         Err(e) => Err(e.into()),
     }
 }
 
 const COPY_TARGETS: &str = "weld-copy-targets.json";
 
-pub(crate) fn copy_targets(path: &Path, metadata_limit: u64) -> Result<Vec<Vec<Vec<u8>>>> {
+pub(crate) fn copy_targets(
+    path: &Path,
+    lease: Option<&crate::store_lease::StoreLease>,
+    metadata_limit: u64,
+) -> Result<Vec<Vec<Vec<u8>>>> {
+    crate::store_access::validate_path(path, lease)?;
     // JSON byte arrays take at most four bytes per destination byte.
     let limit = metadata_limit.saturating_mul(6).max(2);
     if !fs::symlink_metadata(path.join(COPY_TARGETS))?.is_file() {

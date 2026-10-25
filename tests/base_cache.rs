@@ -67,9 +67,10 @@ fn fixture(path: &Path, version: u32) -> Result<(), String> {
     .unwrap();
     Ok(())
 }
-fn populate(store: &Path) -> PathBuf {
+fn populate(store: &Path, lease: &rpweld::store_lease::StoreLease) -> PathBuf {
     cached_base(
         store,
+        lease,
         "alpine",
         false,
         limits(),
@@ -95,11 +96,13 @@ fn record(store: &Path) -> PathBuf {
 #[test]
 fn hits_refresh_failure_and_retained_shared_generations() {
     let tmp = tempfile::tempdir().unwrap();
-    let old = populate(tmp.path());
+    let lease = rpweld::store_lease::StoreLease::shared(tmp.path(), &|| false).unwrap();
+    let old = populate(tmp.path(), &lease);
     assert_eq!(
         old,
         cached_base(
             tmp.path(),
+            &lease,
             "index.docker.io/alpine:latest",
             false,
             limits(),
@@ -112,6 +115,7 @@ fn hits_refresh_failure_and_retained_shared_generations() {
     assert!(
         cached_base(
             tmp.path(),
+            &lease,
             "alpine",
             true,
             limits(),
@@ -126,10 +130,20 @@ fn hits_refresh_failure_and_retained_shared_generations() {
     assert_eq!(before, fs::read(record(tmp.path())).unwrap());
     assert_eq!(
         old,
-        cached_base(tmp.path(), "alpine", false, limits(), || false, no_fetch).unwrap()
+        cached_base(
+            tmp.path(),
+            &lease,
+            "alpine",
+            false,
+            limits(),
+            || false,
+            no_fetch
+        )
+        .unwrap()
     );
     let new = cached_base(
         tmp.path(),
+        &lease,
         "alpine",
         true,
         limits(),
@@ -157,9 +171,11 @@ fn hits_refresh_failure_and_retained_shared_generations() {
 #[test]
 fn pinned_source_digest_is_not_converted_oci_digest() {
     let tmp = tempfile::tempdir().unwrap();
+    let lease = rpweld::store_lease::StoreLease::shared(tmp.path(), &|| false).unwrap();
     let reference = format!("alpine@sha256:{}", "a".repeat(64));
     let path = cached_base(
         tmp.path(),
+        &lease,
         &reference,
         false,
         limits(),
@@ -172,7 +188,16 @@ fn pinned_source_digest_is_not_converted_oci_digest() {
     .unwrap();
     assert_eq!(
         path,
-        cached_base(tmp.path(), &reference, true, limits(), || false, no_fetch).unwrap()
+        cached_base(
+            tmp.path(),
+            &lease,
+            &reference,
+            true,
+            limits(),
+            || false,
+            no_fetch
+        )
+        .unwrap()
     );
     let record: serde_json::Value =
         serde_json::from_slice(&fs::read(record(tmp.path())).unwrap()).unwrap();
@@ -183,7 +208,8 @@ fn pinned_source_digest_is_not_converted_oci_digest() {
 fn corrupt_records_traversal_and_selected_mismatch_fail_closed_even_on_refresh() {
     for corruption in ["json", "../escape", "descriptor", "identity"] {
         let tmp = tempfile::tempdir().unwrap();
-        populate(tmp.path());
+        let lease = rpweld::store_lease::StoreLease::shared(tmp.path(), &|| false).unwrap();
+        populate(tmp.path(), &lease);
         let file = record(tmp.path());
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
@@ -206,7 +232,16 @@ fn corrupt_records_traversal_and_selected_mismatch_fail_closed_even_on_refresh()
         }
         for refresh in [false, true] {
             assert!(
-                cached_base(tmp.path(), "alpine", refresh, limits(), || false, no_fetch).is_err()
+                cached_base(
+                    tmp.path(),
+                    &lease,
+                    "alpine",
+                    refresh,
+                    limits(),
+                    || false,
+                    no_fetch
+                )
+                .is_err()
             );
         }
     }
@@ -215,28 +250,64 @@ fn corrupt_records_traversal_and_selected_mismatch_fail_closed_even_on_refresh()
 #[test]
 fn corrupt_content_and_requested_limits_are_checked_on_hits() {
     let tmp = tempfile::tempdir().unwrap();
-    let path = populate(tmp.path());
+    let lease = rpweld::store_lease::StoreLease::shared(tmp.path(), &|| false).unwrap();
+    let path = populate(tmp.path(), &lease);
     let mut small = limits();
     small.max_layer_bytes = 1;
-    assert!(cached_base(tmp.path(), "alpine", false, small, || false, no_fetch).is_err());
+    assert!(
+        cached_base(
+            tmp.path(),
+            &lease,
+            "alpine",
+            false,
+            small,
+            || false,
+            no_fetch
+        )
+        .is_err()
+    );
     let metadata = rpweld::image::load_layout(&path, None, limits(), || false).unwrap();
     fs::write(
         path.join(format!("blobs/sha256/{}", &metadata.layers[0].digest[7..])),
         b"corrupt",
     )
     .unwrap();
-    assert!(cached_base(tmp.path(), "alpine", false, limits(), || false, no_fetch).is_err());
-    assert!(cached_base(tmp.path(), "alpine", true, limits(), || false, no_fetch).is_err());
+    assert!(
+        cached_base(
+            tmp.path(),
+            &lease,
+            "alpine",
+            false,
+            limits(),
+            || false,
+            no_fetch
+        )
+        .is_err()
+    );
+    assert!(
+        cached_base(
+            tmp.path(),
+            &lease,
+            "alpine",
+            true,
+            limits(),
+            || false,
+            no_fetch
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn invalid_new_content_does_not_replace_reference() {
     let tmp = tempfile::tempdir().unwrap();
-    populate(tmp.path());
+    let lease = rpweld::store_lease::StoreLease::shared(tmp.path(), &|| false).unwrap();
+    populate(tmp.path(), &lease);
     let before = fs::read(record(tmp.path())).unwrap();
     assert!(
         cached_base(
             tmp.path(),
+            &lease,
             "alpine",
             true,
             limits(),
@@ -255,6 +326,7 @@ fn invalid_new_content_does_not_replace_reference() {
 #[test]
 fn concurrent_cold_fetch_runs_once() {
     let tmp = tempfile::tempdir().unwrap();
+    let _lease = rpweld::store_lease::StoreLease::shared(tmp.path(), &|| false).unwrap();
     let barrier = Arc::new(Barrier::new(6));
     let calls = Arc::new(AtomicUsize::new(0));
     let threads: Vec<_> = (0..6)
@@ -266,6 +338,7 @@ fn concurrent_cold_fetch_runs_once() {
                 barrier.wait();
                 cached_base(
                     &store,
+                    &rpweld::store_lease::StoreLease::shared(&store, &|| false).unwrap(),
                     "alpine",
                     false,
                     limits(),
@@ -288,12 +361,14 @@ fn concurrent_cold_fetch_runs_once() {
 #[test]
 fn waiting_for_lock_is_cancellable() {
     let tmp = tempfile::tempdir().unwrap();
+    let lease = rpweld::store_lease::StoreLease::shared(tmp.path(), &|| false).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let store = tmp.path().to_owned();
     let owner = std::thread::spawn(move || {
         cached_base(
             &store,
+            &rpweld::store_lease::StoreLease::shared(&store, &|| false).unwrap(),
             "alpine",
             false,
             limits(),
@@ -311,6 +386,7 @@ fn waiting_for_lock_is_cancellable() {
     let start = std::time::Instant::now();
     let result = cached_base(
         tmp.path(),
+        &lease,
         "alpine",
         false,
         limits(),
@@ -334,7 +410,10 @@ fn cli_offline_hit_ignores_invalid_credentials_even_with_no_cache() {
     let tmp = tempfile::tempdir().unwrap();
     let store = tmp.path().join("store");
     rpweld::registry::private_dir(&store).unwrap();
-    populate(&store);
+    populate(
+        &store,
+        &rpweld::store_lease::StoreLease::shared(&store, &|| false).unwrap(),
+    );
     let context = tmp.path().join("context");
     fs::create_dir(&context).unwrap();
     fs::write(context.join("Dockerfile"), "FROM alpine\n").unwrap();
@@ -388,17 +467,31 @@ fn secrets_in_either_cache_area_are_rejected_without_reading() {
 #[test]
 fn symlink_generation_and_oversized_new_content_fail_closed() {
     let tmp = tempfile::tempdir().unwrap();
-    let old = populate(tmp.path());
+    let lease = rpweld::store_lease::StoreLease::shared(tmp.path(), &|| false).unwrap();
+    let old = populate(tmp.path(), &lease);
     let moved = tmp.path().join("moved");
     fs::rename(&old, &moved).unwrap();
     std::os::unix::fs::symlink(&moved, &old).unwrap();
-    assert!(cached_base(tmp.path(), "alpine", false, limits(), || false, no_fetch).is_err());
+    assert!(
+        cached_base(
+            tmp.path(),
+            &lease,
+            "alpine",
+            false,
+            limits(),
+            || false,
+            no_fetch
+        )
+        .is_err()
+    );
     let tmp = tempfile::tempdir().unwrap();
+    let lease = rpweld::store_lease::StoreLease::shared(tmp.path(), &|| false).unwrap();
     let mut small = limits();
     small.max_layer_bytes = 1;
     assert!(
         cached_base(
             tmp.path(),
+            &lease,
             "alpine",
             false,
             small,

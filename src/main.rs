@@ -37,6 +37,8 @@ Default Dockerfile: CONTEXT/Dockerfile. Verified cached bases are reused offline
 Failed refreshes fail the build and preserve the previous base cache.
 Managed builds create private state under RPWELD_HOME (default ~/.local/share/rpweld).
 One -t tag per build; push retries use 'rpweld push TAG'. Images/work are retained.
+Managed builds/push hold a persistent store lease; cross-store inputs are rejected.
+Cancellation waits for all descendants; uninterruptible tasks can delay it indefinitely.
 Managed defaults: 2 GiB rootfs/layer, 64 MiB metadata; temporary host DNS enabled
 (--no-host-dns disables it). Explicit output/work without -t keep legacy defaults.
 Bindings match literal FROM names; --base-ref selects an OCI ref annotation.
@@ -472,10 +474,17 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
         return write!(out, "{HELP}").map_err(|e| e.to_string());
     }
     let mut cli = parse_build_args(args)?;
+    // An explicitly selected Dockerfile can itself be a managed input.
+    let early_lease = source_lease(std::path::Path::new(&cli.dockerfile))?;
     let source = read_build_source(&cli.dockerfile)?;
-    prepare_build(&source, &mut cli, out)?;
-    let result = rpweld::build::build(&source, &cli.options, || CANCELLED.load(Ordering::Relaxed))
-        .map_err(|e| e.to_string())?;
+    let lease = prepare_build(&source, &mut cli, early_lease, out)?;
+    let result = match lease.as_ref() {
+        Some(lease) => rpweld::build::build_with_lease(&source, &cli.options, lease, || {
+            CANCELLED.load(Ordering::Relaxed)
+        }),
+        None => rpweld::build::build(&source, &cli.options, || CANCELLED.load(Ordering::Relaxed)),
+    }
+    .map_err(|e| e.to_string())?;
     writeln!(
         out,
         "Experimental OCI build: {}\nManifest: {}\nRetained work: {}",
@@ -484,20 +493,51 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
         result.work.display()
     )
     .map_err(|e| e.to_string())?;
-    finish_build(&cli, out)
+    finish_build(&cli, lease.as_ref(), out)
+}
+
+#[cfg(target_os = "linux")]
+fn source_lease(path: &std::path::Path) -> Result<Option<rpweld::store_lease::StoreLease>, String> {
+    if rpweld::store_access::validate_path(path, None).is_ok() {
+        return Ok(None);
+    }
+    let store = rpweld::registry::store_dir()?;
+    let lease =
+        rpweld::store_lease::StoreLease::shared(&store, &|| CANCELLED.load(Ordering::Relaxed))
+            .map_err(|e| e.to_string())?;
+    rpweld::store_access::validate_path(path, Some(&lease)).map_err(|e| e.to_string())?;
+    Ok(Some(lease))
+}
+#[cfg(not(target_os = "linux"))]
+fn source_lease(_: &std::path::Path) -> Result<Option<rpweld::store_lease::StoreLease>, String> {
+    Ok(None)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn prepare_build(_: &str, _: &mut BuildCli, _: &mut impl Write) -> Result<(), String> {
+fn prepare_build(
+    _: &str,
+    _: &mut BuildCli,
+    _: Option<rpweld::store_lease::StoreLease>,
+    _: &mut impl Write,
+) -> Result<Option<rpweld::store_lease::StoreLease>, String> {
     Err("build requires Linux amd64".into())
 }
 #[cfg(not(target_os = "linux"))]
-fn finish_build(_: &BuildCli, _: &mut impl Write) -> Result<(), String> {
+fn finish_build(
+    _: &BuildCli,
+    _: Option<&rpweld::store_lease::StoreLease>,
+    _: &mut impl Write,
+) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_build(source: &str, cli: &mut BuildCli, out: &mut impl Write) -> Result<(), String> {
+fn prepare_build(
+    source: &str,
+    cli: &mut BuildCli,
+    early_lease: Option<rpweld::store_lease::StoreLease>,
+    out: &mut impl Write,
+) -> Result<Option<rpweld::store_lease::StoreLease>, String> {
     use rpweld::{
         build_plan::{self, Base},
         registry,
@@ -526,16 +566,39 @@ fn prepare_build(source: &str, cli: &mut BuildCli, out: &mut impl Write) -> Resu
         }
         cli.registry.cert_dir = Some(cert_dir);
     }
-    let managed = cli.options.output.as_os_str().is_empty()
+    let managed = early_lease.is_some()
+        || cli.options.output.as_os_str().is_empty()
         || cli.options.work.as_os_str().is_empty()
         || cli.tag.is_some()
         || cli.registry.authfile.is_some()
-        || pull;
+        || pull
+        || [&cli.options.work, &cli.options.output, &cli.options.context]
+            .into_iter()
+            .chain(cli.options.bases.values().map(|b| &b.layout))
+            .filter(|p| !p.as_os_str().is_empty())
+            .any(|p| rpweld::store_access::validate_path(p, None).is_err());
     if !managed {
-        return Ok(());
+        // The library validates explicit paths too; managed inputs never opt out.
+        return Ok(None);
     }
     let context = std::fs::canonicalize(&cli.options.context).map_err(|e| e.to_string())?;
     let store = registry::store_dir()?;
+    let lease = match early_lease {
+        Some(lease) => lease,
+        None => {
+            rpweld::store_lease::StoreLease::shared(&store, &|| CANCELLED.load(Ordering::Relaxed))
+                .map_err(|e| e.to_string())?
+        }
+    };
+    rpweld::store_access::validate_root(&store, &lease).map_err(|e| e.to_string())?;
+    for path in [&cli.options.work, &cli.options.output, &cli.options.context]
+        .into_iter()
+        .chain(cli.options.bases.values().map(|b| &b.layout))
+    {
+        if !path.as_os_str().is_empty() {
+            rpweld::store_access::validate_path(path, Some(&lease)).map_err(|e| e.to_string())?;
+        }
+    }
     if store.starts_with(&context) || context.starts_with(&store) {
         return Err(
             "build context and Weld store must be disjoint; set RPWELD_HOME outside the context"
@@ -570,6 +633,7 @@ fn prepare_build(source: &str, cli: &mut BuildCli, out: &mut impl Write) -> Resu
         } else {
             let layout = registry::cached_base(
                 &store,
+                &lease,
                 &reference,
                 cli.pull,
                 cli.options.limits.image,
@@ -578,8 +642,12 @@ fn prepare_build(source: &str, cli: &mut BuildCli, out: &mut impl Write) -> Resu
                     writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
                         .map_err(|e| e.to_string())?;
                     out.flush().map_err(|e| e.to_string())?;
-                    registry::Transport::new(&cli.registry)?
-                        .pull(reference, layout, &|| CANCELLED.load(Ordering::Relaxed))
+                    registry::Transport::new(&cli.registry)?.pull(
+                        &lease,
+                        reference,
+                        layout,
+                        &|| CANCELLED.load(Ordering::Relaxed),
+                    )
                 },
             )?;
             resolved.insert(reference, layout.clone());
@@ -593,17 +661,22 @@ fn prepare_build(source: &str, cli: &mut BuildCli, out: &mut impl Write) -> Resu
             },
         );
     }
-    Ok(())
+    Ok(Some(lease))
 }
 
 #[cfg(target_os = "linux")]
-fn finish_build(cli: &BuildCli, out: &mut impl Write) -> Result<(), String> {
+fn finish_build(
+    cli: &BuildCli,
+    lease: Option<&rpweld::store_lease::StoreLease>,
+    out: &mut impl Write,
+) -> Result<(), String> {
     if let Some(tag) = &cli.tag {
         let store = rpweld::registry::store_dir()?;
-        rpweld::registry::save_tag(&store, tag, &cli.options.output)?;
+        let lease = lease.ok_or("tagging requires store lease")?;
+        rpweld::registry::save_tag(&store, lease, tag, &cli.options.output)?;
         writeln!(out, "Tagged {tag}").map_err(|e| e.to_string())?;
         if cli.push {
-            push_image_path(tag, &cli.options.output, &cli.registry, out)?;
+            push_image_path(lease, tag, &cli.options.output, &cli.registry, out)?;
         }
     }
     Ok(())
@@ -615,12 +688,17 @@ fn push_image(
     options: &rpweld::registry::Options,
     out: &mut impl Write,
 ) -> Result<(), String> {
-    let image = rpweld::registry::tagged_image(&rpweld::registry::store_dir()?, tag)?;
-    push_image_path(tag, &image, options, out)
+    let store = rpweld::registry::store_dir()?;
+    let lease =
+        rpweld::store_lease::StoreLease::shared(&store, &|| CANCELLED.load(Ordering::Relaxed))
+            .map_err(|e| e.to_string())?;
+    let image = rpweld::registry::tagged_image(&store, &lease, tag)?;
+    push_image_path(&lease, tag, &image, options, out)
 }
 
 #[cfg(target_os = "linux")]
 fn push_image_path(
+    lease: &rpweld::store_lease::StoreLease,
     tag: &str,
     image: &std::path::Path,
     options: &rpweld::registry::Options,
@@ -643,7 +721,7 @@ fn push_image_path(
     writeln!(out, "Pushing {tag} (verified TLS)...").map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())?;
     rpweld::registry::Transport::new(options)?
-        .push(tag, image, &|| CANCELLED.load(Ordering::Relaxed))?;
+        .push(lease, tag, image, &|| CANCELLED.load(Ordering::Relaxed))?;
     writeln!(out, "Pushed {tag}").map_err(|e| e.to_string())
 }
 
@@ -855,6 +933,13 @@ fn summary(report: &serde_json::Value) -> String {
 fn main() {
     // The tracer owns process-wide signal and child-reaping state. Dispatch only
     // in a fresh executable, before the builder initializes threads or children.
+    #[cfg(target_os = "linux")]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() == Some(std::ffi::OsStr::new("__lease-guard")) {
+            rpweld::lease_process::entry(args);
+        }
+    }
     let mut worker_args = std::env::args_os().skip(1);
     if worker_args.next().as_deref() == Some(std::ffi::OsStr::new("__trace-worker")) {
         rpweld::trace_worker::worker_entry(worker_args);
@@ -919,7 +1004,13 @@ mod tests {
                 self.text.extend_from_slice(bytes);
                 let text = String::from_utf8_lossy(&self.text);
                 if !self.retagged && text.contains(&format!("Tagged {TAG}\n")) {
-                    rpweld::registry::save_tag(&self.store, TAG, &self.replacement).unwrap();
+                    rpweld::registry::save_tag(
+                        &self.store,
+                        &rpweld::store_lease::StoreLease::shared(&self.store, &|| false).unwrap(),
+                        TAG,
+                        &self.replacement,
+                    )
+                    .unwrap();
                     self.retagged = true;
                 }
                 if text.contains("Pushing ") {
@@ -959,7 +1050,12 @@ mod tests {
         assert_eq!(error, "stop before transport");
         assert!(writer.retagged && writer.verified);
         assert_eq!(
-            rpweld::registry::tagged_image(&writer.store, TAG).unwrap(),
+            rpweld::registry::tagged_image(
+                &writer.store,
+                &rpweld::store_lease::StoreLease::shared(&writer.store, &|| false).unwrap(),
+                TAG
+            )
+            .unwrap(),
             writer.replacement
         );
         // Standalone push resolves the current tag and rejects its invalid layout.

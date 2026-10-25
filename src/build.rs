@@ -13,6 +13,9 @@
 //! Errors leave partial owned work/output directories for manual inspection;
 //! nothing recursively deletes user trees. Never reuse a failed build directory.
 
+#[cfg(not(target_os = "linux"))]
+use std::process::Command;
+
 use crate::{
     build_plan::{self, Base, InstructionKind as I, Protocol, Run},
     context, export, image, layer,
@@ -20,13 +23,14 @@ use crate::{
     rootfs,
 };
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 use std::{
     collections::BTreeMap,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::Duration,
+    process::Stdio,
 };
 
 /// Errors include underlying parser, image, filesystem, worker and export errors.
@@ -602,9 +606,10 @@ fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<()>
 }
 
 /// Parse/static-preflight completely before creating directories. Spawns the
-/// current executable's `__trace-worker` dispatch (caller must implement it).
+/// current executable's `__trace-worker` and `__lease-guard` dispatches.
+/// Embedders must implement both, before threads and signal handlers.
 /// Cancellation is cooperative for I/O; RUN cancellation signals its dedicated
-/// worker, waits for bounded cleanup, then kills/reaps it if necessary.
+/// worker through the lease guard, waiting for descendant-safe cleanup.
 struct StageResult {
     result: BuildResult,
     args: BTreeMap<String, String>,
@@ -649,15 +654,43 @@ pub fn selected_stages(plan: &build_plan::BuildPlan, target: Option<&str>) -> Re
     Ok(selected.into_iter().collect())
 }
 
+/// Compatibility entry point for truly unmanaged paths only.
 pub fn build(
     source: &str,
     options: &BuildOptions,
+    cancelled: impl Fn() -> bool,
+) -> Result<BuildResult> {
+    build_inner(source, options, None, cancelled)
+}
+
+/// Caller keeps this lease through use of returned managed paths, tagging and push.
+pub fn build_with_lease(
+    source: &str,
+    options: &BuildOptions,
+    lease: &crate::store_lease::StoreLease,
+    cancelled: impl Fn() -> bool,
+) -> Result<BuildResult> {
+    build_inner(source, options, Some(lease), cancelled)
+}
+
+fn build_inner(
+    source: &str,
+    options: &BuildOptions,
+    lease: Option<&crate::store_lease::StoreLease>,
     cancelled: impl Fn() -> bool,
 ) -> Result<BuildResult> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err("build requires Linux amd64".into());
     }
     check(&cancelled)?;
+    for path in [&options.work, &options.output, &options.context]
+        .into_iter()
+        .chain(options.bases.values().map(|b| &b.layout))
+        .chain(options.cache.iter())
+        .chain(options.dockerfile.iter())
+    {
+        crate::store_access::validate_path(path, lease)?;
+    }
     let plan = build_plan::parse(source)?;
     let policy = context::load_policy(&options.context, options.dockerfile.as_deref(), &cancelled)?;
     let selected = selected_stages(&plan, options.target.as_deref())?;
@@ -750,6 +783,7 @@ pub fn build(
             &previous,
             &mut notice,
             &policy,
+            lease,
             &cancelled,
         )?;
         previous.insert(n, result);
@@ -757,6 +791,7 @@ pub fn build(
     Ok(previous.remove(&target).unwrap().result)
 }
 
+#[allow(clippy::too_many_arguments)] // Keep the operation lease explicit at each call boundary.
 fn build_stage(
     plan: &build_plan::BuildPlan,
     index: usize,
@@ -764,6 +799,7 @@ fn build_stage(
     previous: &BTreeMap<usize, StageResult>,
     notice: &mut bool,
     policy: &crate::dockerignore::Policy,
+    lease: Option<&crate::store_lease::StoreLease>,
     cancelled: impl Fn() -> bool,
 ) -> Result<StageResult> {
     check(&cancelled)?;
@@ -887,10 +923,13 @@ fn build_stage(
     };
     let mut cache_hit = false;
     if let Some(entry) = &cache_entry
-        && crate::build_cache::lookup(entry)?
+        && crate::build_cache::lookup(entry, lease)?
     {
-        let targets =
-            crate::build_cache::copy_targets(entry, options.limits.layer.max_metadata_bytes)?;
+        let targets = crate::build_cache::copy_targets(
+            entry,
+            lease,
+            options.limits.layer.max_metadata_bytes,
+        )?;
         let mut targets = targets.iter();
         let mut copied = context::Summary::default();
         for step in &steps {
@@ -1007,7 +1046,7 @@ fn build_stage(
                     None
                 };
                 let result = worker(
-                    &root, &run_state, command, workdir, env, options, &cancelled,
+                    &root, &run_state, command, workdir, env, options, lease, &cancelled,
                 );
                 // Restore even on failed/cancelled RUN; restoration errors are fatal.
                 if let Some(dns) = dns {
@@ -1022,13 +1061,19 @@ fn build_stage(
     let manifest = if cache_hit {
         // Preserve the cached OCI bytes: re-exporting a replayed tree changes
         // access timestamps and would invalidate every dependent stage.
-        crate::build_cache::publish(cache_entry.as_ref().unwrap(), &output, None, &cancelled)?;
+        crate::build_cache::publish(
+            cache_entry.as_ref().unwrap(),
+            lease,
+            &output,
+            None,
+            &cancelled,
+        )?;
         metadata.as_ref().unwrap().selected.clone()
     } else {
         export::export_layout(&root, &output, &config, options.limits.export, &cancelled)?
     };
     if !cache_hit && let Some(entry) = cache_entry {
-        crate::build_cache::publish(&output, &entry, Some(&copy_targets), &cancelled)?;
+        crate::build_cache::publish(&output, lease, &entry, Some(&copy_targets), &cancelled)?;
     }
     Ok(StageResult {
         result: BuildResult {
@@ -1109,6 +1154,7 @@ fn install_dns(root: &Path, state: &Path) -> Result<Option<Dns>> {
     Ok(Some(dns))
 }
 
+#[allow(clippy::too_many_arguments)] // The lease is borrowed independently of build options.
 fn worker(
     root: &Path,
     state: &Path,
@@ -1116,10 +1162,17 @@ fn worker(
     wd: &str,
     env: &[String],
     options: &BuildOptions,
+    lease: Option<&crate::store_lease::StoreLease>,
     c: &impl Fn() -> bool,
 ) -> Result<()> {
     let timeout = options.limits.run_timeout_seconds;
-    let mut cmd = Command::new(std::env::current_exe()?);
+    #[cfg(target_os = "linux")]
+    let mut cmd = crate::lease_process::command(std::env::current_exe()?, lease)?;
+    #[cfg(not(target_os = "linux"))]
+    let mut cmd = {
+        let _ = lease;
+        Command::new(std::env::current_exe()?)
+    };
     cmd.env("RPWELD_BUILD_WORKER", "1").env(
         "RPWELD_TRACE_VERBOSE",
         if options.verbose { "1" } else { "0" },
@@ -1138,33 +1191,27 @@ fn worker(
     for e in env {
         cmd.arg("--env").arg(e);
     }
-    let mut child = cmd.spawn()?;
-    let start = std::time::Instant::now();
-    let mut stopping = None;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if stopping.is_some() {
-                return Err("RUN cancelled/timed out; partial root retained".into());
-            }
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(format!("RUN worker failed: {status}").into())
-            };
+    let child = cmd.spawn()?;
+    #[cfg(target_os = "linux")]
+    {
+        let mut child = child;
+        let (status, stopped) = crate::lease_process::wait(
+            &mut child,
+            c,
+            Duration::from_secs(timeout.saturating_add(5)),
+        )?;
+        if stopped {
+            return Err("RUN cancelled/timed out; partial root retained".into());
         }
-        if stopping.is_none() && (c() || start.elapsed() > Duration::from_secs(timeout + 5)) {
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::kill(child.id() as i32, libc::SIGTERM);
-            }
-            stopping = Some(std::time::Instant::now());
+        if !status.success() {
+            return Err(format!("RUN worker failed: {status}").into());
         }
-        if stopping.is_some_and(|s| s.elapsed() > Duration::from_secs(5)) {
-            child.kill()?;
-            child.wait()?;
-            return Err("RUN cleanup deadline exceeded; partial root retained".into());
-        }
-        std::thread::sleep(Duration::from_millis(25));
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (child, timeout, c);
+        Err("RUN requires Linux".into())
     }
 }
 

@@ -274,3 +274,11 @@ JSON schema v1 preserves UTF-8 paths as strings. Non-UTF-8 Unix paths use
 `{"unix_bytes":[...]}`; Windows equivalents use `{"windows_wide":[...]}`.
 These arrays preserve exact native path units without replacement-character
 collisions. Human-readable output escapes control characters.
+
+Managed builds and pushes hold a shared store lease. Dedicated supervisors keep
+that lease while RUN or transfer descendants survive the CLI. Cancellation waits
+for safe teardown before restoring DNS or removing temporary transfer files;
+uninterruptible descendants can delay shutdown indefinitely. Do not kill the
+supervisors or replace `store.lock`. This is a cooperative local-store protocol,
+not isolation from hostile processes. Older binaries do not participate, so all
+old workers and transfers must exit before any future cleanup feature is used.

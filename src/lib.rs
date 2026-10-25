@@ -14,9 +14,14 @@ pub mod executor;
 pub mod export;
 pub mod image;
 pub mod layer;
+mod lease_guard;
+#[cfg(target_os = "linux")]
+pub mod lease_process;
 pub mod oci;
 pub mod registry;
 pub mod resources;
 pub mod rootfs;
+pub mod store_access;
 pub mod store_inventory;
+pub mod store_lease;
 pub mod trace_worker;
