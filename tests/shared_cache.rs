@@ -1,0 +1,513 @@
+#![cfg(target_os = "linux")]
+use rpweld::{
+    image::{self, Limits},
+    oci::{BlobStore, Descriptor, ManagedCache},
+    store_lease::StoreLease,
+};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{
+    cell::Cell,
+    fs,
+    os::unix::fs::{MetadataExt, symlink},
+    path::{Path, PathBuf},
+    sync::{Arc, Barrier},
+};
+
+fn limits() -> Limits {
+    Limits {
+        max_metadata_bytes: 65536,
+        max_total_metadata_bytes: 262144,
+        max_descriptors: 32,
+        max_layer_bytes: 4096,
+        max_total_layer_bytes: 8192,
+    }
+}
+fn key(n: u8) -> String {
+    format!("{n:064x}")
+}
+fn blob(store: &BlobStore, media_type: &str, bytes: &[u8]) -> Descriptor {
+    let descriptor = Descriptor {
+        media_type: media_type.into(),
+        digest: format!("sha256:{:x}", Sha256::digest(bytes)),
+        size: bytes.len() as i64,
+        annotations: Default::default(),
+        extensions: Default::default(),
+    };
+    store.ingest(bytes, &descriptor, 65536, || false).unwrap();
+    descriptor
+}
+fn fixture(path: &Path, version: u32) -> Descriptor {
+    fs::create_dir(path).unwrap();
+    let store = BlobStore::open(path).unwrap();
+    let layer = blob(
+        &store,
+        "application/vnd.oci.image.layer.v1.tar",
+        &[42; 4096],
+    );
+    let config = blob(
+        &store,
+        "application/vnd.oci.image.config.v1+json",
+        &serde_json::to_vec(&json!({
+            "architecture": "amd64", "os": "linux", "config": {}, "version": version,
+            "rootfs": {"type": "layers", "diff_ids": [layer.digest]}
+        }))
+        .unwrap(),
+    );
+    let manifest = blob(
+        &store,
+        "application/vnd.oci.image.manifest.v1+json",
+        &serde_json::to_vec(&json!({
+            "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": config, "layers": [layer]
+        }))
+        .unwrap(),
+    );
+    blob(
+        &store,
+        "application/octet-stream",
+        b"unreferenced must not be copied",
+    );
+    fs::write(
+        path.join("oci-layout"),
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        path.join("index.json"),
+        serde_json::to_vec(&json!({"schemaVersion":2,"manifests":[manifest]})).unwrap(),
+    )
+    .unwrap();
+    layer
+}
+fn layer_path(root: &Path, layer: &Descriptor) -> PathBuf {
+    root.join("blobs/sha256")
+        .join(layer.digest.strip_prefix("sha256:").unwrap())
+}
+fn inode(path: &Path) -> (u64, u64) {
+    let m = fs::metadata(path).unwrap();
+    (m.dev(), m.ino())
+}
+fn publish(cache: &ManagedCache<'_>, source: &Path, n: u8) -> PathBuf {
+    cache
+        .publish(
+            source,
+            &key(n),
+            limits(),
+            &[vec![b"payload".to_vec()]],
+            1024,
+            &|| false,
+        )
+        .unwrap()
+}
+fn lookup(cache: &ManagedCache<'_>, n: u8) -> bool {
+    cache
+        .lookup(&key(n), limits(), 1024, 1, &|| false)
+        .unwrap()
+        .is_some()
+}
+
+#[test]
+fn shares_only_verified_pool_inodes_and_never_adopts_mutable_source() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let a = publish(&cache, &source, 1);
+    let b = publish(&cache, &source, 2);
+    let pool = layer_path(&t.path().join("cache-v2/content"), &layer);
+    assert_eq!(inode(&pool), inode(&layer_path(&a, &layer)));
+    assert_eq!(inode(&pool), inode(&layer_path(&b, &layer)));
+    assert_ne!(inode(&pool), inode(&layer_path(&source, &layer)));
+    assert_eq!(fs::metadata(&pool).unwrap().nlink(), 3);
+    assert_eq!(
+        fs::read_dir(t.path().join("cache-v2/content/blobs/sha256"))
+            .unwrap()
+            .count(),
+        3
+    );
+    fs::write(
+        layer_path(&source, &layer),
+        b"mutable source was overwritten",
+    )
+    .unwrap();
+    assert!(lookup(&cache, 1));
+    assert!(lookup(&cache, 2));
+    assert!(
+        StoreLease::try_exclusive_existing(t.path())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn does_not_adopt_empty_unmarked_or_replaced_namespaces() {
+    let t = tempfile::tempdir().unwrap();
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    fs::create_dir(t.path().join("cache-v2")).unwrap();
+    assert!(ManagedCache::open(t.path(), &lease, &|| false).is_err());
+    fs::rename(t.path().join("cache-v2"), t.path().join("unmarked")).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    fs::rename(
+        t.path().join("cache-v2/entries"),
+        t.path().join("saved-entries"),
+    )
+    .unwrap();
+    fs::create_dir(t.path().join("cache-v2/entries")).unwrap();
+    assert!(cache.lookup(&key(1), limits(), 1024, 1, &|| false).is_err());
+    assert!(ManagedCache::open(t.path(), &lease, &|| false).is_err());
+}
+
+#[test]
+fn concurrent_initialization_and_publication_validate_one_winner() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    fixture(&source, 1);
+    // Initialize only the persistent lease before racing namespace creation.
+    drop(StoreLease::shared(t.path(), &|| false).unwrap());
+    let barrier = Arc::new(Barrier::new(4));
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let barrier = barrier.clone();
+            let root = t.path();
+            let source = &source;
+            scope.spawn(move || {
+                let lease = StoreLease::shared(root, &|| false).unwrap();
+                barrier.wait();
+                let cache = ManagedCache::open(root, &lease, &|| false).unwrap();
+                barrier.wait();
+                publish(&cache, source, 1);
+                assert!(lookup(&cache, 1));
+            });
+        }
+    });
+    assert_eq!(
+        fs::read_dir(t.path().join("cache-v2/entries"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_dir(t.path().join("cache-v2/content/blobs/sha256"))
+            .unwrap()
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn existing_winner_must_match_source_and_receipt_and_never_gets_replaced() {
+    let t = tempfile::tempdir().unwrap();
+    let a = t.path().join("a");
+    fixture(&a, 1);
+    let b = t.path().join("b");
+    fixture(&b, 2);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let entry = publish(&cache, &a, 1);
+    let original = inode(&entry);
+    assert!(
+        cache
+            .publish(
+                &b,
+                &key(1),
+                limits(),
+                &[vec![b"payload".to_vec()]],
+                1024,
+                &|| false
+            )
+            .is_err()
+    );
+    assert!(
+        cache
+            .publish(
+                &a,
+                &key(1),
+                limits(),
+                &[vec![b"different".to_vec()]],
+                1024,
+                &|| false
+            )
+            .is_err()
+    );
+    assert_eq!(inode(&entry), original);
+    assert!(lookup(&cache, 1));
+    fs::create_dir(t.path().join("cache-v2/entries").join(key(2))).unwrap();
+    assert!(
+        cache
+            .publish(&a, &key(2), limits(), &[], 0, &|| false)
+            .is_err()
+    );
+}
+
+#[test]
+fn in_place_corruption_poisoning_is_detected_and_never_repaired() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let a = publish(&cache, &source, 1);
+    publish(&cache, &source, 2);
+    fs::write(layer_path(&a, &layer), b"corrupt shared inode").unwrap();
+    for n in [1, 2] {
+        assert!(cache.lookup(&key(n), limits(), 1024, 1, &|| false).is_err());
+    }
+    assert!(
+        cache
+            .publish(&source, &key(3), limits(), &[], 0, &|| false)
+            .is_err()
+    );
+    assert!(image::load_layout(&source, None, limits(), || false).is_ok());
+    assert!(!t.path().join("cache-v2/entries").join(key(3)).exists());
+}
+
+#[test]
+fn replacement_corruption_is_isolated_but_even_valid_detached_blobs_are_rejected() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let a = publish(&cache, &source, 1);
+    publish(&cache, &source, 2);
+    let path = layer_path(&a, &layer);
+    fs::remove_file(&path).unwrap();
+    fs::copy(layer_path(&source, &layer), &path).unwrap();
+    assert!(cache.lookup(&key(1), limits(), 1024, 1, &|| false).is_err());
+    assert!(lookup(&cache, 2));
+    fs::write(path, b"corrupt detached inode").unwrap();
+    assert!(cache.lookup(&key(1), limits(), 1024, 1, &|| false).is_err());
+    assert!(lookup(&cache, 2));
+}
+
+#[test]
+fn receipts_keys_and_metadata_are_bounded_and_validated_on_hits() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    assert!(
+        cache
+            .publish(&source, "../outside", limits(), &[], 0, &|| false)
+            .is_err()
+    );
+    assert!(
+        cache
+            .publish(
+                &source,
+                &key(1),
+                limits(),
+                &[vec![vec![1; 4097]]],
+                10000,
+                &|| false
+            )
+            .is_err()
+    );
+    assert!(
+        cache
+            .publish(
+                &source,
+                &key(1),
+                limits(),
+                &[vec![b"payload".to_vec()]],
+                0,
+                &|| false
+            )
+            .is_err()
+    );
+    let entry = publish(&cache, &source, 1);
+    assert!(cache.lookup(&key(1), limits(), 0, 1, &|| false).is_err());
+    assert!(cache.lookup(&key(1), limits(), 1024, 2, &|| false).is_err());
+    let receipt = entry.join("weld-copy-targets.json");
+    fs::write(&receipt, b"[[]]").unwrap();
+    assert!(cache.lookup(&key(1), limits(), 1024, 1, &|| false).is_err());
+    fs::write(entry.join("weld-cache-entry.json"), vec![b' '; 16385]).unwrap();
+    assert!(cache.lookup(&key(1), limits(), 1024, 1, &|| false).is_err());
+}
+
+#[test]
+fn symlinks_and_cross_store_inputs_never_bypass_ownership() {
+    let t = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = outside.path().join("source");
+    fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let other_lease = StoreLease::shared(outside.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    assert!(
+        cache
+            .publish(&source, &key(1), limits(), &[], 0, &|| false)
+            .is_err()
+    );
+    assert!(ManagedCache::open(t.path(), &other_lease, &|| false).is_err());
+    symlink(&source, t.path().join("cache-v2/entries").join(key(1))).unwrap();
+    assert!(cache.lookup(&key(1), limits(), 1024, 1, &|| false).is_err());
+    fs::rename(t.path().join("cache-v2"), t.path().join("original")).unwrap();
+    symlink(t.path().join("original"), t.path().join("cache-v2")).unwrap();
+    assert!(ManagedCache::open(t.path(), &lease, &|| false).is_err());
+}
+
+#[test]
+fn cancellation_at_every_check_never_exposes_a_partial_entry() {
+    // Establish the exact check count for this fixture, then interrupt each check.
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let count = Cell::new(0);
+    cache
+        .publish(&source, &key(1), limits(), &[], 0, &|| {
+            count.set(count.get() + 1);
+            false
+        })
+        .unwrap();
+    let checks = count.get();
+    assert!(checks > 10);
+    for stop in 1..=checks {
+        let attempt = tempfile::tempdir().unwrap();
+        let lease = StoreLease::shared(attempt.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(attempt.path(), &lease, &|| false).unwrap();
+        // Source must be external to the first fixture's leased store.
+        let input = attempt.path().join("source");
+        fixture(&input, 1);
+        let calls = Cell::new(0);
+        let result = cache.publish(&input, &key(1), limits(), &[], 0, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() == stop
+        });
+        assert!(result.is_err(), "check {stop} did not cancel");
+        assert!(
+            !attempt
+                .path()
+                .join("cache-v2/entries")
+                .join(key(1))
+                .exists(),
+            "check {stop} published"
+        );
+        assert_eq!(
+            fs::read_dir(attempt.path().join("cache-v2/entries"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+}
+
+#[test]
+fn crash_child() {
+    let Some(root) = std::env::var_os("RPWELD_SHARED_CACHE_CRASH_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let stop: usize = std::env::var("RPWELD_SHARED_CACHE_CRASH_STOP")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let lease = StoreLease::shared(&root, &|| false).unwrap();
+    let cache = ManagedCache::open(&root, &lease, &|| false).unwrap();
+    let calls = Cell::new(0);
+    cache
+        .publish(&root.join("source"), &key(1), limits(), &[], 0, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == stop {
+                unsafe { libc::_exit(77) };
+            }
+            false
+        })
+        .unwrap();
+    // No destructors: also exercise reopening a completed publication.
+    unsafe { libc::_exit(78) };
+}
+
+#[test]
+fn abrupt_process_exit_leaves_only_valid_entries_or_unpublished_debris() {
+    let baseline = tempfile::tempdir().unwrap();
+    fixture(&baseline.path().join("source"), 1);
+    let lease = StoreLease::shared(baseline.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(baseline.path(), &lease, &|| false).unwrap();
+    let count = Cell::new(0);
+    cache
+        .publish(
+            &baseline.path().join("source"),
+            &key(1),
+            limits(),
+            &[],
+            0,
+            &|| {
+                count.set(count.get() + 1);
+                false
+            },
+        )
+        .unwrap();
+    for stop in [1, 15, count.get() / 2, count.get() - 1, count.get(), 0] {
+        let t = tempfile::tempdir().unwrap();
+        fixture(&t.path().join("source"), 1);
+        drop(StoreLease::shared(t.path(), &|| false).unwrap());
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_child", "--nocapture"])
+            .env("RPWELD_SHARED_CACHE_CRASH_ROOT", t.path())
+            .env("RPWELD_SHARED_CACHE_CRASH_STOP", stop.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if stop == 0 { 78 } else { 77 }),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+        assert_eq!(
+            cache
+                .lookup(&key(1), limits(), 0, 0, &|| false)
+                .unwrap()
+                .is_some(),
+            stop == 0
+        );
+        // Recovery does not adopt/delete crash debris; verified orphan blobs may be reused.
+        cache
+            .publish(&t.path().join("source"), &key(1), limits(), &[], 0, &|| {
+                false
+            })
+            .unwrap();
+        assert!(
+            cache
+                .lookup(&key(1), limits(), 0, 0, &|| false)
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn missing_blob_never_falls_back_to_pool_and_unknown_entry_children_fail_closed() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let a = publish(&cache, &source, 1);
+    let b = publish(&cache, &source, 2);
+    fs::remove_file(layer_path(&a, &layer)).unwrap();
+    assert!(cache.lookup(&key(1), limits(), 1024, 1, &|| false).is_err());
+    assert!(lookup(&cache, 2));
+    fs::write(b.join("user-file"), b"never adopt me").unwrap();
+    assert!(cache.lookup(&key(2), limits(), 1024, 1, &|| false).is_err());
+    assert!(
+        cache
+            .publish(
+                &source,
+                &key(2),
+                limits(),
+                &[vec![b"payload".to_vec()]],
+                1024,
+                &|| false
+            )
+            .is_err()
+    );
+    assert_eq!(fs::read(b.join("user-file")).unwrap(), b"never adopt me");
+}

@@ -150,12 +150,7 @@ pub(crate) fn publish_created(
         }
     }
     if let Some((targets, metadata_limit)) = targets {
-        let limit = receipt_limit(metadata_limit, targets.len())?;
-        let bytes = serde_json::to_vec(targets)?;
-        if bytes.len() as u64 > limit {
-            return Err("cached COPY targets exceed metadata budget".into());
-        }
-        validate_receipt(&bytes, metadata_limit, targets.len())?;
+        let bytes = receipt_bytes(targets, metadata_limit)?;
         fs::write(temporary.path().join(COPY_TARGETS), bytes)?;
     }
     if cancelled() {
@@ -172,7 +167,35 @@ pub(crate) fn publish_created(
     }
 }
 
-const COPY_TARGETS: &str = "weld-copy-targets.json";
+pub(crate) const COPY_TARGETS: &str = "weld-copy-targets.json";
+
+pub(crate) fn receipt_bytes(targets: &[Vec<Vec<u8>>], metadata_limit: u64) -> Result<Vec<u8>> {
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: u64,
+    }
+    impl Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() as u64 > self.limit.saturating_sub(self.bytes.len() as u64) {
+                return Err(std::io::Error::other(
+                    "cached COPY targets exceed metadata budget",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = Bounded {
+        bytes: Vec::new(),
+        limit: receipt_limit(metadata_limit, targets.len())?,
+    };
+    serde_json::to_writer(&mut output, targets)?;
+    validate_receipt(&output.bytes, metadata_limit, targets.len())?;
+    Ok(output.bytes)
+}
 
 fn receipt_limit(metadata_limit: u64, instructions: usize) -> Result<u64> {
     if instructions > crate::build_plan::MAX_INSTRUCTIONS {
@@ -287,6 +310,20 @@ pub(crate) fn copy_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutable_output_copy_does_not_alias_immutable_source() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("blob"), b"immutable").unwrap();
+        fs::hard_link(source.join("blob"), t.path().join("pool-blob")).unwrap();
+        let output = t.path().join("output");
+        publish_created(&source, None, &output, None, &|| false, || Ok(())).unwrap();
+        fs::write(output.join("blob"), b"mutable output").unwrap();
+        assert_eq!(fs::read(source.join("blob")).unwrap(), b"immutable");
+        assert_eq!(fs::read(t.path().join("pool-blob")).unwrap(), b"immutable");
+    }
 
     #[test]
     fn cancelled_blob_publication_never_installs_an_entry() {

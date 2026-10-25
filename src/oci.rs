@@ -12,6 +12,11 @@
 //! RustCrypto sha2 0.10.9 incremental Digest API (MIT OR Apache-2.0, MSRV 1.41).
 
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+#[path = "cache_store.rs"]
+mod cache_store;
+#[cfg(target_os = "linux")]
+pub use cache_store::ManagedCache;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
