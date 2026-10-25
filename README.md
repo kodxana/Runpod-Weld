@@ -397,7 +397,8 @@ rpweld image rm TAG --dry-run --json
 `--json` is optional. Without `--dry-run`, cleanup applies a newly computed plan.
 `image rm` removes only the tag record; builds cleanup removes only validated
 listed components, retaining the run, ownership record, stages container and unknown
-siblings. Cache cleanup currently reports a protected no-op. A plan acquires
+siblings. Cache cleanup selects validated, unreferenced owned cache-v2 entries
+and reclaims unreferenced owned blobs after checking their remaining links. A plan acquires
 the existing exclusive store lease without waiting; a busy store selects nothing
 and returns an error. There is no force option. Missing stores remain absent;
 legacy stores without a lock get a protected best-effort inventory, without
@@ -415,11 +416,19 @@ External regular files with unrelated identities need not protect every build.
 Malformed or incomplete scans select nothing. Inventory skips of symlinks/special
 entries inside validated components are resolved by the component scan. Explicit and external paths
 are never owned. `image rm` selects only the validated tag record; its target stays
-unchanged, including after a retag. Cache generations, temporary entries, and
-structurally complete layouts lack ownership proof and stay protected. Thus cache
-prune currently has zero eligible entries; current base references also remain
-protected. Lockfiles, authentication files, certificates, and unknown entries are
+unchanged, including after a retag. Legacy cache-v1 entries, base-cache generations,
+unrecognized temporary entries, and layouts without validated ownership remain
+protected. Cache-v2 selection requires complete provenance and hardlink accounting;
+unexplained external aliases prevent deletion. Lockfiles, authentication files, certificates, and unknown entries are
 always protected.
+
+Cache retirement holds the exclusive store lease and publication lock. A durable
+`cache-v2/retirement.json` records deletion intent before mutation; interrupted
+retirement blocks cache access until a subsequent cleanup apply validates and
+completes recovery. Recovery completes deletion rather than restoring partial
+cache layouts. All pending build, tag and cache journals and prospective references
+are validated before recovery changes anything. Malformed journals remain for
+manual investigation; deleting the journal is not a supported recovery procedure.
 
 Inventory logical bytes include repeated hardlinks; unique logical and allocated
 bytes deduplicate inodes. They are observations, not reclamation estimates. The
