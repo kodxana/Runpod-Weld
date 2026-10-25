@@ -74,7 +74,7 @@ fn help_explains_experimental_limits() {
     assert!(result.status.success());
     let text = String::from_utf8(result.stdout).unwrap();
     for expected in [
-        "single stage",
+        "multi-stage",
         "--base-ref",
         "no memory or disk quota",
         "Local COPY",

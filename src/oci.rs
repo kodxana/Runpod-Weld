@@ -257,6 +257,30 @@ impl BlobStore {
         Ok(file)
     }
 
+    /// Link verified content into another store under the trusted stable-directory model.
+    pub fn link_verified<C: Fn() -> bool>(
+        &self,
+        destination: &Self,
+        descriptor: &Descriptor,
+        max_size: u64,
+        cancelled: C,
+    ) -> Result<(), Error> {
+        let file = self.open_verified(descriptor, max_size, &cancelled)?;
+        file.sync_all()?;
+        check_cancel(&cancelled)?;
+        check_directories(&destination.directory)?;
+        let (digest, _) = descriptor.expected(max_size)?;
+        let target = destination.directory.join(digest.encoded());
+        match fs::hard_link(self.directory.join(digest.encoded()), target) {
+            Ok(()) => (),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                destination.open_verified(descriptor, max_size, &cancelled)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
     fn create_temp(&self) -> Result<(File, Temporary), Error> {
         for _ in 0..128 {
             let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);

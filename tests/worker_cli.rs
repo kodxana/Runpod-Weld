@@ -18,6 +18,6 @@ fn hidden_worker_rejects_invalid_input_before_starting_work() {
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("trace_root:"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("rpweld: runner error:"));
     }
 }

@@ -13,23 +13,37 @@ Usage:
   rpweld --version
   rpweld --help
 
+  rpweld login REGISTRY [--username USER] [--password-stdin] [--authfile FILE] [--cert-dir DIR]
+  rpweld logout REGISTRY [--authfile FILE]
+  rpweld push TAG [--authfile FILE] [--cert-dir DIR]
+  rpweld build [-f DOCKERFILE] [-t TAG] [--push] [--authfile FILE] [--cert-dir DIR] CONTEXT
+
   rpweld build -f DOCKERFILE [--base NAME=LAYOUT] [--base-ref NAME=REFERENCE]
-    --output NEWDIR --work-dir NEWDIR [--build-arg KEY=VALUE] [--host-dns]
+    --output NEWDIR --work-dir NEWDIR [--build-arg KEY=VALUE] [--host-dns] [--verbose]
+    [--target STAGE] [--no-cache] [--pull] [--platform linux/amd64]
     [--max-rootfs-bytes N] [--max-layer-bytes N] [--metadata-budget N]
     [--run-timeout-seconds N] CONTEXT
 
-Experimental build: Linux amd64, single stage, local OCI bases or scratch.
+Experimental build: Linux amd64, multi-stage, registry/local OCI bases or scratch.
+Default Dockerfile: CONTEXT/Dockerfile. Verified cached bases are reused offline.
+--pull refreshes base tags using verified TLS; digest references remain reusable.
+Failed refreshes fail the build and preserve the previous base cache.
+Managed builds create private state under RPWELD_HOME (default ~/.local/share/rpweld).
+One -t tag per build; push retries use 'rpweld push TAG'. Images/work are retained.
+Managed defaults: 2 GiB rootfs/layer, 64 MiB metadata; temporary host DNS enabled
+(--no-host-dns disables it). Explicit output/work without -t keep legacy defaults.
 Bindings match literal FROM names; --base-ref selects an OCI ref annotation.
 Without --base-ref the layout must have an unambiguous image selection.
 Local COPY supports plain/JSON paths, directory merges and multiple sources
 (destination must end in /), relative to WORKDIR. Basic $NAME/${NAME} expansion
 and Docker word quotes are supported; JSON embedded quotes/backslashes rejected.
 Sources must be context-relative: no globs, parent paths, explicit symlinks,
-COPY flags/--from, or nonempty .dockerignore. No multistage, registry pull/push
-or container run command yet. COPY bytes/entries/metadata accumulate across steps
+unsupported COPY flags, or nonempty .dockerignore. COPY --from accepts prior stages.
+--target selects a named stage and its dependencies. Managed builds cache completed
+stages locally; --no-cache bypasses stage reads/writes only. No container run command yet. COPY bytes/entries/metadata accumulate across steps
 under the rootfs/layer limits; rootfs is also checked after each step.
 Syntax/ignore checks precede mutation; later filesystem failures may follow RUN.
-Defaults: rootfs 268435456 bytes; layer/replay 268435456 bytes;
+Legacy defaults: rootfs 268435456 bytes; layer/replay 268435456 bytes;
 metadata 16777216 bytes per subsystem; 100000 entries; 1024 descriptors;
 RUN timeout 300 seconds (maximum 86400). Budgets accept positive decimal bytes.
 Dockerfile/parser source cap: 1048576 bytes. Parser/metadata budgets are
@@ -51,16 +65,24 @@ fn execute(args: &[String], out: &mut impl Write) -> Result<(), String> {
         [cmd, flag] if cmd == "doctor" && flag == "--json" => doctor(out, true),
         [cmd, rest @ ..] if cmd == "scan" => scan(rest, out),
         [cmd, rest @ ..] if cmd == "build" => run_build(rest, out),
-        [cmd, ..] if ["push", "run"].contains(&cmd.as_str()) => Err(format!(
+        [cmd, rest @ ..] if ["login", "logout", "push"].contains(&cmd.as_str()) => {
+            registry_command(cmd, rest, out)
+        }
+        [cmd, ..] if cmd == "run" => Err(format!(
             "'{cmd}' is not implemented in this development preview; no build or container was started"
         )),
         _ => Err("unrecognized command or option; use 'rpweld --help'".into()),
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct BuildCli {
     dockerfile: String,
     options: rpweld::build::BuildOptions,
+    tag: Option<String>,
+    push: bool,
+    pull: bool,
+    registry: rpweld::registry::Options,
 }
 
 fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
@@ -70,6 +92,11 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
     let mut build_args = BTreeMap::new();
     let mut context = None;
     let mut host_dns = false;
+    let mut no_host_dns = false;
+    let mut no_cache = false;
+    let mut verbose = false;
+    let mut push = false;
+    let mut pull = false;
     let mut positional = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -80,7 +107,26 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             positional = true;
             continue;
         }
-        if !positional && arg == "--host-dns" {
+        if !positional && arg == "--push" {
+            if push {
+                return Err("duplicate --push".into());
+            }
+            push = true;
+        } else if !positional && arg == "--pull" {
+            if pull {
+                return Err("duplicate --pull".into());
+            }
+            pull = true;
+        } else if !positional && arg == "--no-cache" {
+            no_cache = true;
+        } else if !positional && arg == "--verbose" {
+            verbose = true;
+        } else if !positional && arg == "--no-host-dns" {
+            if no_host_dns {
+                return Err("duplicate --no-host-dns".into());
+            }
+            no_host_dns = true;
+        } else if !positional && arg == "--host-dns" {
             if host_dns {
                 return Err("duplicate --host-dns".into());
             }
@@ -97,6 +143,12 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
                 "--max-layer-bytes",
                 "--metadata-budget",
                 "--run-timeout-seconds",
+                "-t",
+                "--tag",
+                "--authfile",
+                "--cert-dir",
+                "--target",
+                "--platform",
             ]
             .contains(&arg.as_str())
             {
@@ -131,23 +183,48 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
                 if map.insert(key.to_owned(), val.to_owned()).is_some() {
                     return Err(format!("duplicate {arg} name: {key}"));
                 }
-            } else if values.insert(arg.as_str(), value.as_str()).is_some() {
+            } else if values
+                .insert(
+                    if arg == "--tag" { "-t" } else { arg.as_str() },
+                    value.as_str(),
+                )
+                .is_some()
+            {
                 return Err(format!("duplicate {arg}"));
             }
         } else if arg.is_empty() || context.replace(arg.clone()).is_some() {
             return Err("exactly one context directory is required".into());
         }
     }
-    let required = |key| {
-        values
-            .get(key)
-            .copied()
-            .ok_or_else(|| format!("missing required {key}"))
-    };
-    let dockerfile = required("-f")?.to_owned();
-    let output = required("--output")?.into();
-    let work = required("--work-dir")?.into();
-    let context = context.ok_or("missing context directory")?.into();
+    if values
+        .get("--platform")
+        .is_some_and(|v| *v != "linux/amd64")
+    {
+        return Err(
+            "only --platform linux/amd64 is supported; cross-architecture execution is unavailable"
+                .into(),
+        );
+    }
+    let context: std::path::PathBuf = context.ok_or("missing context directory")?.into();
+    let dockerfile = values
+        .get("-f")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| context.join("Dockerfile").to_string_lossy().into_owned());
+    let output = values.get("--output").copied().unwrap_or("").into();
+    let work = values.get("--work-dir").copied().unwrap_or("").into();
+    let tag = values
+        .get("-t")
+        .map(|s| rpweld::registry::reference(s, false))
+        .transpose()?;
+    if push && tag.is_none() {
+        return Err("--push requires -t TAG".into());
+    }
+    if no_host_dns && host_dns {
+        return Err("--host-dns conflicts with --no-host-dns".into());
+    }
+    let managed =
+        tag.is_some() || !values.contains_key("--output") || !values.contains_key("--work-dir");
+    host_dns = host_dns || (managed && !no_host_dns);
     let budget = |key, default: u64| -> Result<u64, String> {
         match values.get(key) {
             None => Ok(default),
@@ -159,9 +236,21 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             _ => Err(format!("invalid positive budget: {key}")),
         }
     };
-    let root = budget("--max-rootfs-bytes", 256 * 1024 * 1024)?;
-    let layer = budget("--max-layer-bytes", 256 * 1024 * 1024)?;
-    let metadata = budget("--metadata-budget", 16 * 1024 * 1024)?;
+    let default_bytes = if managed {
+        2 * 1024 * 1024 * 1024
+    } else {
+        256 * 1024 * 1024
+    };
+    let root = budget("--max-rootfs-bytes", default_bytes)?;
+    let layer = budget("--max-layer-bytes", default_bytes)?;
+    let metadata = budget(
+        "--metadata-budget",
+        if managed {
+            64 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024
+        },
+    )?;
     let plan_bytes =
         usize::try_from(metadata).map_err(|_| "metadata budget exceeds platform size")?;
     let timeout = budget("--run-timeout-seconds", 300)?;
@@ -178,11 +267,22 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
     }
     Ok(BuildCli {
         dockerfile,
+        tag,
+        push,
+        pull,
+        registry: rpweld::registry::Options {
+            authfile: values.get("--authfile").map(std::path::PathBuf::from),
+            cert_dir: values.get("--cert-dir").map(std::path::PathBuf::from),
+        },
         options: rpweld::build::BuildOptions {
             work,
             output,
             context,
             host_dns,
+            verbose,
+            target: values.get("--target").map(|s| s.to_string()),
+            cache: None,
+            no_cache,
             args: build_args,
             bases: bases
                 .into_iter()
@@ -257,8 +357,9 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
     if args == ["--help"] || args == ["-h"] {
         return write!(out, "{HELP}").map_err(|e| e.to_string());
     }
-    let cli = parse_build_args(args)?;
+    let mut cli = parse_build_args(args)?;
     let source = read_build_source(&cli.dockerfile)?;
+    prepare_build(&source, &mut cli, out)?;
     let result = rpweld::build::build(&source, &cli.options, || CANCELLED.load(Ordering::Relaxed))
         .map_err(|e| e.to_string())?;
     writeln!(
@@ -268,7 +369,223 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
         result.manifest.digest,
         result.work.display()
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    finish_build(&cli, out)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_build(_: &str, _: &mut BuildCli, _: &mut impl Write) -> Result<(), String> {
+    Err("build requires Linux amd64".into())
+}
+#[cfg(not(target_os = "linux"))]
+fn finish_build(_: &BuildCli, _: &mut impl Write) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_build(source: &str, cli: &mut BuildCli, out: &mut impl Write) -> Result<(), String> {
+    use rpweld::{
+        build_plan::{self, Base},
+        registry,
+    };
+    let plan = build_plan::parse(source).map_err(|e| e.to_string())?;
+    let selected = rpweld::build::selected_stages(&plan, cli.options.target.as_deref())
+        .map_err(|e| e.to_string())?;
+    let mut pulls = std::collections::BTreeSet::new();
+    for n in selected {
+        if let Base::Image(name) = &plan.stages[n].base
+            && name != "scratch"
+            && !cli.options.bases.contains_key(name)
+        {
+            pulls.insert(name.clone());
+        }
+    }
+    let pull = !pulls.is_empty();
+    if let Some(cert_dir) = &cli.registry.cert_dir {
+        let context = std::fs::canonicalize(&cli.options.context).map_err(|e| e.to_string())?;
+        let cert_dir = std::fs::canonicalize(cert_dir).map_err(|e| e.to_string())?;
+        if cert_dir.starts_with(&context) {
+            return Err(
+                "certificate directory must be outside the build context to prevent COPY leaking credentials"
+                    .into(),
+            );
+        }
+        cli.registry.cert_dir = Some(cert_dir);
+    }
+    let managed = cli.options.output.as_os_str().is_empty()
+        || cli.options.work.as_os_str().is_empty()
+        || cli.tag.is_some()
+        || cli.registry.authfile.is_some()
+        || pull;
+    if !managed {
+        return Ok(());
+    }
+    let context = std::fs::canonicalize(&cli.options.context).map_err(|e| e.to_string())?;
+    let store = registry::store_dir()?;
+    if store.starts_with(&context) || context.starts_with(&store) {
+        return Err(
+            "build context and Weld store must be disjoint; set RPWELD_HOME outside the context"
+                .into(),
+        );
+    }
+    cli.options.cache = Some(registry::private_dir(&store.join("cache-v1"))?);
+    let auth = registry::auth_path(&cli.registry)?;
+    registry::check_cache_secret_paths(&cli.registry, &store)?;
+    if auth.starts_with(&context) {
+        return Err(
+            "authfile must be outside the build context to prevent COPY leaking credentials".into(),
+        );
+    }
+    let run = tempfile::Builder::new()
+        .prefix("build-")
+        .tempdir_in(&store)
+        .map_err(|e| e.to_string())?
+        .keep();
+    writeln!(out, "Build state: {}", run.display()).map_err(|e| e.to_string())?;
+    if cli.options.work.as_os_str().is_empty() {
+        cli.options.work = run.join("work");
+    }
+    if cli.options.output.as_os_str().is_empty() {
+        cli.options.output = run.join("image");
+    }
+    let mut resolved = BTreeMap::new();
+    for name in pulls {
+        let reference = registry::reference(&name, true)?;
+        let layout = if let Some(layout) = resolved.get(&reference) {
+            std::path::PathBuf::clone(layout)
+        } else {
+            let layout = registry::cached_base(
+                &store,
+                &reference,
+                cli.pull,
+                cli.options.limits.image,
+                || CANCELLED.load(Ordering::Relaxed),
+                |reference, layout| {
+                    writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
+                        .map_err(|e| e.to_string())?;
+                    out.flush().map_err(|e| e.to_string())?;
+                    registry::Transport::new(&cli.registry)?
+                        .pull(reference, layout, &|| CANCELLED.load(Ordering::Relaxed))
+                },
+            )?;
+            resolved.insert(reference, layout.clone());
+            layout
+        };
+        cli.options.bases.insert(
+            name.clone(),
+            rpweld::build::LocalBase {
+                layout,
+                reference: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn finish_build(cli: &BuildCli, out: &mut impl Write) -> Result<(), String> {
+    if let Some(tag) = &cli.tag {
+        let store = rpweld::registry::store_dir()?;
+        rpweld::registry::save_tag(&store, tag, &cli.options.output)?;
+        writeln!(out, "Tagged {tag}").map_err(|e| e.to_string())?;
+        if cli.push {
+            push_image_path(tag, &cli.options.output, &cli.registry, out)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn push_image(
+    tag: &str,
+    options: &rpweld::registry::Options,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let image = rpweld::registry::tagged_image(&rpweld::registry::store_dir()?, tag)?;
+    push_image_path(tag, &image, options, out)
+}
+
+#[cfg(target_os = "linux")]
+fn push_image_path(
+    tag: &str,
+    image: &std::path::Path,
+    options: &rpweld::registry::Options,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    // Verify local content before sending. Skopeo then verifies transfer digests.
+    rpweld::image::load_layout(
+        image,
+        None,
+        rpweld::image::Limits {
+            max_metadata_bytes: 64 * 1024 * 1024,
+            max_total_metadata_bytes: 64 * 1024 * 1024,
+            max_descriptors: 1024,
+            max_layer_bytes: u64::MAX,
+            max_total_layer_bytes: u64::MAX,
+        },
+        || CANCELLED.load(Ordering::Relaxed),
+    )
+    .map_err(|e| e.to_string())?;
+    writeln!(out, "Pushing {tag} (verified TLS)...").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    rpweld::registry::Transport::new(options)?
+        .push(tag, image, &|| CANCELLED.load(Ordering::Relaxed))?;
+    writeln!(out, "Pushed {tag}").map_err(|e| e.to_string())
+}
+
+fn registry_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(), String> {
+    if args == ["--help"] || args == ["-h"] {
+        return write!(out, "{HELP}").map_err(|e| e.to_string());
+    }
+    let mut options = rpweld::registry::Options::default();
+    let mut target = None;
+    let mut username = None;
+    let mut password_stdin = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--authfile" | "--cert-dir" | "--username" | "-u" => {
+                let v=iter.next().filter(|s|!s.is_empty() && !s.starts_with('-') && !s.contains('\0')).ok_or("missing option value")?;
+                match arg.as_str() {
+                    "--authfile" if options.authfile.is_none()=>options.authfile=Some(v.into()),
+                    "--cert-dir" if options.cert_dir.is_none()=>options.cert_dir=Some(v.into()),
+                    "--username" | "-u" if cmd=="login" && username.is_none()=>username=Some(v.as_str()),
+                    _=>return Err("duplicate or unsupported registry option".into()),
+                }
+            },
+            "--password-stdin" if cmd=="login" && !password_stdin=>password_stdin=true,
+            v if !v.starts_with('-') && target.is_none()=>target=Some(v),
+            _=>return Err("invalid registry arguments; passwords must use a hidden prompt or --password-stdin".into()),
+        }
+    }
+    let target = target.ok_or("registry hostname or image tag required")?;
+    let target = if cmd == "push" {
+        rpweld::registry::reference(target, false)?
+    } else {
+        rpweld::registry::registry(target)?
+    };
+    #[cfg(target_os = "linux")]
+    {
+        match cmd {
+            "login" => {
+                rpweld::registry::login(&target, username, password_stdin, &options, &|| {
+                    CANCELLED.load(Ordering::Relaxed)
+                })?;
+                writeln!(out,"Logged in to {target}. File credentials are encoded, not encrypted; configure credHelpers for external storage.").map_err(|e|e.to_string())
+            }
+            "logout" => {
+                rpweld::registry::logout(&target, &options, &|| CANCELLED.load(Ordering::Relaxed))?;
+                writeln!(out, "Logged out of {target}").map_err(|e| e.to_string())
+            }
+            "push" => push_image(&target, &options, out),
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (target, options, username, password_stdin, out);
+        Err("registry operations require Linux".into())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -399,6 +716,16 @@ fn summary(report: &serde_json::Value) -> String {
         bytes(&resources["memory"]["observed_hard_ceiling_bytes"]),
         bytes(&resources["memory"]["observed_operating_headroom_bytes"])
     );
+    let nofile = &report["capabilities"]["nofile"];
+    let limit = |v: &serde_json::Value| match (v.as_u64(), v.as_str()) {
+        (Some(n), _) => n.to_string(),
+        (_, Some("unlimited")) => "unlimited".into(),
+        _ => "unknown".into(),
+    };
+    result.push_str(&format!(
+        "Open-file limits observed: soft {}, hard {} (per process)\nReplay adjusts soft only as needed within hard; GPU/CPU/RAM size does not set this ceiling.\n",
+        limit(&nofile["soft"]), limit(&nofile["hard"])
+    ));
     if resources["memory"]["explicit_budget_required"] == true {
         result.push_str("Automatic memory sizing unavailable; an explicit budget is required.\n");
     }
@@ -407,7 +734,7 @@ fn summary(report: &serde_json::Value) -> String {
             result.push_str(&format!("Warning: {warning}\n"));
         }
     }
-    result.push_str("Experimental build supports single-stage local OCI or scratch with restricted local COPY; no multistage, pull or push. See build --help for COPY restrictions. RUN resources require external enforcement. Use --json for raw observations.\n");
+    result.push_str("Experimental build supports multi-stage registry/local OCI or scratch with restricted local COPY; no multistage. See build --help for registry and COPY options. RUN resources require external enforcement. Use --json for raw observations.\n");
     result
 }
 
@@ -420,7 +747,9 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(target_os = "linux")]
-    if args.first().is_some_and(|arg| arg == "build")
+    if args
+        .first()
+        .is_some_and(|arg| ["build", "push", "login", "logout"].contains(&arg.as_str()))
         && let Err(error) = install_build_signals()
     {
         eprintln!("rpweld: cannot install build cancellation handlers: {error}");
@@ -435,6 +764,96 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_push_keeps_its_output_after_concurrent_retag() {
+        const CHILD: &str = "RPWELD_RETAG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::build_push_keeps_its_output_after_concurrent_retag",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", home.path())
+                .env("RPWELD_HOME", home.path().join("store"))
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        struct RetagWriter {
+            text: Vec<u8>,
+            store: std::path::PathBuf,
+            replacement: std::path::PathBuf,
+            retagged: bool,
+            verified: bool,
+        }
+        const TAG: &str = "localhost:1/test/retag:latest";
+        impl Write for RetagWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.text.extend_from_slice(bytes);
+                let text = String::from_utf8_lossy(&self.text);
+                if !self.retagged && text.contains(&format!("Tagged {TAG}\n")) {
+                    rpweld::registry::save_tag(&self.store, TAG, &self.replacement).unwrap();
+                    self.retagged = true;
+                }
+                if text.contains("Pushing ") {
+                    self.verified = true;
+                    // Stop after local verification, before any registry transport.
+                    return Err(io::Error::other("stop before transport"));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let context = tmp.path().join("context");
+        std::fs::create_dir(&context).unwrap();
+        std::fs::write(context.join("Dockerfile"), "FROM scratch\nCOPY . /\n").unwrap();
+        let replacement = tmp.path().join("invalid-image");
+        std::fs::create_dir(&replacement).unwrap();
+        let mut writer = RetagWriter {
+            text: Vec::new(),
+            store: rpweld::registry::store_dir().unwrap(),
+            replacement,
+            retagged: false,
+            verified: false,
+        };
+        let error = run_build(
+            &[
+                "-t".into(),
+                TAG.into(),
+                "--push".into(),
+                context.to_str().unwrap().into(),
+            ],
+            &mut writer,
+        )
+        .unwrap_err();
+        assert_eq!(error, "stop before transport");
+        assert!(writer.retagged && writer.verified);
+        assert_eq!(
+            rpweld::registry::tagged_image(&writer.store, TAG).unwrap(),
+            writer.replacement
+        );
+        // Standalone push resolves the current tag and rejects its invalid layout.
+        let mut output = Vec::new();
+        assert!(push_image(TAG, &rpweld::registry::Options::default(), &mut output).is_err());
+        assert!(
+            output.is_empty(),
+            "invalid layout must fail before transport"
+        );
+    }
 
     fn build_args(extra: &[&str]) -> Vec<String> {
         [
@@ -469,6 +888,13 @@ mod tests {
         assert_eq!(base.reference.as_deref(), Some("release=one"));
         assert_eq!(cli.options.args["EMPTY"], "");
         assert!(cli.options.host_dns);
+        assert!(!cli.options.verbose);
+        assert!(
+            parse_build_args(&build_args(&["--verbose"]))
+                .unwrap()
+                .options
+                .verbose
+        );
         assert_eq!(cli.options.limits.max_rootfs_bytes, 268435456);
         assert_eq!(cli.options.limits.image.max_total_metadata_bytes, 16777216);
     }
@@ -498,11 +924,7 @@ mod tests {
         ] {
             assert!(parse_build_args(&build_args(&extra)).is_err(), "{extra:?}");
         }
-        for args in [
-            vec![],
-            vec!["-f", "x"],
-            vec!["--output", "x", "--work-dir", "y", "ctx"],
-        ] {
+        for args in [vec![], vec!["-f", "x"], vec!["--push", "ctx"]] {
             assert!(
                 parse_build_args(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()).is_err()
             );
@@ -621,7 +1043,22 @@ mod tests {
             json!({"resources": {"supported": true, "memory": {"explicit_budget_required": true}}});
         let text = summary(&report);
         assert!(text.contains("Memory ceiling observed: unknown"));
+        assert!(text.contains("Open-file limits observed: soft unknown, hard unknown"));
         assert!(text.contains("explicit budget is required"));
         assert!(!text.contains("0.00 GiB"));
+    }
+
+    #[test]
+    fn doctor_renders_process_limits_without_hardware_inference() {
+        for (soft, hard, expected) in [
+            (json!(1024), json!(4096), "soft 1024, hard 4096"),
+            (json!(1024), json!("unlimited"), "soft 1024, hard unlimited"),
+        ] {
+            let report = json!({"resources": {"supported": true},
+                "capabilities": {"nofile": {"soft": soft, "hard": hard}}});
+            let text = summary(&report);
+            assert!(text.contains(expected), "{text}");
+            assert!(text.contains("per process"));
+        }
     }
 }

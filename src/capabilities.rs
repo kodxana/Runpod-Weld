@@ -44,6 +44,25 @@ mod linux {
         }
     }
 
+    fn nofile() -> Value {
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } != 0 {
+            return json!({"soft": null, "hard": null,
+                "error": std::io::Error::last_os_error().to_string()});
+        }
+        let limits = unsafe { limits.assume_init() };
+        let value = |n| {
+            if n == libc::RLIM_INFINITY {
+                json!("unlimited")
+            } else {
+                json!(n)
+            }
+        };
+        json!({"soft": value(limits.rlim_cur), "hard": value(limits.rlim_max),
+            "scope": "process", "source": "getrlimit(RLIMIT_NOFILE)",
+            "policy": "Replay may raise soft to its calculated requirement, never hard; syscall restrictions can still prevent adjustment."})
+    }
+
     pub(super) fn inspect() -> Value {
         let status = fs::read_to_string("/proc/self/status");
         let mut fields = serde_json::Map::new();
@@ -85,6 +104,7 @@ mod linux {
         .collect();
         json!({
             "supported": true, "platform": "linux", "read_only": true,
+            "nofile": nofile(),
             "uid": unsafe { libc::getuid() }, "effective_uid": unsafe { libc::geteuid() },
             "status": fields, "status_error": status.err().map(|e| e.to_string()),
             "apparmor_current": read("/proc/self/attr/current"),

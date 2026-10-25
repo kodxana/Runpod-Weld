@@ -1,7 +1,7 @@
 //! Minimal, trusted/stable Linux amd64 builds from local OCI bindings or scratch.
-//! Supports one stage: FROM, RUN, local COPY, ARG, ENV, WORKDIR, JSON
+//! Supports dependency-selected stages: FROM, RUN, local/stage COPY, ARG, ENV, WORKDIR, JSON
 //! CMD/ENTRYPOINT, EXPOSE.
-//! Local COPY is supported; flags/stages, custom shells, USER/OnBuild and complex
+//! Local/stage COPY is supported; other COPY flags, custom shells, USER/OnBuild and complex
 //! expansion fail closed. RUN exec
 //! form uses `/bin/sh -c 'exec ...'` with every argv element literally quoted.
 //! This is not a sandbox. Caller owns stable ancestors and trusted image/commands;
@@ -57,6 +57,7 @@ pub struct Limits {
 
 /// Work/output must be new paths with existing, stable parents, disjoint from
 /// each other, context and base layouts. Work owns rootfs, spool and worker state.
+#[derive(Clone)]
 pub struct BuildOptions {
     pub work: PathBuf,
     pub output: PathBuf,
@@ -67,6 +68,11 @@ pub struct BuildOptions {
     /// Opt in to temporary host /etc/resolv.conf only when the image's file is
     /// missing/empty. Original file metadata is restored by rename before export.
     pub host_dns: bool,
+    /// Show low-level runner compatibility diagnostics.
+    pub verbose: bool,
+    pub target: Option<String>,
+    pub cache: Option<PathBuf>,
+    pub no_cache: bool,
 }
 
 /// Successful flattened OCI publication and retained engine work directory.
@@ -80,6 +86,7 @@ pub struct BuildResult {
 enum Step {
     Directory(String),
     Copy {
+        from: Option<usize>,
         sources: Vec<String>,
         destination: String,
     },
@@ -258,15 +265,13 @@ fn array(config: &Value, key: &str) -> Result<Vec<String>> {
     }
 }
 
-fn preflight(
-    source: &str,
+fn preflight_stage(
+    plan: &build_plan::BuildPlan,
+    index: usize,
     options: &BuildOptions,
     mut config: Value,
-) -> Result<(Value, Vec<Step>)> {
-    let plan = build_plan::parse(source)?;
-    if plan.stages.len() != 1 {
-        return Err("multistage builds unsupported".into());
-    }
+    inherited_args: BTreeMap<String, String>,
+) -> Result<(Value, Vec<Step>, BTreeMap<String, String>)> {
     let cap = options.limits.max_plan_bytes;
     if config.get("config").is_none_or(Value::is_null) {
         config["config"] = json!({});
@@ -342,22 +347,25 @@ fn preflight(
             }
         }
     }
-    let mut args = BTreeMap::new();
+    let mut args = inherited_args;
     let mut steps = vec![Step::Directory(wd.clone())];
     let mut charge = supplied_bytes + wd.len() + map_bytes(&globals, cap)?;
     let mut cmd_set = false;
-    for i in &plan.stages[0].instructions {
+    for i in &plan.stages[index].instructions {
         let mut vars = args.clone();
         vars.extend(env.clone()); // ENV shadows ARG, including empty values.
         match &i.kind {
             I::From { .. } => (),
             I::Copy { from, paths } => {
-                if from.is_some() {
-                    return Err("COPY --from unsupported".into());
-                }
                 let mut values = copy_words(paths, &vars, cap)?;
                 let dest = values.pop().ok_or("COPY destination missing")?;
-                for source in &values {
+                for source in &mut values {
+                    if from.is_some() {
+                        *source = source.trim_start_matches('/').to_owned();
+                        if source.is_empty() {
+                            *source = ".".into();
+                        }
+                    }
                     copy_path(source, false)?;
                 }
                 if dest.is_empty() || (values.len() > 1 && !dest.ends_with('/')) {
@@ -373,6 +381,7 @@ fn preflight(
                     .and_then(|n| values.iter().try_fold(n, |n, s| n.checked_add(s.len())))
                     .ok_or("plan budget overflow")?;
                 steps.push(Step::Copy {
+                    from: *from,
                     sources: values,
                     destination,
                 });
@@ -473,7 +482,7 @@ fn preflight(
     if serde_json::to_vec(&config)?.len() > cap.saturating_sub(charge) {
         return Err("config budget exceeded".into());
     }
-    Ok((config, steps))
+    Ok((config, steps, args))
 }
 
 fn fresh(path: &Path) -> Result<PathBuf> {
@@ -554,6 +563,50 @@ fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<()>
 /// current executable's `__trace-worker` dispatch (caller must implement it).
 /// Cancellation is cooperative for I/O; RUN cancellation signals its dedicated
 /// worker, waits for bounded cleanup, then kills/reaps it if necessary.
+struct StageResult {
+    result: BuildResult,
+    args: BTreeMap<String, String>,
+}
+
+/// Select the target and only its transitive FROM/COPY dependencies.
+pub fn selected_stages(plan: &build_plan::BuildPlan, target: Option<&str>) -> Result<Vec<usize>> {
+    let last = match target {
+        Some(name) => plan
+            .stages
+            .iter()
+            .position(|s| {
+                s.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
+            .ok_or("unknown target stage")?,
+        None => plan
+            .stages
+            .len()
+            .checked_sub(1)
+            .ok_or("Dockerfile needs a stage")?,
+    };
+    let mut selected = std::collections::BTreeSet::new();
+    let mut pending = vec![last];
+    while let Some(n) = pending.pop() {
+        if !selected.insert(n) {
+            continue;
+        }
+        if let Base::Stage(base) = plan.stages[n].base {
+            pending.push(base);
+        }
+        for i in &plan.stages[n].instructions {
+            if let I::Copy {
+                from: Some(from), ..
+            } = i.kind
+            {
+                pending.push(from);
+            }
+        }
+    }
+    Ok(selected.into_iter().collect())
+}
+
 pub fn build(
     source: &str,
     options: &BuildOptions,
@@ -564,18 +617,117 @@ pub fn build(
     }
     check(&cancelled)?;
     let plan = build_plan::parse(source)?;
-    if plan.stages.len() != 1 {
-        return Err("multistage builds unsupported".into());
+    let selected = selected_stages(&plan, options.target.as_deref())?;
+    let target = *selected.last().unwrap();
+    let work = fresh(&options.work)?;
+    let output = fresh(&options.output)?;
+    let context = fs::canonicalize(&options.context)?;
+    let mut paths = vec![work.clone(), output, context];
+    disjoint(&paths)?;
+    for base in options.bases.values() {
+        paths.push(fs::canonicalize(&base.layout)?);
     }
+    // Multiple aliases may intentionally bind the same immutable base.
+    paths.sort();
+    paths.dedup();
+    disjoint(&paths)?;
+    if let Some(cache) = &options.cache {
+        let cache = fs::canonicalize(cache)?;
+        for path in &paths {
+            disjoint(&[cache.clone(), path.clone()])?;
+        }
+    }
+    // Evaluate all selected stages before any RUN, with inherited config/ARG scopes.
+    let mut evaluated: BTreeMap<usize, (Value, BTreeMap<String, String>)> = BTreeMap::new();
+    let mut evaluated_bytes = 0usize;
+    for &n in &selected {
+        check(&cancelled)?;
+        let (config, args) = match &plan.stages[n].base {
+            Base::Stage(base) => evaluated[base].clone(),
+            Base::Image(name) if name == "scratch" => (
+                json!({"os":"linux", "architecture":"amd64", "config":{}}),
+                BTreeMap::new(),
+            ),
+            Base::Image(name) => {
+                let b = options
+                    .bases
+                    .get(name)
+                    .ok_or_else(|| format!("no local base binding for {name}"))?;
+                (
+                    image::load_layout(
+                        &b.layout,
+                        b.reference.as_deref(),
+                        options.limits.image,
+                        &cancelled,
+                    )?
+                    .config,
+                    BTreeMap::new(),
+                )
+            }
+        };
+        let (config, steps, args) = preflight_stage(&plan, n, options, config, args)?;
+        if steps
+            .iter()
+            .any(|s| matches!(s, Step::Copy { from: None, .. }))
+        {
+            copy_ignore(&options.context)?;
+        }
+        evaluated_bytes = evaluated_bytes
+            .checked_add(serde_json::to_vec(&config)?.len())
+            .and_then(|n| n.checked_add(args.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()))
+            .ok_or("multi-stage metadata overflow")?;
+        if evaluated_bytes > options.limits.max_plan_bytes {
+            return Err("multi-stage evaluated metadata budget exceeded".into());
+        }
+        evaluated.insert(n, (config, args));
+    }
+    let intermediate = if selected.len() > 1 {
+        Some(
+            tempfile::Builder::new()
+                .prefix(".weld-stages-")
+                .tempdir_in(work.parent().unwrap())?
+                .keep(),
+        )
+    } else {
+        None
+    };
+    let mut previous = BTreeMap::new();
+    let mut notice = false;
+    for n in selected {
+        let mut stage_options = options.clone();
+        if n != target {
+            let parent = intermediate.as_ref().unwrap();
+            stage_options.work = parent.join(format!("stage-{n}-work"));
+            stage_options.output = parent.join(format!("stage-{n}-image"));
+        }
+        eprintln!(
+            "Stage {}: {}",
+            n + 1,
+            plan.stages[n].name.as_deref().unwrap_or("unnamed")
+        );
+        let result = build_stage(&plan, n, &stage_options, &previous, &mut notice, &cancelled)?;
+        previous.insert(n, result);
+    }
+    Ok(previous.remove(&target).unwrap().result)
+}
+
+fn build_stage(
+    plan: &build_plan::BuildPlan,
+    index: usize,
+    options: &BuildOptions,
+    previous: &BTreeMap<usize, StageResult>,
+    notice: &mut bool,
+    cancelled: impl Fn() -> bool,
+) -> Result<StageResult> {
+    check(&cancelled)?;
     // Syntax-only pass: inherited ENV must not be guessed before loading config.
     for instruction in plan
         .global_args
         .iter()
-        .chain(plan.stages[0].instructions.iter())
+        .chain(plan.stages[index].instructions.iter())
     {
         let empty = BTreeMap::new();
         match &instruction.kind {
-            I::Copy { from: Some(_), .. } => return Err("COPY --from unsupported".into()),
             I::Arg {
                 default: Some(s), ..
             } => {
@@ -602,7 +754,14 @@ pub fn build(
         return Err("context must be a directory".into());
     }
     let mut paths = vec![work.clone(), output.clone(), context];
-    let binding = match &plan.stages[0].base {
+    let stage_base = match plan.stages[index].base {
+        Base::Stage(n) => Some(LocalBase {
+            layout: previous[&n].result.output.clone(),
+            reference: None,
+        }),
+        _ => None,
+    };
+    let binding = match &plan.stages[index].base {
         Base::Image(name) if name == "scratch" => None,
         Base::Image(name) => Some(
             options
@@ -610,9 +769,9 @@ pub fn build(
                 .get(name)
                 .ok_or_else(|| format!("no local base binding for {name}"))?,
         ),
-        Base::Stage(_) => return Err("stage base unsupported".into()),
+        Base::Stage(_) => stage_base.as_ref(),
     };
-    let base_path = binding.map(|b| fs::canonicalize(&b.layout)).transpose()?;
+    let mut base_path = binding.map(|b| fs::canonicalize(&b.layout)).transpose()?;
     if let Some(p) = &base_path {
         for suffix in ["", "blobs", "blobs/sha256"] {
             let m = fs::symlink_metadata(p.join(suffix))?;
@@ -623,7 +782,7 @@ pub fn build(
         paths.push(p.clone());
     }
     disjoint(&paths)?;
-    let metadata = match (binding, &base_path) {
+    let mut metadata = match (binding, &base_path) {
         (Some(b), Some(p)) => Some(image::load_layout(
             p,
             b.reference.as_deref(),
@@ -636,13 +795,82 @@ pub fn build(
         .as_ref()
         .map(|m| m.config.clone())
         .unwrap_or_else(|| json!({"os":"linux", "architecture":"amd64", "config":{}}));
-    let (config, steps) = preflight(source, options, config)?;
-    if steps.iter().any(|s| matches!(s, Step::Copy { .. })) {
+    let inherited = match plan.stages[index].base {
+        Base::Stage(n) => previous[&n].args.clone(),
+        _ => BTreeMap::new(),
+    };
+    let (config, mut steps, args) =
+        preflight_stage(plan, index, options, config, inherited.clone())?;
+    if steps
+        .iter()
+        .any(|s| matches!(s, Step::Copy { from: None, .. }))
+    {
         copy_ignore(&options.context)?;
+    }
+    let cache_entry = if let Some(cache) = options.cache.as_ref().filter(|_| !options.no_cache) {
+        let dependencies: Vec<_> = plan.stages[index]
+            .instructions
+            .iter()
+            .filter_map(|i| match i.kind {
+                I::Copy { from: Some(n), .. } => {
+                    Some(previous[&n].result.manifest.digest.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        let input = format!(
+            "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{}\n{:?}",
+            plan.global_args,
+            plan.stages[index],
+            options.args,
+            options.limits,
+            // Later ARG instructions can overwrite values consumed by earlier steps.
+            inherited,
+            metadata.as_ref().map(|m| &m.selected.digest),
+            options.host_dns,
+            dependencies
+        );
+        let uses_context = steps
+            .iter()
+            .any(|s| matches!(s, Step::Copy { from: None, .. }));
+        Some(cache.join(crate::build_cache::key(
+            input.as_bytes(),
+            uses_context.then_some(options.context.as_path()),
+            options.limits,
+            &cancelled,
+        )?))
+    } else {
+        None
+    };
+    let mut cache_hit = false;
+    if let Some(entry) = &cache_entry
+        && crate::build_cache::lookup(entry)?
+    {
+        for suffix in ["blobs", "blobs/sha256"] {
+            let m = fs::symlink_metadata(entry.join(suffix))?;
+            if !m.is_dir() || m.file_type().is_symlink() {
+                return Err("invalid cache blob directory".into());
+            }
+        }
+        let cached = image::load_layout(entry, None, options.limits.image, &cancelled)?;
+        if cached.config["config"] != config["config"] {
+            return Err("cache config does not match evaluated stage".into());
+        }
+        metadata = Some(cached);
+        base_path = Some(entry.clone());
+        steps.clear();
+        cache_hit = true;
+        eprintln!("  CACHED (verified local stage)");
     }
     #[cfg(target_os = "linux")]
     if steps.iter().any(|s| matches!(s, Step::Run { .. })) && unsafe { libc::geteuid() } != 0 {
         return Err("RUN worker requires root".into());
+    }
+    if !*notice && steps.iter().any(|s| matches!(s, Step::Run { .. })) {
+        *notice = true;
+        eprintln!(
+            "Note: Weld runs trusted Dockerfiles only; RUN commands can access the Pod's devices and process information."
+        );
     }
     check(&cancelled)?;
     fs::create_dir(&work)?;
@@ -677,12 +905,19 @@ pub fn build(
         check(&cancelled)?;
         match step {
             Step::Copy {
+                from,
                 sources,
                 destination,
             } => {
                 let limits = options.limits;
-                let summary = context::copy_local(
-                    &options.context,
+                let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
+                let copy = if from.is_some() {
+                    context::copy_stage
+                } else {
+                    context::copy_local
+                };
+                let summary = copy(
+                    stage_root.as_deref().unwrap_or(&options.context),
                     &root,
                     &sources.iter().map(String::as_str).collect::<Vec<_>>(),
                     destination,
@@ -722,13 +957,7 @@ pub fn build(
                     None
                 };
                 let result = worker(
-                    &root,
-                    &run_state,
-                    command,
-                    workdir,
-                    env,
-                    options.limits.run_timeout_seconds,
-                    &cancelled,
+                    &root, &run_state, command, workdir, env, options, &cancelled,
                 );
                 // Restore even on failed/cancelled RUN; restoration errors are fatal.
                 if let Some(dns) = dns {
@@ -740,12 +969,24 @@ pub fn build(
         root_budget(&root, options.limits, &cancelled)?;
     }
     check(&cancelled)?;
-    let manifest =
-        export::export_layout(&root, &output, &config, options.limits.export, &cancelled)?;
-    Ok(BuildResult {
-        manifest,
-        output,
-        work,
+    let manifest = if cache_hit {
+        // Preserve the cached OCI bytes: re-exporting a replayed tree changes
+        // access timestamps and would invalidate every dependent stage.
+        crate::build_cache::publish(cache_entry.as_ref().unwrap(), &output, &cancelled)?;
+        metadata.as_ref().unwrap().selected.clone()
+    } else {
+        export::export_layout(&root, &output, &config, options.limits.export, &cancelled)?
+    };
+    if !cache_hit && let Some(entry) = cache_entry {
+        crate::build_cache::publish(&output, &entry, &cancelled)?;
+    }
+    Ok(StageResult {
+        result: BuildResult {
+            manifest,
+            output,
+            work,
+        },
+        args,
     })
 }
 
@@ -824,10 +1065,15 @@ fn worker(
     command: &str,
     wd: &str,
     env: &[String],
-    timeout: u64,
+    options: &BuildOptions,
     c: &impl Fn() -> bool,
 ) -> Result<()> {
+    let timeout = options.limits.run_timeout_seconds;
     let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.env("RPWELD_BUILD_WORKER", "1").env(
+        "RPWELD_TRACE_VERBOSE",
+        if options.verbose { "1" } else { "0" },
+    );
     cmd.arg("__trace-worker")
         .arg(root)
         .arg(state)
@@ -875,6 +1121,15 @@ fn worker(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    fn preflight(
+        source: &str,
+        options: &BuildOptions,
+        config: Value,
+    ) -> Result<(Value, Vec<Step>)> {
+        let plan = build_plan::parse(source)?;
+        let (config, steps, _) = preflight_stage(&plan, 0, options, config, BTreeMap::new())?;
+        Ok((config, steps))
+    }
     fn options(temp: &Path) -> BuildOptions {
         let context = temp.join("context");
         fs::create_dir(&context).unwrap();
@@ -885,6 +1140,10 @@ mod tests {
             bases: BTreeMap::new(),
             args: BTreeMap::new(),
             host_dns: false,
+            verbose: false,
+            target: None,
+            cache: None,
+            no_cache: false,
             limits: Limits {
                 image: image::Limits {
                     max_metadata_bytes: 1024 * 1024,
@@ -942,7 +1201,6 @@ mod tests {
         let o = options(t.path());
         for source in [
             "FROM scratch\nWORKDIR /made\nCOPY --badflag a b\n",
-            "FROM scratch\nFROM scratch\n",
             "FROM scratch\nWORKDIR /made\nENV A=${UNSET:-bad}\n",
             "FROM scratch\nWORKDIR /made\nWORKDIR ../bad\n",
         ] {

@@ -18,5 +18,19 @@ jobs:
       - run: cargo test --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --bin rpweld
+      - name: Verify authenticated HTTPS registry workflow
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo apache2-utils
+          mkdir "$RUNNER_TEMP/weld-registry"
+          (
+            cd "$RUNNER_TEMP/weld-registry"
+            apt-get download docker-registry
+            dpkg-deb -x ./*.deb unpacked
+          )
+          sudo python3 tests/registry_https.py --weld "$PWD/target/debug/rpweld" \
+            --registry "$RUNNER_TEMP/weld-registry/unpacked/usr/bin/docker-registry"
       - run: python tests/scan_cli.py target/debug/rpweld
       - run: python tests/compatibility.py --self-test

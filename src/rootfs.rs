@@ -89,21 +89,27 @@ mod linux {
         // need a different identity-preserving replay design, not dropped pins.
         // 256 resolution FDs OR 257 recursive deletion FDs + readdir, with
         // headroom for source/destination, target pins and temporary duplicates.
-        let mut required: libc::rlim_t = 272;
+        let mut whiteout_pins: libc::rlim_t = 0;
+        let mut replay_pins: libc::rlim_t = 0;
         let overflow = || Error::Unsupported("rootfs descriptor budget overflow");
         for e in entries {
             check(c)?;
-            let pins = if split(&e.path).1.starts_with(b".wh.") {
-                1 // One parent per marker, including opaque markers.
+            if split(&e.path).1.starts_with(b".wh.") {
+                whiteout_pins = whiteout_pins.checked_add(1).ok_or_else(overflow)?;
             } else {
-                match e.kind {
+                let pins = match e.kind {
                     EntryKind::Directory => 1,
                     EntryKind::Symlink | EntryKind::Hardlink => 2,
                     EntryKind::File => 0,
-                }
-            };
-            required = required.checked_add(pins).ok_or_else(overflow)?;
+                };
+                replay_pins = replay_pins.checked_add(pins).ok_or_else(overflow)?;
+            }
         }
+        // Whiteout pins are all dropped before replay pins are retained.
+        let mut required = whiteout_pins
+            .max(replay_pins)
+            .checked_add(272)
+            .ok_or_else(overflow)?;
         // Includes root, host and the verified spool, plus the enumeration FD.
         // Counting all open FDs also safely overestimates those above soft NOFILE.
         for fd in std::fs::read_dir("/proc/self/fd")? {
@@ -116,7 +122,7 @@ mod linux {
         let mut limits = unsafe { limits.assume_init() };
         if required > limits.rlim_max {
             return Err(io::Error::other(format!(
-                "descriptor budget requires {required} FDs, exceeding RLIMIT_NOFILE hard limit {} (soft {}); root unchanged; pinned descriptors scale with layer entries",
+                "descriptor budget requires {required} FDs, exceeding RLIMIT_NOFILE hard limit {} (soft {}); root unchanged; this process cannot raise the hard limit automatically. Use a runtime with a higher hard NOFILE limit or a layer requiring fewer pinned descriptors; GPU/CPU/RAM size does not determine this limit",
                 limits.rlim_max, limits.rlim_cur
             )).into());
         }
@@ -1398,7 +1404,14 @@ mod tests {
     fn descriptor_budget_subprocess() {
         const CHILD: &str = "RPWELD_ROOTFS_FD_BUDGET_CHILD";
         let Ok(case) = std::env::var(CHILD) else {
-            for case in ["raise", "insufficient", "cancel", "opaque", "unchanged"] {
+            for case in [
+                "raise",
+                "insufficient",
+                "cancel",
+                "opaque",
+                "unchanged",
+                "phases",
+            ] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -1435,6 +1448,13 @@ mod tests {
                 fs::write(root.join(format!("lower/{i}")), b"").unwrap();
             }
             entries = vec![file("lower/.wh..wh..opq", b"")];
+        } else if case == "phases" {
+            entries.clear();
+            for i in 0..500 {
+                fs::write(root.join(format!("old{i}")), b"old").unwrap();
+                entries.push(file(&format!(".wh.old{i}"), b""));
+                entries.push(directory(&format!("new{i}")));
+            }
         } else if case == "unchanged" {
             entries = vec![file("small", b"ok")];
         } else {
@@ -1466,6 +1486,13 @@ mod tests {
             },
             0
         );
+        // Doctor observes the inherited limits without changing them, including
+        // a runtime where soft and hard are both fixed at 1024.
+        let observed = crate::capabilities::inspect();
+        assert_eq!(observed["nofile"]["soft"], 1024);
+        assert_eq!(observed["nofile"]["hard"], hard);
+        assert_eq!(limits().rlim_cur, 1024);
+        assert_eq!(limits().rlim_max, hard);
         // Cancel during preflight, after the initial cancellation check.
         let calls = Cell::new(0);
         let result = apply_layer(root, &mut layer, || {
@@ -1509,6 +1536,14 @@ mod tests {
             "opaque" => {
                 result.unwrap();
                 assert_eq!(fs::read_dir(root.join("lower")).unwrap().count(), 0);
+                assert_eq!(limits().rlim_cur, 1024);
+            }
+            "phases" => {
+                result.unwrap();
+                for i in 0..500 {
+                    assert!(!root.join(format!("old{i}")).exists());
+                    assert!(root.join(format!("new{i}")).is_dir());
+                }
                 assert_eq!(limits().rlim_cur, 1024);
             }
             "unchanged" => {

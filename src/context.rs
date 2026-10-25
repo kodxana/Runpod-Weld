@@ -73,6 +73,46 @@ pub fn copy_local(
     limits: Limits,
     cancelled: impl Fn() -> bool,
 ) -> Result<Summary, Error> {
+    copy_source(
+        context_root,
+        image_root,
+        sources,
+        destination,
+        limits,
+        false,
+        cancelled,
+    )
+}
+
+/// Copy a completed stage root; .dockerignore applies only to the build context.
+pub fn copy_stage(
+    context_root: &Path,
+    image_root: &Path,
+    sources: &[&str],
+    destination: &str,
+    limits: Limits,
+    cancelled: impl Fn() -> bool,
+) -> Result<Summary, Error> {
+    copy_source(
+        context_root,
+        image_root,
+        sources,
+        destination,
+        limits,
+        true,
+        cancelled,
+    )
+}
+
+fn copy_source(
+    context_root: &Path,
+    image_root: &Path,
+    sources: &[&str],
+    destination: &str,
+    limits: Limits,
+    stage: bool,
+    cancelled: impl Fn() -> bool,
+) -> Result<Summary, Error> {
     #[cfg(target_os = "linux")]
     {
         linux::copy(
@@ -81,6 +121,7 @@ pub fn copy_local(
             sources,
             destination,
             limits,
+            stage,
             &cancelled,
         )
     }
@@ -92,6 +133,7 @@ pub fn copy_local(
             sources,
             destination,
             limits,
+            stage,
             cancelled,
         );
         Err(Error::Unsupported("local COPY requires Linux"))
@@ -549,6 +591,7 @@ mod linux {
         sources: &[&str],
         destination: &str,
         limits: Limits,
+        stage: bool,
         c: &impl Fn() -> bool,
     ) -> Result<Summary, Error> {
         check(c)?;
@@ -565,20 +608,22 @@ mod linux {
         let ctx = root(ctx)?;
         let image = root(image)?;
         let dst = destination_path(&image, &dst, c)?;
-        match open(
-            &ctx,
-            b".dockerignore",
-            libc::O_PATH | libc::O_NOFOLLOW,
-            true,
-        ) {
-            Ok(f) => {
-                let m = f.metadata()?;
-                if !m.is_file() || m.len() != 0 {
-                    return Err(Error::Unsupported("nonempty or nonregular .dockerignore"));
+        if !stage {
+            match open(
+                &ctx,
+                b".dockerignore",
+                libc::O_PATH | libc::O_NOFOLLOW,
+                true,
+            ) {
+                Ok(f) => {
+                    let m = f.metadata()?;
+                    if !m.is_file() || m.len() != 0 {
+                        return Err(Error::Unsupported("nonempty or nonregular .dockerignore"));
+                    }
                 }
+                Err(e) if missing(&e) => (),
+                Err(e) => return Err(e),
             }
-            Err(e) if missing(&e) => (),
-            Err(e) => return Err(e),
         }
         let dest_dir = match open(&image, &dst, libc::O_PATH, false) {
             Ok(f) => f.metadata()?.is_dir(),

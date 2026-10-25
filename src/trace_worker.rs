@@ -130,7 +130,7 @@ pub fn worker_main(options: WorkerOptions) -> ! {
     match result {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("trace_root: {error}");
+            eprintln!("rpweld: runner error: {error}");
             std::process::exit(1);
         }
     }
@@ -141,7 +141,7 @@ pub fn worker_entry(args: impl IntoIterator<Item = OsString>) -> ! {
     match WorkerOptions::from_args(args) {
         Ok(options) => worker_main(options),
         Err(error) => {
-            eprintln!("trace_root: {error}");
+            eprintln!("rpweld: runner error: {error}");
             std::process::exit(1);
         }
     }
@@ -402,9 +402,11 @@ mod linux {
                 .iter()
                 .any(|&fd| (r.rdi as u32) <= fd as u32 && fd as u32 <= r.rsi as u32)
         {
-            eprintln!(
-                "trace_root: close_range covers pinned fds; returning ENOSYS for caller fallback"
-            );
+            if std::env::var_os("RPWELD_TRACE_VERBOSE").is_some_and(|v| v == "1") {
+                eprintln!(
+                    "rpweld: debug: close_range fallback used to preserve runner file descriptors"
+                );
+            }
             spoof(task, r, -(ENOSYS as i64));
             return Ok(());
         }
@@ -703,7 +705,7 @@ mod linux {
                 std::thread::sleep(Duration::from_millis(2));
             }
             eprintln!(
-                "trace_root: cleanup deadline; children remain (tracked {:?})",
+                "rpweld: runner cleanup deadline; children remain (tracked {:?})",
                 self.tasks.keys()
             );
         }
@@ -735,11 +737,11 @@ mod linux {
         while !children.tasks.is_empty() {
             let signal = CANCEL.load(Ordering::Relaxed);
             if signal != 0 {
-                eprintln!("trace_root: cancelled by signal {signal}");
+                eprintln!("rpweld: runner cancelled by signal {signal}");
                 return Ok(128 + signal);
             }
             if start.elapsed() >= timeout {
-                eprintln!("trace_root: timeout");
+                eprintln!("rpweld: RUN timed out");
                 return Ok(124);
             }
             let pids: Vec<_> = children.tasks.keys().copied().collect();
@@ -1037,9 +1039,11 @@ mod linux {
                 execve(argv[0], argv.as_ptr(), env.as_ptr());
                 _exit(126);
             }
-            eprintln!(
-                "trace_root: trusted experiment, NOT a security sandbox; outer /dev and /proc exposed; dumpability restored; relative paths native"
-            );
+            if std::env::var_os("RPWELD_BUILD_WORKER").is_none() {
+                eprintln!(
+                    "Note: Weld runs trusted commands only; commands can access host devices and process information."
+                );
+            }
             supervise(pid, dirs, Duration::from_secs(seconds))
         }
     }
