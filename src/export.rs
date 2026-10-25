@@ -119,7 +119,8 @@ impl Baseline {
 /// is performed (it would change ctime). Root metadata is always emitted.
 /// Base history is preserved and extended when present; absent history on a
 /// nonempty base stays absent rather than inventing historical entries. Base
-/// blobs are verified and hardlinked; only cross-device links use verified copy.
+/// blobs are verified and copied into independent destination inodes: public
+/// layouts and work snapshots must not share mutable storage with their bases.
 pub fn export_delta_layout(
     root: &Path,
     destination: &Path,

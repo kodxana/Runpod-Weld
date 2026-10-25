@@ -525,16 +525,9 @@ pub(super) fn inherit(
         let source = BlobStore::open(layout)?;
         for descriptor in &state.layers {
             check(c)?;
-            // Immutable blobs share storage on one filesystem; EXDEV is the only
-            // supported copy case. Verification and all other errors propagate.
-            match source.link_verified(store, descriptor, state.blob_limit, c) {
-                Ok(()) => (),
-                Err(crate::oci::Error::Io(e)) if e.raw_os_error() == Some(libc::EXDEV) => {
-                    let file = source.open_verified(descriptor, state.blob_limit, c)?;
-                    store.ingest(file, descriptor, state.blob_limit, c)?;
-                }
-                Err(e) => return Err(e.into()),
-            }
+            // Public output is mutable; only ManagedCache may share blob inodes.
+            let file = source.open_verified(descriptor, state.blob_limit, c)?;
+            store.ingest(file, descriptor, state.blob_limit, c)?;
         }
     }
     let mut ids: Vec<Value> = state
@@ -1116,6 +1109,69 @@ mod tests {
             export_delta_layout(&current, &output, &config(), &baseline, LIMITS, || false).is_err()
         );
         assert!(!output.join("index.json").exists());
+    }
+
+    #[test]
+    fn public_base_blobs_have_independent_inodes_and_bidirectional_mutation_isolation() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let work = temp.path();
+        let root = work.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("app"), b"app").unwrap();
+        let base = work.join("base");
+        export_layout(&root, &base, &config(), LIMITS, || false).unwrap();
+        let current = work.join("current");
+        let image = replay(&base, &current, work);
+        let baseline = capture(&current, &base, work);
+        let first = work.join("first");
+        let second = work.join("second");
+        export_delta_layout(&current, &first, &config(), &baseline, LIMITS, || false).unwrap();
+        export_delta_layout_created(
+            &current,
+            &second,
+            &config(),
+            &baseline,
+            LIMITS,
+            || false,
+            || Ok(()),
+        )
+        .unwrap();
+        let relative =
+            Path::new("blobs/sha256").join(image.layers[0].digest.strip_prefix("sha256:").unwrap());
+        let source = base.join(&relative);
+        let first_blob = first.join(&relative);
+        let second_blob = second.join(&relative);
+        let original = fs::read(&source).unwrap();
+        assert_eq!(fs::read(&first_blob).unwrap(), original);
+        assert_eq!(fs::read(&second_blob).unwrap(), original);
+        assert_eq!(load(&first).layers[0], image.layers[0]);
+        assert_eq!(load(&second).layers[0], image.layers[0]);
+        let identities =
+            [&source, &first_blob, &second_blob].map(|p| identity(&fs::metadata(p).unwrap()));
+        assert_ne!(identities[0], identities[1]);
+        assert_ne!(identities[0], identities[2]);
+        assert_ne!(identities[1], identities[2]);
+        // Open without truncation/replacement, so this catches shared inodes.
+        OpenOptions::new()
+            .write(true)
+            .open(&first_blob)
+            .unwrap()
+            .write_all(b"output mutation")
+            .unwrap();
+        assert_eq!(identity(&fs::metadata(&first_blob).unwrap()), identities[1]);
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(&second_blob).unwrap(), original);
+        let mutated_output = fs::read(&first_blob).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b"source mutation")
+            .unwrap();
+        assert_eq!(identity(&fs::metadata(&source).unwrap()), identities[0]);
+        assert_eq!(fs::read(&first_blob).unwrap(), mutated_output);
+        assert_eq!(fs::read(&second_blob).unwrap(), original);
+        load(&second); // Independent exported bytes still verify after both writes.
     }
 
     #[test]
