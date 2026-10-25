@@ -31,19 +31,39 @@ bytes sum `st_blocks * 512`, once per device/inode. This does not detect shared
 reflink extents. Output/work/store and all-retained scopes are separate. New blob
 bytes mean digests absent from the preceding build, not a network transfer metric.
 
-`oracle.py` verifies descriptor size/SHA256 and uncompressed diff IDs, processes
-whiteouts before each layer, and replays with GNU tar rather than the production
-importer. Explicit PAX atime is restored separately because GNU tar only restores
-mtime. Snapshot includes content hash, mode/type, ownership, atime/mtime in ns,
+`oracle.py` verifies descriptor size/SHA256, uncompressed diff IDs and non-empty
+history counts when history is present. It processes whiteouts before each layer,
+then applies ordinary entries in archive order with GNU tar and `--numeric-owner`.
+Each ordinary replacement happens at its own entry; a preceding hardlink retains
+the old inode. Existing directory headers replace xattrs without deleting children;
+untouched directories retain their xattrs. Explicit PAX atime is restored
+separately because GNU tar only restores mtime. Surviving explicit directory
+timestamps are restored after children, and a missing root header preserves the
+lower root timestamps. Snapshot includes content hash, mode/type, ownership, atime/mtime in ns,
 xattrs, symlink target, and hardlink equivalence classes. ctime is not restorable.
 This is a trusted-fixture oracle, not an untrusted archive extraction service.
 
-The self-test covers opaque whiteouts, deletion, file-to-directory replacement,
-hardlinks, symlinks, xattrs, numeric ownership, permissions, mtime and corrupt
-blobs. CLI acceptance additionally covers descriptor annotations, unchanged base
-bytes/diff IDs, explicit root metadata, cumulative delta size, inherited stages,
-cache format isolation, no-cache namespace avoidance, cache/no-cache content and
-metadata equivalence, budgets, cancellation, and corrupt base rejection.
+The executed standalone self-test covers opaque whiteouts, deletion,
+file-to-directory replacement, ordered lower-inode hardlinks and splitting,
+symlinks, directory xattr deletion with child retention, conflicting text/numeric
+owners, permissions, atime/mtime, a missing upper root header, raw byte names,
+security capabilities, invalid history and same-size corrupt blobs.
+
+Prepared CLI acceptance covers descriptor annotations, unchanged base bytes/diff
+IDs and history prefix, explicit root metadata, cumulative delta size, metadata-only
+and mutating inherited stages, both cache-format directions, fresh and populated
+no-cache bypass, both cache namespace versions, explicit expected content/modes/
+owners/timestamps/config, budgets, RUN cancellation, and same-size corruption of
+accessed original-base and populated-checkpoint paths. Cache corruption targets
+all cached non-base layer inodes, not an arbitrary entry; originals are restored
+in `finally`. These candidate/Docker checks remain unexecuted until frozen handoff.
+
+CLI cancellation is synchronized to a marker inside RUN. It does **not** prove
+cancellation during serialization or publication. No deterministic export-phase
+CLI hook is available, so that independent CLI coverage is deferred. Production
+exporter unit tests may exercise their cancellation closure separately; this
+fixture does not claim to have run or verified those tests. Missing-root coverage
+is currently an independent replay regression, not a candidate missing-root test.
 
 No broad timestamp exception is allowed. The rich fixture gives the base root
 explicit subsecond timestamps and requires exact no-op preservation. Mutating
