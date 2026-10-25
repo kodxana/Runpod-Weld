@@ -126,7 +126,7 @@ rpweld scan Dockerfile
 rpweld scan path/to/Dockerfile --json
 ```
 
-The scanner accepts supported static `USER` syntax and reports invalid identities. USER with ARG/ENV expansion requires build-time validation; the scanner does not inspect image account files. It reports physical line numbers and detects features needing review, such as instruction flags, external frontends, remote ADD and multistage syntax. Possible heredocs stop scanning and mark the remainder uninspected. It does not rewrite Dockerfiles.
+The scanner accepts supported static `USER` syntax and reports invalid identities. USER with ARG/ENV expansion requires build-time validation; the scanner does not inspect image account files. It reports physical line numbers and detects features needing review, such as instruction flags, external frontends, remote ADD and multistage syntax. Supported single-body heredocs are consumed without interpreting their contents as Dockerfile instructions; scanning resumes at the next physical instruction. Unsupported or unterminated heredocs stop scanning and mark the remainder uninspected. It does not rewrite Dockerfiles.
 
 Exit 0 means no known issues were found by these partial static checks. Exit 2 means errors, required review, incomplete scanning, or an input error. Neither outcome establishes build support: the builder is still under development, and base-image configuration and package-manager behavior are not inspected. Inputs must be regular UTF-8 files no larger than 1 MiB.
 
@@ -480,3 +480,48 @@ reflinks, open descriptors and directory blocks remain unknown, the total upper 
 is unknown for component plans, and the lower bound stays zero. Entry/depth limits bound
 the additional component pass separately from inventory; record/metadata byte limits
 apply to inventory reads. Partial scans and cancellation clear every selection.
+
+### Bounded heredocs
+
+Weld supports one bare `RUN <<EOF` and one inline source in
+`COPY [--chmod=0755] [--chown=user:group] <<EOF destination`. Delimiters are
+ASCII identifiers, optionally single-, double-, partially quoted or backslash
+escaped. `<<-EOF` removes leading tabs (not spaces) from body and delimiter
+lines. Bodies preserve blank lines, comments, backslashes and LF/CRLF bytes;
+CRLF headers and delimiters are accepted independently of body line endings.
+A closing delimiter must occupy its entire line, apart from `<<-` tabs.
+Diagnostics use physical Dockerfile line numbers, including body lines.
+
+Bare RUN executes the body directly through the current image/SHELL shell,
+with current USER, WORKDIR, ARG and ENV. Quoting its delimiter does **not**
+disable the shell's expansion of the script. COPY expands `$NAME` and `${NAME}`
+using in-scope ARG/ENV (ENV wins), preserves quote characters, expands variables
+even inside single quotes, and removes backslash escapes. Any delimiter quoting
+or escaping disables COPY body expansion. Unsupported dollar forms, including
+parameter modifiers and command substitution, fail closed in expanding COPY
+bodies; quoted COPY bodies retain them literally. No COPY body is sent to a shell.
+
+Inline COPY defaults to mode 0644 and uid/gid 0:0 regardless of USER; existing
+COPY chmod/chown rules and confined destination traversal apply. Generated
+source files live only in the owned build work directory, outside the image,
+with fixed Unix-epoch access/modification timestamps. This deterministic timestamp
+profile avoids host clock/temp-path dependence; it does not promise BuildKit
+creation-time timestamp parity. The existing 1 MiB source, 64 KiB physical-line and evaluated-plan budgets bound
+bodies; the quoted RUN command must also fit 64 KiB. Byte/entry/metadata budgets, cancellation,
+leases and COPY cache receipts apply on cache hits and misses. Source body,
+evaluated contents, permissions and source order participate in cache identity.
+Local `.dockerignore` rules do not filter inline contents.
+
+Multiple heredocs, mixed inline/local COPY sources, COPY --from with inline
+contents, command-bearing RUN (`RUN cat <<EOF` or `RUN <<EOF bash`), fd-prefixed
+heredocs, bare RUN shebangs, ADD/ONBUILD heredocs and non-identifier delimiters
+are explicitly unsupported. Other `<<` occurrences retain the existing
+fail-closed restriction, including quoted literals. Parser directives remain
+outside the parser's supported profile. RUN CRLF scripts may fail in their
+selected shell just as they do in Docker; Weld does not normalize them.
+
+Semantics were checked against the [Dockerfile reference](https://docs.docker.com/reference/dockerfile/#here-documents),
+[BuildKit's RUN and raw-expansion dispatch](https://github.com/moby/buildkit/blob/master/frontend/dockerfile/dockerfile2llb/convert.go),
+and Docker 29.7.2 / BuildKit 0.32.2 byte-preserving oracle results. Focused engine
+tests are in `tests/heredoc_engine.rs`; broader oracle fixtures are maintained
+separately.

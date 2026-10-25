@@ -71,7 +71,8 @@ pub fn scan(source: &str) -> Report {
     let mut last = 0;
     let mut continued = false;
     let mut from_seen = false;
-    for (index, physical) in source.lines().enumerate() {
+    let mut lines = source.split_terminator('\n').enumerate();
+    while let Some((index, physical)) = lines.next() {
         let line = index + 1;
         last = line;
         let text = physical.trim();
@@ -134,9 +135,40 @@ pub fn scan(source: &str) -> Report {
         }
         let (name, arguments) = split_instruction(&logical);
         let name = name.to_ascii_uppercase();
+        let mut end_line = line;
+        if arguments.contains("<<") {
+            let result =
+                crate::build_plan::heredoc_header(&name, arguments, start).and_then(|doc| {
+                    let mut doc = doc.expect("marker was present");
+                    let end = crate::build_plan::read_heredoc(&mut doc, &mut lines, start)?;
+                    if name == "RUN" && doc.body.starts_with("#!") {
+                        report.diagnostic(
+                            start,
+                            "review",
+                            "unsupported_heredoc",
+                            "Shebang RUN heredocs are unsupported by the builder.",
+                            Some(&name),
+                        );
+                    }
+                    Ok(end)
+                });
+            match result {
+                Ok(end) => end_line = end,
+                Err(e) => {
+                    report.diagnostic(
+                        start,
+                        "review",
+                        "heredoc_scan_stopped",
+                        &e.message,
+                        Some(&name),
+                    );
+                    report.scan_complete = false;
+                }
+            }
+        }
         report.instructions.push(Instruction {
             line: start,
-            end_line: line,
+            end_line,
             name: name.clone(),
         });
         if name == "FROM" {
@@ -161,11 +193,7 @@ pub fn scan(source: &str) -> Report {
             );
         }
         inspect(&mut report, start, &name, arguments);
-        // shortcut: stop at any possible heredoc; use a real parser before accepting heredocs.
-        if matches!(name.as_str(), "RUN" | "COPY" | "ADD" | "ONBUILD") && arguments.contains("<<") {
-            report.diagnostic(start, "review", "heredoc_scan_stopped",
-                "Possible heredoc is outside scanner support. Scanning stopped here; remaining lines were not inspected (including any USER instructions).", Some(&name));
-            report.scan_complete = false;
+        if !report.scan_complete {
             break;
         }
         logical.clear();
@@ -522,11 +550,11 @@ mod tests {
     #[test]
     fn heredoc_body_is_never_reported_as_instructions() {
         let report = scan("FROM alpine\nRUN <<EOF\nUSER root\nEOF\nUSER app\n");
-        assert!(!report.scan_complete);
-        assert_eq!(report.policy_status, "review_required");
-        assert_eq!(report.instructions.len(), 2);
-        assert!(has(&report, "heredoc_scan_stopped", 2));
-        assert!(!report.instructions.iter().any(|i| i.name == "USER"));
+        assert!(report.scan_complete);
+        assert_eq!(report.instructions.len(), 3);
+        assert_eq!(report.instructions[1].end_line, 4);
+        assert_eq!(report.instructions[2].name, "USER");
+        assert_eq!(report.instructions[2].line, 5);
     }
 
     #[test]

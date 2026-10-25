@@ -116,6 +116,7 @@ enum Step {
     },
     Copy {
         from: Option<CopySource>,
+        inline: Option<String>,
         sources: Vec<String>,
         destination: String,
         chown: Option<String>,
@@ -135,6 +136,43 @@ struct Checkpoint {
     operation: &'static str,
     config: Value,
     args: BTreeMap<String, String>,
+}
+
+// The stage directory is newly created and leased before this function. Source
+// names come only from validated delimiter identifiers, never container paths.
+fn prepare_inline_sources(steps: &[Step], work: &Path, cancelled: &dyn Fn() -> bool) -> Result<()> {
+    use std::io::Write;
+    for (index, step) in steps.iter().enumerate() {
+        if let Step::Copy {
+            inline: Some(body),
+            sources,
+            ..
+        } = step
+        {
+            check(&cancelled)?;
+            let dir = work.join(format!("inline-{index}"));
+            fs::create_dir(&dir)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(&sources[0]))?;
+            for chunk in body.as_bytes().chunks(65536) {
+                check(&cancelled)?;
+                file.write_all(chunk)?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o644))?;
+            }
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_accessed(std::time::UNIX_EPOCH)
+                    .set_modified(std::time::UNIX_EPOCH),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn check(cancelled: &impl Fn() -> bool) -> Result<()> {
@@ -172,12 +210,21 @@ fn map_bytes(values: &BTreeMap<String, String>, cap: usize) -> Result<usize> {
 
 // Basic Docker word expansion only; modifiers are rejected even in unused ARGs.
 fn expand(raw: &str, vars: &BTreeMap<String, String>, cap: usize) -> Result<String> {
+    expand_mode(raw, vars, cap, false)
+}
+
+fn expand_mode(
+    raw: &str,
+    vars: &BTreeMap<String, String>,
+    cap: usize,
+    raw_quotes: bool,
+) -> Result<String> {
     let mut chars = raw.chars().peekable();
     let mut out = String::new();
     let mut quote = None;
     while let Some(c) = chars.next() {
         match c {
-            '\'' | '"' if quote.is_none() => quote = Some(c),
+            '\'' | '"' if quote.is_none() && !raw_quotes => quote = Some(c),
             c if Some(c) == quote => quote = None,
             '\\' if quote != Some('\'') => {
                 let next = chars.next().ok_or("unfinished escape")?;
@@ -291,6 +338,7 @@ fn check_copy_sources(
     for step in steps {
         if let Step::Copy {
             from: None,
+            inline: None,
             sources,
             ..
         } = step
@@ -612,7 +660,7 @@ fn preflight_checkpoints(
                 chown,
                 chmod,
             } => {
-                let chown = chown
+                let mut chown = chown
                     .as_deref()
                     .map(|s| expand(s, &vars, cap))
                     .transpose()?;
@@ -625,6 +673,37 @@ fn preflight_checkpoints(
                     .transpose()?;
                 let mut values = copy_words(paths, &vars, cap)?;
                 let dest = values.pop().ok_or("COPY destination missing")?;
+                let inline = i
+                    .heredoc
+                    .as_ref()
+                    .map(|doc| {
+                        values = vec![doc.delimiter.clone()];
+                        chown.get_or_insert_with(|| "0:0".into());
+                        if doc.expand {
+                            expand_mode(&doc.body, &vars, cap, true)
+                        } else {
+                            Ok(doc.body.clone())
+                        }
+                    })
+                    .transpose()?;
+                if let Some(body) = &inline {
+                    charge = charge
+                        .checked_add(body.len())
+                        .ok_or("plan budget overflow")?;
+                    if body.len() as u64
+                        > options
+                            .limits
+                            .max_rootfs_bytes
+                            .min(options.limits.layer.max_uncompressed_bytes)
+                        || options
+                            .limits
+                            .max_rootfs_entries
+                            .min(options.limits.layer.max_entries)
+                            == 0
+                    {
+                        return Err("inline COPY budget exceeded".into());
+                    }
+                }
                 for source in &mut values {
                     if from.is_some() {
                         *source = source.trim_start_matches('/').to_owned();
@@ -642,6 +721,12 @@ fn preflight_checkpoints(
                     destination.push('/');
                 }
                 copy_path(&destination, true)?;
+                if inline.is_some()
+                    && (512 + values[0].len() + destination.len()) as u64
+                        > options.limits.layer.max_metadata_bytes
+                {
+                    return Err("inline COPY metadata budget exceeded".into());
+                }
                 charge = charge
                     .checked_add(destination.len())
                     .and_then(|n| {
@@ -655,6 +740,7 @@ fn preflight_checkpoints(
                     .ok_or("plan budget overflow")?;
                 steps.push(Step::Copy {
                     from: from.clone(),
+                    inline,
                     sources: values,
                     destination,
                     chown,
@@ -760,9 +846,23 @@ fn preflight_checkpoints(
             }
             I::Run(run) => {
                 let command = match run {
-                    Run::Shell(s) => exec_command(&shell_argv(&shell, s)),
+                    Run::Shell(s) => exec_command(&shell_argv(
+                        &shell,
+                        i.heredoc
+                            .as_ref()
+                            .map_or(s.as_str(), |doc| doc.body.as_str()),
+                    )),
                     Run::Exec(argv) => exec_command(argv),
                 };
+                // This string is the actual worker argv element, after JSON
+                // decoding and shell quoting; the worker does not JSON-encode it.
+                if command.len() > build_plan::MAX_LINE_BYTES {
+                    return Err(format!(
+                        "line {}: RUN command exceeds 64 KiB worker argument profile",
+                        i.line
+                    )
+                    .into());
+                }
                 let entries: Vec<_> = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 charge = charge
                     .checked_add(
@@ -1473,9 +1573,16 @@ fn build_stage(
             options.host_dns,
             dependencies
         );
-        let uses_context = steps
-            .iter()
-            .any(|s| matches!(s, Step::Copy { from: None, .. }));
+        let uses_context = steps.iter().any(|s| {
+            matches!(
+                s,
+                Step::Copy {
+                    from: None,
+                    inline: None,
+                    ..
+                }
+            )
+        });
         Some(cache.join(crate::build_cache::key(
             input.as_bytes(),
             uses_context.then_some(options.context.as_path()),
@@ -1486,6 +1593,20 @@ fn build_stage(
     } else {
         None
     };
+    check(&cancelled)?;
+    fs::create_dir(&work)?;
+    #[cfg(target_os = "linux")]
+    if let Some(r) = record.as_deref_mut() {
+        r.created(&work, lease.unwrap())?;
+    }
+    let root = work.join("rootfs");
+    let spool = work.join("spool");
+    let state = work.join("state");
+    create_image_root(&root)?;
+    for p in [&spool, &state] {
+        fs::create_dir(p)?;
+    }
+    prepare_inline_sources(&steps, &work, &cancelled)?;
     let mut cache_hit = false;
     if let Some(entry) = &cache_entry
         && crate::build_cache::lookup(entry, lease)?
@@ -1501,15 +1622,29 @@ fn build_stage(
         )?;
         let mut targets = targets.iter();
         let mut copied = context::Summary::default();
-        for step in &steps {
-            if let Step::Copy { from, sources, .. } = step {
-                let stage_root = from.as_ref().map(|n| copy_input(n, previous, external).0);
+        for (step_index, step) in steps.iter().enumerate() {
+            if let Step::Copy {
+                from,
+                inline,
+                sources,
+                ..
+            } = step
+            {
+                let stage_root = if inline.is_some() {
+                    Some(work.join(format!("inline-{}", step_index)))
+                } else {
+                    from.as_ref().map(|n| copy_input(n, previous, external).0)
+                };
                 let summary = context::validate_copy_budget(
                     stage_root.as_deref().unwrap_or(&options.context),
                     &sources.iter().map(String::as_str).collect::<Vec<_>>(),
                     targets.next().ok_or("missing cached COPY targets")?,
                     copy_limits(options.limits, &copied),
-                    if from.is_some() { None } else { Some(policy) },
+                    if from.is_some() || inline.is_some() {
+                        None
+                    } else {
+                        Some(policy)
+                    },
                     &cancelled,
                 )?;
                 copied.bytes_written += summary.bytes_written;
@@ -1546,19 +1681,6 @@ fn build_stage(
         eprintln!(
             "Note: Weld runs trusted Dockerfiles only; RUN commands can access the Pod's devices and process information."
         );
-    }
-    check(&cancelled)?;
-    fs::create_dir(&work)?;
-    #[cfg(target_os = "linux")]
-    if let Some(r) = record.as_deref_mut() {
-        r.created(&work, lease.unwrap())?;
-    }
-    let root = work.join("rootfs");
-    let spool = work.join("spool");
-    let state = work.join("state");
-    create_image_root(&root)?;
-    for p in [&spool, &state] {
-        fs::create_dir(p)?;
     }
     if let (Some(m), Some(p)) = (&metadata, &base_path) {
         let store = BlobStore::open(p)?;
@@ -1604,16 +1726,21 @@ fn build_stage(
             let mut selected: Vec<u8> = Vec::new();
             let mut dependency = None;
             let mut available = true;
-            for step in instruction_steps {
+            for (offset, step) in instruction_steps.iter().enumerate() {
                 if let Step::Copy {
                     from,
+                    inline,
                     sources,
                     destination,
                     chown,
                     chmod,
                 } = step
                 {
-                    let stage_root = from.as_ref().map(|n| copy_input(n, previous, external).0);
+                    let stage_root = if inline.is_some() {
+                        Some(work.join(format!("inline-{}", start + offset)))
+                    } else {
+                        from.as_ref().map(|n| copy_input(n, previous, external).0)
+                    };
                     dependency = from.as_ref().map(|n| copy_input(n, previous, external).1);
                     #[cfg(target_os = "linux")]
                     {
@@ -1623,7 +1750,11 @@ fn build_stage(
                             &sources.iter().map(String::as_str).collect::<Vec<_>>(),
                             destination,
                             copy_limits(options.limits, &copied),
-                            if from.is_some() { None } else { Some(policy) },
+                            if from.is_some() || inline.is_some() {
+                                None
+                            } else {
+                                Some(policy)
+                            },
                             context::CopyOptions {
                                 chown: chown.as_deref(),
                                 chmod: *chmod,
@@ -1700,6 +1831,7 @@ fn build_stage(
             match step {
                 Step::Copy {
                     from,
+                    inline,
                     sources,
                     destination,
                     chown,
@@ -1717,14 +1849,22 @@ fn build_stage(
                             "COPY named ownership requires a materialized image filesystem".into(),
                         );
                     }
-                    let stage_root = from.as_ref().map(|n| copy_input(n, previous, external).0);
+                    let stage_root = if inline.is_some() {
+                        Some(work.join(format!("inline-{}", index)))
+                    } else {
+                        from.as_ref().map(|n| copy_input(n, previous, external).0)
+                    };
                     let summary = context::copy_filtered_with_options(
                         stage_root.as_deref().unwrap_or(&options.context),
                         &root,
                         &sources.iter().map(String::as_str).collect::<Vec<_>>(),
                         destination,
                         copy_limits(options.limits, &copied),
-                        if from.is_some() { None } else { Some(policy) },
+                        if from.is_some() || inline.is_some() {
+                            None
+                        } else {
+                            Some(policy)
+                        },
                         context::CopyOptions {
                             chown: chown.as_deref(),
                             chmod: *chmod,
@@ -2182,6 +2322,96 @@ mod tests {
                 run_timeout_seconds: 30,
             },
         }
+    }
+    #[test]
+    fn heredoc_run_keeps_shell_user_environment_and_body() {
+        let t = tempfile::tempdir().unwrap();
+        let o = options(t.path());
+        let (_, steps) = preflight("FROM scratch\nARG X=value\nSHELL [\"/bin/bash\",\"-eu\",\"-c\"]\nUSER 1234:2345\nRUN <<'EOF'\nprintf '%s' \"$X\"\nEOF\nUSER root\nRUN <<EOF\necho done\nEOF\n", &o, json!({"config":{}})).unwrap();
+        let runs: Vec<_> = steps
+            .iter()
+            .filter_map(|s| {
+                if let Step::Run {
+                    command, user, env, ..
+                } = s
+                {
+                    Some((command, user, env))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(runs[0].1, "1234:2345");
+        assert!(runs[0].0.starts_with("exec '/bin/bash' '-eu' '-c'"));
+        assert!(runs[0].0.contains("$X"));
+        assert!(runs[0].2.contains(&"X=value".into()));
+        assert_eq!(runs[1].1, "root");
+    }
+
+    #[test]
+    fn heredoc_expansion_limits_and_materialization_cancellation() {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        let source = "FROM scratch\nARG X=123456789\nCOPY <<EOF /out\n$X\nEOF\n";
+        o.limits.max_rootfs_bytes = 9;
+        assert!(preflight(source, &o, json!({"config":{}})).is_err());
+        o.limits.max_rootfs_bytes = 1024;
+        o.limits.max_plan_bytes = 5;
+        assert!(preflight(source, &o, json!({"config":{}})).is_err());
+        o.limits.max_plan_bytes = 1024;
+        let (_, steps) = preflight(source, &o, json!({"config":{}})).unwrap();
+        fs::create_dir(&o.work).unwrap();
+        assert!(prepare_inline_sources(&steps, &o.work, &|| true).is_err());
+        assert_eq!(fs::read_dir(&o.work).unwrap().count(), 0);
+        assert!(
+            preflight(
+                "FROM scratch\nCOPY <<EOF /x\n${X:-default}\nEOF\n",
+                &o,
+                json!({"config":{}})
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn run_worker_argument_budget_checks_encoded_boundary_before_mutation() {
+        let t = tempfile::tempdir().unwrap();
+        let o = options(t.path());
+        let overhead = exec_command(&shell_argv(&["/bin/sh".into(), "-c".into()], "")).len();
+        for (extra, accepted) in [(0, true), (1, false)] {
+            let body = format!(
+                "{}\n",
+                "x".repeat(build_plan::MAX_LINE_BYTES - overhead - 1 + extra)
+            );
+            let source = format!("FROM scratch\nRUN <<EOF\n{body}EOF\n");
+            let result = preflight(&source, &o, json!({"config":{}}));
+            assert_eq!(result.is_ok(), accepted);
+            if let Ok((_, steps)) = result {
+                assert!(steps.iter().any(|s| matches!(s, Step::Run { command, .. } if command.len() == build_plan::MAX_LINE_BYTES)));
+            }
+        }
+        // Each literal quote costs multiple bytes in the worker argv encoding.
+        let quoted = "'".repeat(20_000);
+        let source = format!("FROM scratch\nRUN <<EOF\n{quoted}\nEOF\n");
+        let never_cancel: fn() -> bool = || false;
+        assert!(
+            build(&source, &o, never_cancel)
+                .unwrap_err()
+                .to_string()
+                .contains("64 KiB")
+        );
+        assert!(!o.work.exists());
+        assert!(!o.output.exists());
+        let json_run = serde_json::to_string(&vec!["echo", &quoted]).unwrap();
+        assert!(
+            preflight(
+                &format!("FROM scratch\nRUN {json_run}\n"),
+                &o,
+                json!({"config":{}})
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("64 KiB")
+        );
     }
     #[test]
     fn runtime_metadata_inheritance_validation_and_budget() {

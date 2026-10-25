@@ -13,13 +13,13 @@
 //! are validated by the evaluator before dependency selection or image lookup.
 //!
 //! Deliberate limits: default backslash escape only, no parser directives,
-//! heredocs, dynamic COPY --from, flags except
+//! complex heredocs, dynamic COPY --from, flags except
 //! FROM --platform, COPY --from/--chmod/--chown and HEALTHCHECK options, legacy ENV/LABEL,
 //! or other instructions.
 //! Empty continuation lines, repeated trailing escapes and non-ASCII syntax
 //! whitespace are rejected rather than guessed. This is not full Dockerfile.
-//! WORKDIR paths containing spaces must be quoted. Any `<<` payload is rejected,
-//! including quoted literals, to keep heredoc handling unambiguous.
+//! WORKDIR paths containing spaces must be quoted. `<<` is supported only for
+//! one bare RUN or one inline COPY source; other occurrences fail closed.
 
 use std::fmt;
 
@@ -86,6 +86,15 @@ pub struct Instruction {
     /// Logical payload after continuation folding, before lexical decoding.
     pub raw_payload: String,
     pub kind: InstructionKind,
+    pub heredoc: Option<Heredoc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heredoc {
+    pub delimiter: String,
+    pub expand: bool,
+    pub strip_tabs: bool,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,7 +340,8 @@ pub fn parse(source: &str) -> Result<BuildPlan> {
     let mut pending = false;
     let mut instructions = 0;
     let mut tokens = 0;
-    for (index, physical) in source.split_terminator('\n').enumerate() {
+    let mut lines = source.split_terminator('\n').enumerate();
+    while let Some((index, physical)) = lines.next() {
         let line = index + 1;
         if line > MAX_LINES {
             return error(line, "physical line limit exceeded");
@@ -394,7 +404,13 @@ pub fn parse(source: &str) -> Result<BuildPlan> {
         if instructions > MAX_INSTRUCTIONS {
             return error(start, "instruction limit exceeded");
         }
-        let instruction = parse_instruction(&logical, start, line, &plan, &mut tokens)?;
+        let mut instruction = parse_instruction(&logical, start, line, &plan, &mut tokens)?;
+        if let Some(doc) = &mut instruction.heredoc {
+            instruction.end_line = read_heredoc(doc, &mut lines, start)?;
+            if matches!(instruction.kind, InstructionKind::Run(_)) && doc.body.starts_with("#!") {
+                return error(start, "shebang RUN heredocs are unsupported");
+            }
+        }
         match &instruction.kind {
             InstructionKind::From { base, alias, .. } => {
                 plan.stages.push(Stage {
@@ -489,9 +505,7 @@ fn parse_instruction(
     if payload.is_empty() {
         return error(line, format!("{name} requires a payload"));
     }
-    if payload.contains("<<") {
-        return error(line, "heredoc markers are unsupported");
-    }
+    let heredoc = heredoc_header(&name, payload, line)?;
     if payload
         .chars()
         .any(|c| c.is_whitespace() && !matches!(c, ' ' | '\t'))
@@ -740,7 +754,82 @@ fn parse_instruction(
         end_line,
         raw_payload: payload.into(),
         kind,
+        heredoc,
     })
+}
+
+/// Deliberately narrow grammar shared with the policy scanner. Other possible
+/// heredocs fail closed rather than exposing their bodies as instructions.
+pub(crate) fn heredoc_header(name: &str, payload: &str, line: usize) -> Result<Option<Heredoc>> {
+    if !payload.contains("<<") {
+        return Ok(None);
+    }
+    let mut tokens = 0;
+    let values = words(payload, line, &mut tokens)?;
+    let sources: Vec<_> = values.iter().filter(|w| !w.raw.starts_with("--")).collect();
+    let valid = match name {
+        "RUN" => values.len() == 1 && sources.len() == 1,
+        "COPY" => sources.len() == 2 && !values.iter().any(|w| w.raw.starts_with("--from")),
+        _ => false,
+    };
+    let unsupported = "unsupported heredoc: use bare RUN <<word or COPY [--chmod/--chown] <<word destination; multiple, command-bearing, fd-prefixed and mixed-source heredocs are unsupported";
+    if !valid
+        || !sources[0].raw.starts_with("<<")
+        || sources.iter().skip(1).any(|w| w.raw.contains("<<"))
+    {
+        return error(line, unsupported);
+    }
+    let raw = &sources[0].raw[2..];
+    let (strip_tabs, raw) = raw.strip_prefix('-').map_or((false, raw), |s| (true, s));
+    let delimiter = words(raw, line, &mut tokens)?;
+    if delimiter.len() != 1 || !identifier(&delimiter[0].value) {
+        return error(
+            line,
+            "heredoc delimiter must be an optionally quoted ASCII identifier",
+        );
+    }
+    Ok(Some(Heredoc {
+        delimiter: delimiter[0].value.clone(),
+        expand: raw == delimiter[0].value,
+        strip_tabs,
+        body: String::new(),
+    }))
+}
+
+pub(crate) fn read_heredoc<'a>(
+    doc: &mut Heredoc,
+    lines: &mut impl Iterator<Item = (usize, &'a str)>,
+    start: usize,
+) -> Result<usize> {
+    for (index, physical) in lines {
+        let line = index + 1;
+        let delimiter_line = physical.strip_suffix('\r').unwrap_or(physical);
+        if line > MAX_LINES || physical.len() > MAX_LINE_BYTES {
+            return error(line, "heredoc physical line budget exceeded");
+        }
+        if delimiter_line.chars().any(|c| c.is_control() && c != '\t') {
+            return error(line, "control character in heredoc");
+        }
+        let text = if doc.strip_tabs {
+            physical.trim_start_matches('\t')
+        } else {
+            physical
+        };
+        if (if doc.strip_tabs {
+            delimiter_line.trim_start_matches('\t')
+        } else {
+            delimiter_line
+        }) == doc.delimiter
+        {
+            return Ok(line);
+        }
+        if doc.body.len() + text.len() + 1 > MAX_SOURCE_BYTES {
+            return error(line, "heredoc body budget exceeded");
+        }
+        doc.body.push_str(text);
+        doc.body.push('\n');
+    }
+    error(start, format!("unterminated heredoc {}", doc.delimiter))
 }
 
 fn argv(text: &str, line: usize, tokens: &mut usize, executable: bool) -> Result<Vec<String>> {
@@ -982,7 +1071,7 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
             "FROM alpine\nUSER root:group:extra",
             "FROM alpine\nADD a b",
             "FROM alpine\nRUN --mount=type=cache echo hi",
-            "FROM alpine\nRUN <<EOF\nhi\nEOF",
+            "FROM alpine\nRUN <<EOF cat\nhi\nEOF",
             "FROM alpine\nRUN [bad]",
             "FROM alpine\nRUN []",
             "FROM alpine\nRUN [1]",
