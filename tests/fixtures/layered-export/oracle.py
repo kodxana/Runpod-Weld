@@ -53,10 +53,10 @@ def replay(layout, destination):
     destination.mkdir()
 
     def timestamps(member, path):
-        current = path.lstat()
         ns = lambda value: int(Decimal(str(value)) * 1_000_000_000)
-        os.utime(path, ns=(ns(member.pax_headers["atime"]) if "atime" in member.pax_headers else current.st_atime_ns,
-                           ns(member.pax_headers.get("mtime", member.mtime))), follow_symlinks=False)
+        mtime = member.pax_headers.get("mtime", member.mtime)
+        # Deterministic replay convention, not an OCI requirement for atime.
+        os.utime(path, ns=(ns(member.pax_headers.get("atime", mtime)), ns(mtime)), follow_symlinks=False)
 
     def extract(archive, member):
         # One member at a time retains tar ordering, including links to lower
@@ -119,11 +119,13 @@ def replay(layout, destination):
 
 
 def snapshot(root):
+    """Capture pre-read metadata; link reads may advance live atime, never restored."""
     result = {}
     inodes = {}
     def walk(path):
-        yield path
-        if path.is_dir() and not path.is_symlink():
+        s = path.lstat()
+        yield path, s
+        if stat.S_ISDIR(s.st_mode):
             fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOATIME)
             try:
                 with os.scandir(fd) as entries:
@@ -132,14 +134,17 @@ def snapshot(root):
                     yield from walk(path / name)
             finally:
                 os.close(fd)
-    paths = walk(root)
-    for path in paths:
-        s = path.lstat()
+    # Capture ALL entries before readlink/content reads can affect inode aliases.
+    paths = list(walk(root))
+    for path, s in paths:
         relative = str(path.relative_to(root))
-        item = {"mode": s.st_mode, "uid": s.st_uid, "gid": s.st_gid,
+        result[relative] = {"mode": s.st_mode, "uid": s.st_uid, "gid": s.st_gid,
                 "mtime_ns": s.st_mtime_ns, "atime_ns": s.st_atime_ns,
                 "xattrs": {k: os.getxattr(path, k, follow_symlinks=False).hex()
                            for k in sorted(os.listxattr(path, follow_symlinks=False))}}
+    for path, s in paths:
+        relative = str(path.relative_to(root))
+        item = result[relative]
         if stat.S_ISREG(s.st_mode):
             fd = os.open(path, os.O_RDONLY | os.O_NOATIME)
             with os.fdopen(fd, "rb") as f:
@@ -148,7 +153,6 @@ def snapshot(root):
             item["hardlink_group"] = inodes.setdefault(identity, relative)
         elif stat.S_ISLNK(s.st_mode):
             item["target"] = os.readlink(path)
-        result[relative] = item
     return result
 
 

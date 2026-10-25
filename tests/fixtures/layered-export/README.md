@@ -45,11 +45,31 @@ then applies ordinary entries in archive order with GNU tar and `--numeric-owner
 Each ordinary replacement happens at its own entry; a preceding hardlink retains
 the old inode. Existing directory headers replace xattrs without deleting children;
 untouched directories retain their xattrs. Explicit PAX atime is restored
-separately because GNU tar only restores mtime. Surviving explicit directory
+separately because GNU tar only restores mtime. When an entry omits atime, replay
+uses its archived mtime (including PAX fractions). This is a deterministic test
+replay convention matching the product, not an OCI requirement to encode atime.
+It prevents extraction wall-clock time from influencing independent comparisons;
+explicit atime and mtime remain exact. Surviving explicit directory
 timestamps are restored after children, and a missing root header preserves the
 lower root timestamps. Snapshot includes content hash, mode/type, ownership, atime/mtime in ns,
 xattrs, symlink target, and hardlink equivalence classes. ctime is not restorable.
+Snapshot captures metadata for all entries before reading any content or link
+targets, enumerating directories without following symlinks. This preserves the
+pre-read metadata of inode aliases. Reading link targets can still advance live
+symlink atime: snapshot never restores timestamps, which would itself change
+ctime. Compare first observations of separate fresh replay trees, or reuse a
+saved snapshot; a later observation describes the current, possibly changed tree.
+The populated-cache comparison observes only OCI directories and regular files,
+whose enumeration/content reads use O_NOATIME, rather than replayed symlinks.
+Timestamp setting occurs only during disposable replay initialization, including
+preserving lower root timestamps when the upper layer has no root header.
 This is a trusted-fixture oracle, not an untrusted archive extraction service.
+
+Run `python3 -B -m unittest -v test_oracle` from this directory for no-builder
+timestamp regressions: identical four-entry replays, omitted and explicit
+fractional times, hardlink aliases, missing-root preservation, and first/repeated
+symlink observations without ctime mutation. Run `python3 -B oracle.py` for the
+existing changeset/xattr/capability self-test as well.
 
 The executed standalone self-test covers opaque whiteouts, deletion,
 file-to-directory replacement, ordered lower-inode hardlinks and splitting,
