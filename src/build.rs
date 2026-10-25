@@ -248,7 +248,9 @@ fn expand_mode(
                     name.push(chars.next().unwrap());
                 }
                 if !identifier(&name) || (braced && chars.next() != Some('}')) {
-                    return Err("only $NAME and ${NAME} expansion supported".into());
+                    return Err(
+                        "unsupported expansion; only $NAME and ${NAME} expansion supported".into(),
+                    );
                 }
                 let value = vars.get(&name).map(String::as_str).unwrap_or("");
                 if value.len() > cap.saturating_sub(out.len()) {
@@ -2428,7 +2430,9 @@ mod tests {
                 &o,
                 json!({"config":{}})
             )
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported expansion")
         );
     }
     #[test]
