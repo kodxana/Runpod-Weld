@@ -279,7 +279,36 @@ fn inspect(report: &mut Report, line: usize, name: &str, arguments: &str) {
         }
         return;
     }
-    if arguments.starts_with("--") {
+    if name == "FROM" && arguments.starts_with("--") {
+        match crate::build_plan::parse(&format!("FROM {arguments}")) {
+            Err(e) => report.diagnostic(
+                line,
+                "error",
+                "invalid_from_platform",
+                &e.message,
+                Some(name),
+            ),
+            Ok(plan) => {
+                if let crate::build_plan::InstructionKind::From {
+                    platform: Some(value),
+                    ..
+                } = &plan.stages[0].instructions[0].kind
+                {
+                    if value.contains('$') {
+                        report.diagnostic(line, "review", "platform_expansion", "FROM platform uses global ARG expansion and requires build-time validation; only linux/amd64 is supported.", Some(name));
+                    } else if let Err(e) = crate::build::normalize_platform(value) {
+                        report.diagnostic(
+                            line,
+                            "error",
+                            "invalid_from_platform",
+                            &e.to_string(),
+                            Some(name),
+                        );
+                    }
+                }
+            }
+        }
+    } else if arguments.starts_with("--") {
         report.diagnostic(line, "review", "instruction_flags",
             "This scanner does not validate instruction flags. The builder supports static COPY --from stages/images and --chmod/--chown within its documented profile; dynamic --from remains unsupported. Other flags require separate compatibility review.", Some(name));
     }
@@ -332,6 +361,30 @@ fn inspect(report: &mut Report, line: usize, name: &str, arguments: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_platform_checks_static_values_and_defers_globals() {
+        assert!(
+            scan("FROM --platform=linux/x86_64 scratch")
+                .diagnostics
+                .is_empty()
+        );
+        assert!(has(
+            &scan("FROM --platform=linux/arm64 scratch"),
+            "invalid_from_platform",
+            1
+        ));
+        assert!(has(
+            &scan("FROM --platform= scratch"),
+            "invalid_from_platform",
+            1
+        ));
+        assert!(has(
+            &scan("FROM --platform=$BUILDPLATFORM scratch"),
+            "platform_expansion",
+            1
+        ));
+    }
 
     fn has(report: &Report, code: &str, line: usize) -> bool {
         report

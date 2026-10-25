@@ -14,7 +14,7 @@
 //!
 //! Deliberate limits: default backslash escape only, no parser directives,
 //! heredocs, dynamic COPY --from, flags except
-//! COPY --from/--chmod/--chown, legacy ENV/LABEL, or other instructions.
+//! FROM --platform and COPY --from/--chmod/--chown, legacy ENV/LABEL, or other instructions.
 //! Empty continuation lines, repeated trailing escapes and non-ASCII syntax
 //! whitespace are rejected rather than guessed. This is not full Dockerfile.
 //! WORKDIR paths containing spaces must be quoted. Any `<<` payload is rejected,
@@ -110,6 +110,8 @@ pub enum InstructionKind {
     From {
         base: Base,
         alias: Option<String>,
+        /// Raw global ARG template, validated before any image lookup.
+        platform: Option<String>,
     },
     Run(Run),
     /// Last argument is the destination; preceding arguments are sources.
@@ -228,7 +230,7 @@ pub fn parse(source: &str) -> Result<BuildPlan> {
         }
         let instruction = parse_instruction(&logical, start, line, &plan, &mut tokens)?;
         match &instruction.kind {
-            InstructionKind::From { base, alias } => {
+            InstructionKind::From { base, alias, .. } => {
                 plan.stages.push(Stage {
                     name: alias.clone(),
                     base: base.clone(),
@@ -330,20 +332,28 @@ fn parse_instruction(
     {
         return error(line, "non-ASCII syntax whitespace is unsupported");
     }
-    if payload.starts_with("--") && name != "COPY" {
+    if payload.starts_with("--") && !matches!(name.as_str(), "COPY" | "FROM") {
         return error(line, "instruction flags are unsupported");
     }
     charge(tokens, 1, line)?;
     let kind = match name.as_str() {
         "FROM" => {
             let words = words(payload, line, tokens)?;
-            if !matches!(words.len(), 1 | 3)
-                || (words.len() == 3 && !words[1].value.eq_ignore_ascii_case("AS"))
-            {
-                return error(line, "expected FROM reference [AS name]");
+            let platform = words[0]
+                .value
+                .strip_prefix("--platform=")
+                .map(str::to_owned);
+            if platform.as_deref() == Some("") {
+                return error(line, "FROM --platform requires a value");
             }
             if words.iter().any(|w| w.raw != w.value) {
                 return error(line, "quoted FROM syntax is unsupported");
+            }
+            let words = &words[usize::from(platform.is_some())..];
+            if !matches!(words.len(), 1 | 3)
+                || (words.len() == 3 && !words[1].value.eq_ignore_ascii_case("AS"))
+            {
+                return error(line, "expected FROM [--platform=value] reference [AS name]");
             }
             let reference = &words[0].value;
             if reference.is_empty()
@@ -379,7 +389,11 @@ fn parse_instruction(
                 })
                 .map(Base::Stage)
                 .unwrap_or_else(|| Base::Image(reference.clone()));
-            InstructionKind::From { base, alias }
+            InstructionKind::From {
+                base,
+                alias,
+                platform,
+            }
         }
         "RUN" => InstructionKind::Run(if payload.starts_with('[') {
             Run::Exec(argv(payload, line, tokens, true)?)
@@ -623,6 +637,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_platform_retains_template_and_rejects_ambiguous_flags() {
+        let plan = parse(
+            "FROM --platform=${BUILDPLATFORM} scratch AS base\nFROM --platform=linux/amd64 base",
+        )
+        .unwrap();
+        assert!(matches!(&plan.stages[0].instructions[0].kind,
+            InstructionKind::From { platform: Some(value), .. } if value == "${BUILDPLATFORM}"));
+        assert_eq!(plan.stages[1].base, Base::Stage(0));
+        for source in [
+            "FROM --platform= scratch",
+            "FROM --platform linux/amd64 scratch",
+            "FROM --platform=linux/amd64",
+            "FROM --unknown=linux/amd64 scratch",
+            "FROM --platform=linux/amd64 --platform=linux/amd64 scratch",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn continuation_indentation_preserves_shell_and_quoted_values() {
         let plan = parse(
             "FROM alpine\nRUN echo a\\\n    b\nENV X=\"a\\\n    b\"\nCOPY \"a\\\n    b\" /out\n",
@@ -768,7 +802,7 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
         for source in [
             "FROM",
             "FROM ''",
-            "FROM --platform=linux/amd64 alpine",
+            "FROM --platform=linux/amd64 --platform=linux/amd64 alpine",
             "# escape=`\nFROM alpine",
             "# syntax=docker/dockerfile:1\nFROM alpine",
             "RUN hi",

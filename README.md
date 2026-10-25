@@ -72,6 +72,30 @@ Explicit WORKDIR resolves the current USER when it must create directories, and 
 
 Global ARG values and `--build-arg` overrides can select FROM images before pulls and cache lookup. Redeclare a global ARG inside a stage to use it there. Expansion supports basic `$NAME` and `${NAME}` forms, not shell expressions. Dynamic COPY `--from` and dynamic forward/self stage references remain unsupported. Explicit `--base` bindings use the resolved image reference.
 
+The automatic global args `BUILDPLATFORM`/`TARGETPLATFORM` default to `linux/amd64`,
+`BUILDOS`/`TARGETOS` to `linux`, `BUILDARCH`/`TARGETARCH` to `amd64`, and
+`BUILDVARIANT`/`TARGETVARIANT` to empty strings. These describe the supported Pod
+worker and image, regardless of the CLI host. They are available in global ARG
+defaults and FROM without declaration. Each stage must declare e.g. `ARG TARGETARCH`
+before using it in instructions or RUN; child stages inherit declared args, unrelated
+stages do not. ARG values are not persisted as image ENV unless explicitly assigned.
+`--build-arg` overrides automatic globals even without a global declaration;
+explicit ARG defaults override automatic defaults, while CLI values take precedence
+over both. ENV shadows stage ARG values as usual. Overrides are strings and do not
+change the execution architecture or exported image platform.
+
+`FROM --platform=$BUILDPLATFORM image` and literal platforms are supported. Every
+stage's expanded platform is validated before pulls, cache lookup or build mutation,
+including unused stages and backward stage references. Only Linux amd64 is supported;
+empty/unresolved values, ARM, other OSes and amd64 variants above v1 are rejected.
+FROM accepts containerd spellings `linux`, `amd64`, `x86_64`, `x86-64`, case folding,
+and `linux/amd64/v1` (normalized to `linux/amd64`). No emulation is performed.
+The CLI retains its explicit `--platform linux/amd64` contract. The lexical scanner
+validates literal FROM platforms and marks ARG-based platforms for build-time review.
+Semantics follow [Docker's automatic ARG scope](https://docs.docker.com/build/building/variables/),
+[BuildKit's default overrides](https://github.com/moby/buildkit/blob/master/frontend/dockerfile/dockerfile2llb/platform.go),
+and [containerd normalization](https://github.com/containerd/platforms/blob/main/platforms.go).
+
 SHELL accepts a JSON argument array and affects subsequent shell-form RUN, CMD and ENTRYPOINT. Exec-form commands remain literal argument arrays. LABEL supports variable expansion and inherited labels. RUN currently still needs `/bin/sh` in the image for Weld's dispatch wrapper, even when a custom shell is selected.
 
 ```sh

@@ -349,7 +349,29 @@ fn global_args(
         }
         text(value)?;
     }
-    let mut globals = BTreeMap::new();
+    // These describe the supported worker/target, never the CLI host OS.
+    let mut globals: BTreeMap<String, String> = [
+        ("BUILDPLATFORM", "linux/amd64"),
+        ("BUILDOS", "linux"),
+        ("BUILDARCH", "amd64"),
+        ("BUILDVARIANT", ""),
+        ("TARGETPLATFORM", "linux/amd64"),
+        ("TARGETOS", "linux"),
+        ("TARGETARCH", "amd64"),
+        ("TARGETVARIANT", ""),
+    ]
+    .into_iter()
+    .map(|(name, value)| {
+        (
+            name.to_owned(),
+            supplied
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| value.to_owned()),
+        )
+    })
+    .collect();
+    map_bytes(&globals, cap)?;
     for instruction in &plan.global_args {
         if let I::Arg { name, default } = &instruction.kind {
             let default = default
@@ -376,6 +398,18 @@ pub fn resolve_plan(
     let globals = global_args(&plan, supplied, cap)?;
     let mut charged = map_bytes(&globals, cap)?;
     for index in 0..plan.stages.len() {
+        if let I::From {
+            platform: Some(platform),
+            ..
+        } = &mut plan.stages[index].instructions[0].kind
+        {
+            let value = expand(platform, &globals, cap)?;
+            charged = charged
+                .checked_add(value.len())
+                .filter(|n| *n <= cap)
+                .ok_or("resolved FROM budget exceeded")?;
+            *platform = normalize_platform(&value)?.to_owned();
+        }
         let Base::Image(raw) = &plan.stages[index].base else {
             continue;
         };
@@ -411,6 +445,26 @@ pub fn resolve_plan(
         }
     }
     Ok(plan)
+}
+
+/// containerd-compatible normalization restricted to the supported worker.
+pub fn normalize_platform(value: &str) -> Result<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    let parts: Vec<_> = lower.splitn(4, '/').collect();
+    let arch = |s: &str| matches!(s, "amd64" | "x86_64" | "x86-64");
+    let supported = match parts.as_slice() {
+        [one] => *one == "linux" || arch(one),
+        [os, a] => *os == "linux" && arch(a),
+        [os, a, variant] => *os == "linux" && arch(a) && *variant == "v1",
+        _ => false,
+    };
+    if !supported {
+        return Err(format!(
+            "invalid or unsupported FROM platform {value:?}; only linux/amd64 is supported"
+        )
+        .into());
+    }
+    Ok("linux/amd64")
 }
 
 fn preflight_stage(
@@ -1931,6 +1985,102 @@ fn worker(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_platform_globals_and_from_validation() {
+        let supplied = BTreeMap::new();
+        let plan = resolve_plan("FROM --platform=$BUILDPLATFORM scratch AS base\nFROM --platform=${TARGETPLATFORM} base", &supplied, 4096).unwrap();
+        assert_eq!(plan.stages[1].base, Base::Stage(0));
+        for stage in &plan.stages {
+            assert!(
+                matches!(&stage.instructions[0].kind, I::From { platform: Some(p), .. } if p == "linux/amd64")
+            );
+        }
+        let globals = global_args(&plan, &supplied, 4096).unwrap();
+        assert_eq!(globals.len(), 8);
+        for prefix in ["BUILD", "TARGET"] {
+            assert_eq!(globals[&format!("{prefix}OS")], "linux");
+            assert_eq!(globals[&format!("{prefix}ARCH")], "amd64");
+            assert_eq!(globals[&format!("{prefix}VARIANT")], "");
+        }
+        let supplied = BTreeMap::from([("TARGETPLATFORM".into(), "linux/arm64".into())]);
+        assert!(resolve_plan("FROM --platform=$TARGETPLATFORM scratch", &supplied, 4096).is_err());
+        assert!(resolve_plan("FROM scratch", &supplied, 4096).is_ok());
+        assert!(resolve_plan("FROM scratch", &BTreeMap::new(), 10).is_err());
+        let plan =
+            resolve_plan("ARG BASE=$TARGETARCH\nFROM $BASE", &BTreeMap::new(), 4096).unwrap();
+        assert_eq!(plan.stages[0].base, Base::Image("amd64".into()));
+        for platform in ["linux", "amd64", "x86_64", "LINUX/X86-64", "linux/amd64/v1"] {
+            assert_eq!(normalize_platform(platform).unwrap(), "linux/amd64");
+        }
+        for platform in [
+            "",
+            "linux/arm64",
+            "windows/amd64",
+            "linux/amd64/v2",
+            "linux/amd64/",
+            "linux//",
+            "linux/amd64/v1/extra",
+            "$UNKNOWN",
+        ] {
+            assert!(
+                resolve_plan(
+                    &format!("FROM scratch AS base\nFROM --platform={platform} base"),
+                    &BTreeMap::new(),
+                    4096
+                )
+                .is_err(),
+                "{platform}"
+            );
+        }
+        let supplied = BTreeMap::from([("TARGETPLATFORM".into(), "linux/amd64 ".into())]);
+        assert!(resolve_plan("FROM --platform=$TARGETPLATFORM scratch", &supplied, 4096).is_err());
+        let supplied = BTreeMap::from([("TARGETARCH".into(), "override".into())]);
+        let plan =
+            resolve_plan("ARG TARGETARCH=default\nFROM $TARGETARCH", &supplied, 4096).unwrap();
+        assert_eq!(plan.stages[0].base, Base::Image("override".into()));
+    }
+
+    #[test]
+    fn automatic_args_require_stage_declaration_and_preserve_overrides() {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        let source = "ARG TARGETARCH\nFROM scratch AS base\nENV BEFORE=$TARGETARCH\nARG TARGETARCH\nARG BUILDVARIANT\nRUN echo test\nENV AFTER=$TARGETARCH\nFROM base\nENV CHILD=$TARGETARCH\nFROM scratch\nENV UNRELATED=$TARGETARCH";
+        for override_value in [None, Some("custom"), Some("")] {
+            o.args.clear();
+            if let Some(v) = override_value {
+                o.args.insert("TARGETARCH".into(), v.into());
+            }
+            let plan = resolve_plan(source, &o.args, 4096).unwrap();
+            let (cfg, steps, args) =
+                preflight_stage(&plan, 0, &o, json!({"config":{}}), BTreeMap::new()).unwrap();
+            let expected = override_value.unwrap_or("amd64");
+            assert_eq!(
+                cfg["config"]["Env"],
+                json!([format!("AFTER={expected}"), "BEFORE="])
+            );
+            assert!(steps.iter().any(|s| matches!(s, Step::Run { env, .. } if env.contains(&format!("TARGETARCH={expected}")) && env.contains(&"BUILDVARIANT=".into()) && !env.iter().any(|v| v.starts_with("BUILDOS=")))));
+            let (child, _, _) = preflight_stage(&plan, 1, &o, cfg, args).unwrap();
+            assert!(
+                child["config"]["Env"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(format!("CHILD={expected}")))
+            );
+            let (other, _, _) =
+                preflight_stage(&plan, 2, &o, json!({"config":{}}), BTreeMap::new()).unwrap();
+            assert_eq!(other["config"]["Env"], json!(["UNRELATED="]));
+        }
+        o.args.clear();
+        let (cfg, _) = preflight("ARG TARGETARCH=global\nFROM scratch\nARG TARGETARCH=stage\nENV VALUE=$TARGETARCH\nENV TARGETARCH=env\nRUN echo test", &o, json!({"config":{}})).unwrap();
+        assert_eq!(
+            cfg["config"]["Env"],
+            json!(["TARGETARCH=env", "VALUE=stage"])
+        );
+        o.args.insert("TARGETARCH".into(), "cli".into());
+        let (cfg, steps) = preflight("ARG TARGETARCH=global\nFROM scratch\nARG TARGETARCH=stage\nENV VALUE=$TARGETARCH\nENV TARGETARCH=env\nRUN echo test", &o, json!({"config":{}})).unwrap();
+        assert_eq!(cfg["config"]["Env"], json!(["TARGETARCH=env", "VALUE=cli"]));
+        assert!(steps.iter().any(|s| matches!(s, Step::Run { env, .. } if env.contains(&"TARGETARCH=env".into()) && !env.contains(&"TARGETARCH=cli".into()))));
+    }
     fn preflight(
         source: &str,
         options: &BuildOptions,
