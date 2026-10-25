@@ -436,7 +436,8 @@ mod linux {
             .filter(|n| !n.is_empty())
         {
             check(c)?;
-            if !e.xattrs.contains_key(n) {
+            // Hardlink headers update a shared inode; omitted xattrs are not deletions.
+            if e.kind != EntryKind::Hardlink && !e.xattrs.contains_key(n) {
                 cv(unsafe { libc::fremovexattr(fd, cs(n)?.as_ptr()) })?;
             }
         }
@@ -1576,6 +1577,98 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn hardlink_xattrs_merge_in_resolution_order_on_the_shared_inode() {
+        for forward in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let mut target = file("target", b"payload");
+            target.pax = vec![
+                ("SCHILY.xattr.user.keep".into(), b"keep".to_vec()),
+                ("SCHILY.xattr.user.change".into(), b"target".to_vec()),
+            ];
+            let mut first = link("first", "target", true);
+            first.pax = vec![("SCHILY.xattr.user.change".into(), b"first".to_vec())];
+            let mut last = link("last", "first", true);
+            last.pax = vec![("SCHILY.xattr.user.change".into(), b"last".to_vec())];
+            let absent = link("absent", "last", true);
+            if forward {
+                apply(root, vec![absent, last, first, target]);
+            } else {
+                apply(root, vec![target]);
+                apply(root, vec![first, last, absent]);
+            }
+            let inode = fs::metadata(root.join("target")).unwrap().ino();
+            for name in ["target", "first", "last", "absent"] {
+                let path = root.join(name);
+                assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+                assert_eq!(read_xattr(&path, c"user.keep"), Some(b"keep".to_vec()));
+                assert_eq!(read_xattr(&path, c"user.change"), Some(b"last".to_vec()));
+            }
+        }
+    }
+
+    fn read_xattr(path: &Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut buf = vec![0; 256];
+        let len = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if len < 0 {
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENODATA)
+            );
+            None
+        } else {
+            buf.truncate(len as usize);
+            Some(buf)
+        }
+    }
+
+    #[test]
+    fn hardlink_capability_is_cleared_by_chown_unless_explicitly_restored() {
+        let cap = vec![1, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        for explicit in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let mut target = file("target", b"payload");
+            target.pax = vec![("SCHILY.xattr.security.capability".into(), cap.clone())];
+            match apply_layer(root, &mut verified(vec![target]), || false) {
+                Ok(_) => {}
+                Err(Error::Io(e))
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EPERM | libc::EACCES | libc::EOPNOTSUPP)
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            }
+            assert_eq!(
+                read_xattr(&root.join("target"), c"security.capability"),
+                Some(cap.clone())
+            );
+            let mut alias = link("alias", "target", true);
+            if explicit {
+                alias.pax = vec![("SCHILY.xattr.security.capability".into(), cap.clone())];
+            }
+            apply(root, vec![alias]);
+            for name in ["target", "alias"] {
+                assert_eq!(
+                    read_xattr(&root.join(name), c"security.capability"),
+                    explicit.then(|| cap.clone())
+                );
+            }
+        }
+    }
+
     #[test]
     fn directory_xattrs_are_replaced_and_capabilities_preserved_or_error() {
         let tmp = tempfile::tempdir().unwrap();
