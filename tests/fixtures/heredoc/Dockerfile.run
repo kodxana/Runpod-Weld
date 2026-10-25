@@ -1,0 +1,19 @@
+FROM alpine
+ARG VALUE=argument
+ENV VALUE=environment
+SHELL ["/bin/sh", "-eu", "-c"]
+USER 1234:2345
+RUN <<'EOF'
+printf '%s\n' "$VALUE" '$VALUE' > /tmp/result
+id -u >> /tmp/result
+id -g >> /tmp/result
+case "$-" in *e*u*|*u*e*) echo strict >> /tmp/result;; *) exit 23;; esac
+EOF
+RUN <<-EOF
+	printf '%s\n' "$VALUE" >> /tmp/result
+	EOF
+USER 0
+RUN <<EOF
+test "$(id -u)" = 0
+printf '%s\n' restored > /tmp/root-result
+EOF

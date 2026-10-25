@@ -1,0 +1,19 @@
+FROM scratch
+ARG VALUE=argument
+ENV VALUE=environment
+COPY <<EOF /expanded
+"$VALUE" '${VALUE}' \$VALUE
+EOF
+COPY <<'EOF' /literal
+"$VALUE" '${VALUE}' \$VALUE
+EOF
+COPY <<E"O"F /mixed
+$VALUE
+EOF
+COPY <<-EOF /tabs
+	first
+	  second
+	EOF
+COPY --chmod=0751 --chown=1234:2345 <<EOF /owned
+owned
+EOF

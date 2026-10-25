@@ -1,0 +1,234 @@
+{
+  "copy": {
+    "exit": 0,
+    "files": [
+      {
+        "path": "expanded",
+        "bytes": "\"environment\" 'environment' $VALUE\n",
+        "hex": "22656e7669726f6e6d656e74222027656e7669726f6e6d656e7427202456414c55450a",
+        "sha256": "e1ca5b53272f29c8159356f414ee54a220410aa4501dadb22ac194d7673aa56e",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942973
+      },
+      {
+        "path": "literal",
+        "bytes": "\"$VALUE\" '${VALUE}' \\$VALUE\n",
+        "hex": "222456414c5545222027247b56414c55457d27205c2456414c55450a",
+        "sha256": "0a43107133ac0fff8a049c03fa85a7473525cf4e2212abb5bf6ae35e6055ed60",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942973
+      },
+      {
+        "path": "mixed",
+        "bytes": "$VALUE\n",
+        "hex": "2456414c55450a",
+        "sha256": "bbb3bd024ae8fc00641b62e2d9c4bd0b004767ee4b2dbc8b163fc174b2efe592",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942973
+      },
+      {
+        "path": "owned",
+        "bytes": "owned\n",
+        "hex": "6f776e65640a",
+        "sha256": "33bff9108736f23280e9cd50cb1472e3a5b4403ed3f2da1fe67b8487a4fb75c6",
+        "mode": "0o751",
+        "uid": 1234,
+        "gid": 2345,
+        "mtime": 1792942973
+      },
+      {
+        "path": "tabs",
+        "bytes": "first\n  second\n",
+        "hex": "66697273740a20207365636f6e640a",
+        "sha256": "ee2849a69b7111b9a94b2f8b90d7dc11123f38093bfef4204576eccd92eea158",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942973
+      }
+    ]
+  },
+  "run": {
+    "exit": 0,
+    "files": [
+      {
+        "path": "tmp/result",
+        "bytes": "environment\n$VALUE\n1234\n2345\nstrict\nenvironment\n",
+        "hex": "656e7669726f6e6d656e740a2456414c55450a313233340a323334350a7374726963740a656e7669726f6e6d656e740a",
+        "sha256": "b555490ce8b63f735765f4683e5e627b01e51212525d41f1c3e6784b117f61e0",
+        "mode": "0o644",
+        "uid": 1234,
+        "gid": 2345,
+        "mtime": 1792942974
+      },
+      {
+        "path": "tmp/root-result",
+        "bytes": "restored\n",
+        "hex": "726573746f7265640a",
+        "sha256": "09204dbfbdb8fc121fb2a47988fe1a42a1981ac4e16ea4afc915e2d87b40d324",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942974
+      }
+    ]
+  },
+  "missing": {
+    "exit": 1,
+    "files": []
+  },
+  "after": {
+    "exit": 1,
+    "files": []
+  },
+  "multiple": {
+    "exit": 0,
+    "files": [
+      {
+        "path": "A",
+        "bytes": "a\n",
+        "hex": "610a",
+        "sha256": "87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942976
+      },
+      {
+        "path": "B",
+        "bytes": "b\n",
+        "hex": "620a",
+        "sha256": "0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942976
+      }
+    ]
+  },
+  "copy-crlf": {
+    "exit": 0,
+    "files": [
+      {
+        "path": "expanded",
+        "bytes": "\"environment\" 'environment' $VALUE\r\n",
+        "hex": "22656e7669726f6e6d656e74222027656e7669726f6e6d656e7427202456414c55450d0a",
+        "sha256": "14816d0a8617088343c09f12a26a92763ca9d828a7fcfd9dfec427022ac38902",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942976
+      },
+      {
+        "path": "literal",
+        "bytes": "\"$VALUE\" '${VALUE}' \\$VALUE\r\n",
+        "hex": "222456414c5545222027247b56414c55457d27205c2456414c55450d0a",
+        "sha256": "86e50f075c285382a4b6c227032e2959a32d96a994bc2448afe90ee6d55c43c3",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942976
+      },
+      {
+        "path": "mixed",
+        "bytes": "$VALUE\r\n",
+        "hex": "2456414c55450d0a",
+        "sha256": "82bc647392fd7db93ba2a5b0b4e2f45856cf13a424988c6ddc3eb90f234a1922",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942976
+      },
+      {
+        "path": "owned",
+        "bytes": "owned\r\n",
+        "hex": "6f776e65640d0a",
+        "sha256": "c33ce4170e5377b81606729c2bac70868baf6d1344fff23fbc82b17915e3ae75",
+        "mode": "0o751",
+        "uid": 1234,
+        "gid": 2345,
+        "mtime": 1792942976
+      },
+      {
+        "path": "tabs",
+        "bytes": "first\r\n  second\r\n",
+        "hex": "66697273740d0a20207365636f6e640d0a",
+        "sha256": "98ad2a9ddd801d37e9dac0b67e55bab6fc69aa49b683e23711edf5ea48d6169f",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792942976
+      }
+    ]
+  },
+  "run-crlf": {
+    "exit": 1,
+    "files": []
+  },
+  "header-delimiter-crlf": {
+    "exit": 0,
+    "files": [
+      {
+        "path": "expanded",
+        "bytes": "body\n",
+        "hex": "626f64790a",
+        "sha256": "9e2ec912af5dff2a72300863864fc4da04e81999339d9fac5c7590ba8a3f4e11",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792943160
+      }
+    ]
+  },
+  "body-crlf": {
+    "exit": 0,
+    "files": [
+      {
+        "path": "expanded",
+        "bytes": "body\r\n",
+        "hex": "626f64790d0a",
+        "sha256": "0a4e52a11356529491e17d023afed1e6e6f6a544ed97ac73e1d4c5cfefa38b83",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792943161
+      }
+    ]
+  },
+  "shebang": {
+    "exit": 0,
+    "files": [
+      {
+        "path": "tmp/result",
+        "bytes": "shebang\n",
+        "hex": "73686562616e670a",
+        "sha256": "0e24cedb22f3844e93f26fe7886ee88cd1fad93ad7f0cd08817d145e47a8bbc2",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792943161
+      }
+    ]
+  },
+  "command": {
+    "exit": 0,
+    "files": [
+      {
+        "path": "tmp/result",
+        "bytes": "command\n",
+        "hex": "636f6d6d616e640a",
+        "sha256": "f0a3d5493566a7438aea193484ca55dc1ee3a700ceb44e26dc7dad782016147b",
+        "mode": "0o644",
+        "uid": 0,
+        "gid": 0,
+        "mtime": 1792943162
+      }
+    ]
+  }
+}
