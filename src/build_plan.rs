@@ -13,7 +13,7 @@
 //! are validated by the evaluator before dependency selection or image lookup.
 //!
 //! Deliberate limits: default backslash escape only, no parser directives,
-//! heredocs, external COPY images, dynamic COPY --from, flags except
+//! heredocs, dynamic COPY --from, flags except
 //! COPY --from/--chmod/--chown, legacy ENV/LABEL, or other instructions.
 //! Empty continuation lines, repeated trailing escapes and non-ASCII syntax
 //! whitespace are rejected rather than guessed. This is not full Dockerfile.
@@ -73,6 +73,12 @@ pub enum Base {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopySource {
+    Stage(usize),
+    Image(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instruction {
     pub line: usize,
     pub end_line: usize,
@@ -108,7 +114,7 @@ pub enum InstructionKind {
     Run(Run),
     /// Last argument is the destination; preceding arguments are sources.
     Copy {
-        from: Option<usize>,
+        from: Option<CopySource>,
         paths: Arguments,
         chown: Option<String>,
         chmod: Option<String>,
@@ -245,6 +251,21 @@ pub fn parse(source: &str) -> Result<BuildPlan> {
     if plan.stages.is_empty() {
         return error(1, "at least one FROM is required");
     }
+    for stage in &plan.stages {
+        for instruction in &stage.instructions {
+            if let InstructionKind::Copy {
+                from: Some(CopySource::Image(name)),
+                ..
+            } = &instruction.kind
+                && stage_index(name, &plan).is_some()
+            {
+                return error(
+                    instruction.line,
+                    "COPY forward stage references are unsupported",
+                );
+            }
+        }
+    }
     Ok(plan)
 }
 
@@ -380,15 +401,19 @@ fn parse_instruction(
                     if from.is_some() || reference.contains('$') {
                         return error(line, "duplicate or dynamic COPY --from unsupported");
                     }
-                    let index = stage_index(reference, plan).ok_or_else(|| ParseError {
-                        line,
-                        message: "COPY --from must reference an earlier stage".into(),
-                    })?;
-                    // Current stage already exists in the plan but cannot copy itself.
-                    if index + 1 >= plan.stages.len() {
-                        return error(line, "COPY cannot reference its current stage");
-                    }
-                    from = Some(index);
+                    from = Some(if let Some(index) = stage_index(reference, plan) {
+                        if index + 1 >= plan.stages.len() {
+                            return error(line, "COPY cannot reference its current stage");
+                        }
+                        CopySource::Stage(index)
+                    } else {
+                        if reference.is_empty() || reference.bytes().all(|b| b.is_ascii_digit()) {
+                            return error(line, "COPY stage index is out of range");
+                        }
+                        crate::registry::reference(reference, true)
+                            .map_err(|message| ParseError { line, message })?;
+                        CopySource::Image(reference.to_owned())
+                    });
                 } else if let Some(value) = flag.strip_prefix("--chown=") {
                     if value.is_empty() || chown.replace(value.to_owned()).is_some() {
                         return error(line, "empty or duplicate COPY --chown");
@@ -670,7 +695,10 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
         assert_eq!(plan.stages.len(), 2);
         assert!(matches!(
             plan.stages[1].instructions[1].kind,
-            InstructionKind::Copy { from: Some(0), .. }
+            InstructionKind::Copy {
+                from: Some(CopySource::Stage(0)),
+                ..
+            }
         ));
         let InstructionKind::Env(env) = &plan.stages[0].instructions[2].kind else {
             panic!()
@@ -699,6 +727,40 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
             parse("FROM alpine\nUS\\\nER root").unwrap().stages[0].instructions[1].kind,
             InstructionKind::User(_)
         ));
+    }
+
+    #[test]
+    fn copy_image_references_and_stage_precedence() {
+        let plan = parse("FROM scratch AS alpine\nFROM scratch\nCOPY --from=AlPiNe /a /a\nCOPY --from=0 /b /b\nCOPY --from=example.invalid/team/image:tag /c /c\nCOPY --from=other /d /d\n").unwrap();
+        for i in [1, 2] {
+            assert!(matches!(
+                plan.stages[1].instructions[i].kind,
+                InstructionKind::Copy {
+                    from: Some(CopySource::Stage(0)),
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(&plan.stages[1].instructions[3].kind,
+            InstructionKind::Copy { from: Some(CopySource::Image(name)), .. } if name == "example.invalid/team/image:tag"));
+        assert!(matches!(&plan.stages[1].instructions[4].kind,
+            InstructionKind::Copy { from: Some(CopySource::Image(name)), .. } if name == "other"));
+        let pinned = format!(
+            "FROM scratch\nCOPY --from=alpine@sha256:{} /a /a\n",
+            "a".repeat(64)
+        );
+        assert!(parse(&pinned).is_ok());
+        for reference in [
+            "",
+            "$IMAGE",
+            "${IMAGE}",
+            "999999999999999999999999999",
+            "4",
+            "https://host/repo",
+            "alpine@sha256:bad",
+        ] {
+            assert!(parse(&format!("FROM scratch\nCOPY --from={reference} /a /a\n")).is_err());
+        }
     }
 
     #[test]

@@ -68,6 +68,189 @@ fn config(layout: &Path) -> serde_json::Value {
     let manifest = read(blob(index["manifests"][0]["digest"].as_str().unwrap()));
     read(blob(manifest["config"]["digest"].as_str().unwrap()))
 }
+
+fn not_cancelled() -> bool {
+    false
+}
+
+fn cache_external(f: &Fixture, layout: &Path, reference: &str, refresh: bool) -> PathBuf {
+    let store = f.home.join("store");
+    fs::create_dir_all(&store).unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+    let lease = rpweld::store_lease::StoreLease::shared(&store, &not_cancelled).unwrap();
+    rpweld::registry::cached_base(
+        &store,
+        &lease,
+        reference,
+        refresh,
+        rpweld::image::Limits {
+            max_metadata_bytes: 1048576,
+            max_total_metadata_bytes: 4194304,
+            max_descriptors: 100,
+            max_layer_bytes: 10485760,
+            max_total_layer_bytes: 10485760,
+        },
+        not_cancelled,
+        |_, destination| {
+            fs::create_dir_all(destination.join("blobs/sha256")).unwrap();
+            for file in ["index.json", "oci-layout"] {
+                fs::copy(layout.join(file), destination.join(file)).unwrap();
+            }
+            for file in fs::read_dir(layout.join("blobs/sha256")).unwrap() {
+                let file = file.unwrap();
+                fs::copy(
+                    file.path(),
+                    destination.join("blobs/sha256").join(file.file_name()),
+                )
+                .unwrap();
+            }
+            Ok(())
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn external_copy_offline_refresh_config_ownership_and_target_selection() {
+    let mut source = Fixture::new(
+        "FROM scratch\nCOPY --chown=123:456 payload /payload\nENV SOURCE=secret\nUSER 234:567\nWORKDIR /elsewhere\nLABEL source=hidden\nCMD [\"source-command\"]\n",
+    );
+    let (r, original, _) = source.build(&[]);
+    success(&r);
+    let mut f = Fixture::new(
+        "FROM scratch AS unused\nCOPY --from=unreachable.invalid/absent /x /x\nFROM scratch AS final\nUSER 42:43\nCOPY --from=fixture.invalid/source:v1 /payload /result\nCOPY --from=fixture.invalid/source:v1 --chmod=0600 --chown=12:34 /payload /override\n",
+    );
+    cache_external(&f, &original, "fixture.invalid/source:v1", false);
+    let (r, out, root) = f.build(&[]);
+    success(&r);
+    assert_eq!(fs::read(root.join("result")).unwrap(), b"original");
+    assert_eq!(fs::metadata(root.join("result")).unwrap().uid(), 123);
+    let meta = fs::metadata(root.join("override")).unwrap();
+    assert_eq!(
+        (meta.uid(), meta.gid(), meta.mode() & 0o777),
+        (12, 34, 0o600)
+    );
+    let cfg = config(&out);
+    assert_eq!(cfg["config"]["User"], "42:43");
+    assert_eq!(cfg["config"]["Env"], serde_json::json!([]));
+    assert_ne!(cfg["config"]["WorkingDir"], "/elsewhere");
+    assert!(cfg["config"]["Labels"]["source"].is_null());
+    assert_ne!(cfg["config"]["Cmd"], serde_json::json!(["source-command"]));
+    let (r, _, _) = f.build(&[]);
+    success(&r);
+    assert_eq!(cached(&r), 1);
+
+    for flag in ["--max-rootfs-bytes", "--max-layer-bytes"] {
+        let (r, out, _) = f.build(&[flag, "1"]);
+        assert!(!r.status.success());
+        assert!(!out.exists());
+    }
+
+    fs::write(source.context.join("payload"), "refreshed").unwrap();
+    let (r, updated, _) = source.build(&[]);
+    success(&r);
+    cache_external(&f, &updated, "fixture.invalid/source:v1", true);
+    let (r, _, root) = f.build(&[]);
+    success(&r);
+    assert_eq!(cached(&r), 0);
+    assert_eq!(fs::read(root.join("result")).unwrap(), b"refreshed");
+    let (r, _, root) = f.build(&["--no-cache"]);
+    success(&r);
+    assert_eq!(fs::read(root.join("result")).unwrap(), b"refreshed");
+
+    fs::write(f.context.join("Dockerfile"), "FROM scratch AS chosen\nCOPY payload /ok\nFROM scratch\nCOPY --from=unreachable.invalid/missing /x /x\n").unwrap();
+    let (r, _, root) = f.build(&["--target", "chosen"]);
+    success(&r);
+    assert!(root.join("ok").exists());
+}
+
+#[test]
+fn external_copy_local_binding_precedence_and_safe_sources() {
+    let mut source = Fixture::new("FROM scratch\nCOPY payload /payload\n");
+    let (r, image, _) = source.build(&[]);
+    success(&r);
+    let binding = format!("source={}", image.display());
+    let mut f = Fixture::new(
+        "FROM scratch AS source\nCOPY payload /stage\nFROM scratch\nCOPY --from=source /stage /result\n",
+    );
+    let (r, _, _) = f.build(&["--base", &binding]);
+    success(&r);
+    fs::write(
+        f.context.join("Dockerfile"),
+        "FROM scratch\nCOPY --from=source /payload /result\n",
+    )
+    .unwrap();
+    let (r, _, root) = f.build(&["--base", &binding]);
+    success(&r);
+    assert_eq!(fs::read(root.join("result")).unwrap(), b"original");
+    let relocated_blobs = source.home.join("relocated-blobs");
+    let blobs = image.join("blobs/sha256");
+    fs::rename(&blobs, &relocated_blobs).unwrap();
+    symlink(&relocated_blobs, &blobs).unwrap();
+    let (r, out, _) = f.build(&["--base", &binding]);
+    assert!(!r.status.success());
+    assert!(!out.exists());
+    fs::remove_file(&blobs).unwrap();
+    fs::rename(&relocated_blobs, &blobs).unwrap();
+    for from in ["$IMAGE", "99", "https://invalid/image"] {
+        fs::write(
+            f.context.join("Dockerfile"),
+            format!("FROM scratch\nCOPY --from={from} /payload /result\n"),
+        )
+        .unwrap();
+        let (r, out, _) = f.build(&[]);
+        assert!(!r.status.success());
+        assert!(!out.exists());
+    }
+    fs::write(
+        f.context.join("Dockerfile"),
+        "FROM scratch\nCOPY --from=source /../payload /result\n",
+    )
+    .unwrap();
+    let (r, out, _) = f.build(&["--base", &binding]);
+    assert!(!r.status.success());
+    assert!(!out.exists());
+
+    let outside = source.home.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("canary"), "private").unwrap();
+    fs::create_dir(source.context.join("tree")).unwrap();
+    symlink(&outside, source.context.join("tree/escape")).unwrap();
+    fs::write(
+        source.context.join("Dockerfile"),
+        "FROM scratch\nCOPY tree /tree\n",
+    )
+    .unwrap();
+    let (r, image, _) = source.build(&[]);
+    success(&r);
+    fs::write(
+        f.context.join("Dockerfile"),
+        "FROM scratch\nCOPY --from=source /tree/escape/canary /result\n",
+    )
+    .unwrap();
+    let binding = format!("source={}", image.display());
+    let (r, out, _) = f.build(&["--base", &binding]);
+    assert!(!r.status.success());
+    assert!(!out.exists());
+    assert_eq!(fs::read(outside.join("canary")).unwrap(), b"private");
+}
+
+#[test]
+fn external_copy_rejects_corrupt_warm_source() {
+    let mut source = Fixture::new("FROM scratch\nCOPY payload /payload\n");
+    let (r, image, _) = source.build(&[]);
+    success(&r);
+    let mut f = Fixture::new("FROM scratch\nCOPY --from=fixture.invalid/source /payload /result\n");
+    let cache = cache_external(&f, &image, "fixture.invalid/source", false);
+    let (r, _, _) = f.build(&[]);
+    success(&r);
+    for entry in fs::read_dir(cache.join("blobs/sha256")).unwrap() {
+        fs::write(entry.unwrap().path(), b"corrupt").unwrap();
+    }
+    let (r, out, _) = f.build(&[]);
+    assert!(!r.status.success());
+    assert!(!out.exists());
+}
 #[test]
 fn stage_copy_inheritance_target_and_unreachable_stage() {
     let mut f = Fixture::new(

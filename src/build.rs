@@ -1,5 +1,5 @@
 //! Minimal, trusted/stable Linux amd64 builds from local OCI bindings or scratch.
-//! Supports dependency-selected stages: FROM, RUN, local/stage COPY, ARG, ENV, WORKDIR,
+//! Supports dependency-selected stages: FROM, RUN, local/stage/image COPY, ARG, ENV, WORKDIR,
 //! SHELL, USER, LABEL, shell/JSON CMD/ENTRYPOINT, EXPOSE.
 //! COPY supports bounded patterns and --chown/--chmod. OnBuild and complex
 //! expansion fail closed. RUN exec and custom shell argv
@@ -17,7 +17,7 @@
 use std::process::Command;
 
 use crate::{
-    build_plan::{self, Base, InstructionKind as I, Protocol, Run},
+    build_plan::{self, Base, CopySource, InstructionKind as I, Protocol, Run},
     context, export, image, layer,
     oci::{BlobStore, Descriptor},
     rootfs,
@@ -54,7 +54,7 @@ fn copy_limits(limits: Limits, used: &context::Summary) -> context::Limits {
     }
 }
 
-/// Exact expanded FROM name -> local OCI layout and optional ref annotation.
+/// Exact expanded FROM or literal COPY image name -> local OCI layout/ref annotation.
 #[derive(Clone, Debug)]
 pub struct LocalBase {
     pub layout: PathBuf,
@@ -115,7 +115,7 @@ enum Step {
         user: Option<String>,
     },
     Copy {
-        from: Option<usize>,
+        from: Option<CopySource>,
         sources: Vec<String>,
         destination: String,
         chown: Option<String>,
@@ -555,11 +555,17 @@ fn preflight_checkpoints(
                 copy_path(&destination, true)?;
                 charge = charge
                     .checked_add(destination.len())
+                    .and_then(|n| {
+                        n.checked_add(match from {
+                            Some(CopySource::Image(name)) => name.len(),
+                            _ => 0,
+                        })
+                    })
                     .and_then(|n| n.checked_add(chown.as_ref().map_or(0, String::len)))
                     .and_then(|n| values.iter().try_fold(n, |n, s| n.checked_add(s.len())))
                     .ok_or("plan budget overflow")?;
                 steps.push(Step::Copy {
-                    from: *from,
+                    from: from.clone(),
                     sources: values,
                     destination,
                     chown,
@@ -842,6 +848,20 @@ struct StageResult {
     args: BTreeMap<String, String>,
 }
 
+fn copy_input(
+    source: &CopySource,
+    previous: &BTreeMap<usize, StageResult>,
+    external: &BTreeMap<String, (PathBuf, String)>,
+) -> (PathBuf, String) {
+    match source {
+        CopySource::Stage(n) => (
+            previous[n].result.work.join("rootfs"),
+            previous[n].result.manifest.digest.to_string(),
+        ),
+        CopySource::Image(name) => external[name].clone(),
+    }
+}
+
 fn verify_checkpoint(
     layout: &Path,
     config: &Value,
@@ -951,7 +971,8 @@ pub fn selected_stages(plan: &build_plan::BuildPlan, target: Option<&str>) -> Re
         }
         for i in &plan.stages[n].instructions {
             if let I::Copy {
-                from: Some(from), ..
+                from: Some(CopySource::Stage(from)),
+                ..
             } = i.kind
             {
                 pending.push(from);
@@ -959,6 +980,31 @@ pub fn selected_stages(plan: &build_plan::BuildPlan, target: Option<&str>) -> Re
         }
     }
     Ok(selected.into_iter().collect())
+}
+
+/// External FROM/COPY images needed by the selected stages, before local bindings.
+pub fn selected_images(
+    plan: &build_plan::BuildPlan,
+    selected: &[usize],
+) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for &n in selected {
+        if let Base::Image(name) = &plan.stages[n].base
+            && name != "scratch"
+        {
+            names.insert(name.clone());
+        }
+        for instruction in &plan.stages[n].instructions {
+            if let I::Copy {
+                from: Some(CopySource::Image(name)),
+                ..
+            } = &instruction.kind
+            {
+                names.insert(name.clone());
+            }
+        }
+    }
+    names
 }
 
 /// Compatibility entry point for truly unmanaged paths only.
@@ -1076,7 +1122,22 @@ fn build_inner(
         }
         evaluated.insert(n, (config, args));
     }
-    let intermediate = if selected.len() > 1 {
+    let copy_names: std::collections::BTreeSet<_> = selected
+        .iter()
+        .flat_map(|&n| {
+            plan.stages[n]
+                .instructions
+                .iter()
+                .filter_map(|i| match &i.kind {
+                    I::Copy {
+                        from: Some(CopySource::Image(name)),
+                        ..
+                    } => Some(name.clone()),
+                    _ => None,
+                })
+        })
+        .collect();
+    let intermediate = if selected.len() > 1 || !copy_names.is_empty() {
         #[cfg(target_os = "linux")]
         if let Some(r) = record.as_deref_mut() {
             let path = r.path.join("stages");
@@ -1098,6 +1159,59 @@ fn build_inner(
     } else {
         None
     };
+    let mut external = BTreeMap::new();
+    for (index, name) in copy_names.iter().enumerate() {
+        check(&cancelled)?;
+        let binding = options
+            .bases
+            .get(name)
+            .ok_or_else(|| format!("no local base binding for COPY image {name}"))?;
+        let layout = fs::canonicalize(&binding.layout)?;
+        for suffix in ["", "blobs", "blobs/sha256"] {
+            let m = fs::symlink_metadata(binding.layout.join(suffix))?;
+            if !m.is_dir() || m.file_type().is_symlink() {
+                return Err("COPY image blob directories must be real directories".into());
+            }
+        }
+        let metadata = image::load_layout(
+            &layout,
+            binding.reference.as_deref(),
+            options.limits.image,
+            &cancelled,
+        )?;
+        let directory = intermediate
+            .as_ref()
+            .unwrap()
+            // Reserve IDs after Dockerfile stages in the existing owned-work schema.
+            .join(format!("stage-{}-work", plan.stages.len() + index));
+        fs::create_dir(&directory)?;
+        #[cfg(target_os = "linux")]
+        if let Some(r) = record.as_deref_mut() {
+            r.created(&directory, lease.unwrap())?;
+        }
+        let root = directory.join("rootfs");
+        let spool = directory.join("spool");
+        create_image_root(&root)?;
+        fs::create_dir(&spool)?;
+        let store = BlobStore::open(&layout)?;
+        let (mut bytes, mut entries) = (0u64, 0usize);
+        for (descriptor, diff) in metadata.layers.iter().zip(&metadata.diff_ids) {
+            check(&cancelled)?;
+            let mut budget = options.limits.layer;
+            budget.max_uncompressed_bytes = budget
+                .max_uncompressed_bytes
+                .min(options.limits.max_replay_bytes.saturating_sub(bytes));
+            budget.max_entries = budget
+                .max_entries
+                .min(options.limits.max_replay_entries.saturating_sub(entries));
+            let mut verified = layer::verify(&store, descriptor, diff, &spool, budget, &cancelled)?;
+            bytes += verified.size();
+            entries += verified.entries().len();
+            rootfs::apply_layer(&root, &mut verified, &cancelled)?;
+            root_budget(&root, options.limits, &cancelled)?;
+        }
+        external.insert(name.clone(), (root, metadata.selected.digest.to_string()));
+    }
     let mut previous = BTreeMap::new();
     let mut notice = false;
     for n in selected {
@@ -1117,6 +1231,7 @@ fn build_inner(
             n,
             &stage_options,
             &previous,
+            &external,
             &mut notice,
             &policy,
             record.as_deref_mut(),
@@ -1136,6 +1251,7 @@ fn build_stage(
     index: usize,
     options: &BuildOptions,
     previous: &BTreeMap<usize, StageResult>,
+    external: &BTreeMap<String, (PathBuf, String)>,
     notice: &mut bool,
     policy: &crate::dockerignore::Policy,
     mut record: Option<&mut crate::build_record::BuildRecord>,
@@ -1237,10 +1353,8 @@ fn build_stage(
         let dependencies: Vec<_> = plan.stages[index]
             .instructions
             .iter()
-            .filter_map(|i| match i.kind {
-                I::Copy { from: Some(n), .. } => {
-                    Some(previous[&n].result.manifest.digest.to_string())
-                }
+            .filter_map(|i| match &i.kind {
+                I::Copy { from: Some(n), .. } => Some(copy_input(n, previous, external).1),
                 _ => None,
             })
             .collect();
@@ -1286,7 +1400,7 @@ fn build_stage(
         let mut copied = context::Summary::default();
         for step in &steps {
             if let Step::Copy { from, sources, .. } = step {
-                let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
+                let stage_root = from.as_ref().map(|n| copy_input(n, previous, external).0);
                 let summary = context::validate_copy_budget(
                     stage_root.as_deref().unwrap_or(&options.context),
                     &sources.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -1396,8 +1510,8 @@ fn build_stage(
                     chmod,
                 } = step
                 {
-                    let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
-                    dependency = from.map(|n| previous[&n].result.manifest.digest.to_string());
+                    let stage_root = from.as_ref().map(|n| copy_input(n, previous, external).0);
+                    dependency = from.as_ref().map(|n| copy_input(n, previous, external).1);
                     #[cfg(target_os = "linux")]
                     {
                         match context::fingerprint_copy(
@@ -1500,7 +1614,7 @@ fn build_stage(
                             "COPY named ownership requires a materialized image filesystem".into(),
                         );
                     }
-                    let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
+                    let stage_root = from.as_ref().map(|n| copy_input(n, previous, external).0);
                     let summary = context::copy_filtered_with_options(
                         stage_root.as_deref().unwrap_or(&options.context),
                         &root,

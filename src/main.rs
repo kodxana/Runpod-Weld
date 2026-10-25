@@ -45,14 +45,14 @@ Managed builds/push hold a persistent store lease; cross-store inputs are reject
 Cancellation waits for all descendants; uninterruptible tasks can delay it indefinitely.
 Managed defaults: 2 GiB rootfs/layer, 64 MiB metadata; temporary host DNS enabled
 (--no-host-dns disables it). Explicit output/work without -t keep legacy defaults.
-Bindings match ARG-expanded FROM names; --base-ref selects an OCI ref annotation.
+Bindings match ARG-expanded FROM or literal COPY image names; --base-ref selects an OCI ref annotation.
 Without --base-ref the layout must have an unambiguous image selection.
 Local COPY supports plain/JSON paths, directory merges and multiple sources
 (destination must end in /), relative to WORKDIR. Basic $NAME/${NAME} expansion
 and Docker word quotes are supported; JSON embedded quotes/backslashes rejected.
 Sources support bounded wildcards (*, ?, character classes); no parent paths or explicit symlinks.
 COPY --chmod accepts octal modes; --chown resolves image users/groups. Both support ARG expansion.
-.dockerignore filters local COPY sources. COPY --from accepts literal prior stages.
+.dockerignore filters local COPY sources. COPY --from accepts literal prior stages or images.
 Global ARG expands FROM; stage ARG redeclares globals. SHELL JSON overrides subsequent
 shell RUN/CMD/ENTRYPOINT. LABEL and shell/JSON CMD/ENTRYPOINT inherit from bases.
 USER accepts user/uid with optional group/gid and basic ARG/ENV expansion.
@@ -672,21 +672,16 @@ fn prepare_build(
     early_lease: Option<rpweld::store_lease::StoreLease>,
     out: &mut impl Write,
 ) -> Result<Option<rpweld::store_lease::StoreLease>, String> {
-    use rpweld::{build_plan::Base, registry};
+    use rpweld::registry;
     let plan =
         rpweld::build::resolve_plan(source, &cli.options.args, cli.options.limits.max_plan_bytes)
             .map_err(|e| e.to_string())?;
     let selected = rpweld::build::selected_stages(&plan, cli.options.target.as_deref())
         .map_err(|e| e.to_string())?;
-    let mut pulls = std::collections::BTreeSet::new();
-    for n in selected {
-        if let Base::Image(name) = &plan.stages[n].base
-            && name != "scratch"
-            && !cli.options.bases.contains_key(name)
-        {
-            pulls.insert(name.clone());
-        }
-    }
+    let pulls: Vec<_> = rpweld::build::selected_images(&plan, &selected)
+        .into_iter()
+        .filter(|name| !cli.options.bases.contains_key(name))
+        .collect();
     let pull = !pulls.is_empty();
     if let Some(cert_dir) = &cli.registry.cert_dir {
         let context = std::fs::canonicalize(&cli.options.context).map_err(|e| e.to_string())?;

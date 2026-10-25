@@ -281,7 +281,7 @@ fn inspect(report: &mut Report, line: usize, name: &str, arguments: &str) {
     }
     if arguments.starts_with("--") {
         report.diagnostic(line, "review", "instruction_flags",
-            "This scanner does not validate instruction flags. The builder supports COPY --from/--chmod/--chown within its documented profile; other flags require separate compatibility review.", Some(name));
+            "This scanner does not validate instruction flags. The builder supports static COPY --from stages/images and --chmod/--chown within its documented profile; dynamic --from remains unsupported. Other flags require separate compatibility review.", Some(name));
     }
     let mut json_args = None;
     if ["RUN", "CMD", "ENTRYPOINT", "COPY", "ADD", "VOLUME", "SHELL"].contains(&name)

@@ -64,7 +64,7 @@ Resource inspection reads cgroup v1/v2 membership, visible ancestor limits and u
 
 ## Experimental image build
 
-Supported instructions: FROM, RUN (shell or JSON), local/stage COPY (plain or JSON), ARG, ENV, USER, WORKDIR, SHELL, LABEL, shell or JSON CMD/ENTRYPOINT and EXPOSE. Base images are pulled from registries automatically or supplied as local OCI layouts with --base; inherited User is supported, while inherited nonempty OnBuild remains unsupported. WORKDIR traversal through symlinks is currently unsupported.
+Supported instructions: FROM, RUN (shell or JSON), local/stage/image COPY (plain or JSON), ARG, ENV, USER, WORKDIR, SHELL, LABEL, shell or JSON CMD/ENTRYPOINT and EXPOSE. Base images are pulled from registries automatically or supplied as local OCI layouts with --base; inherited User is supported, while inherited nonempty OnBuild remains unsupported. WORKDIR traversal through symlinks is currently unsupported.
 
 USER accepts `user`, `uid`, `user:group`, `uid:gid`, `user:gid` and `uid:group`, with basic ARG/ENV expansion. Names use ASCII letters, digits, `_`, `.` and `-` (no leading `-`); decimal IDs are limited to 0..2147483647. Empty components, extra colons and whitespace are rejected. The evaluated string is preserved in exported `config.User`, including names. A final metadata-only USER need not exist in the image. Each RUN resolves its captured USER against the image's current account files, so an earlier RUN or COPY can create accounts. RUN applies actual kernel UID, GID and supplementary groups in a fresh worker; lookup or credential failures never fall back to root. Numeric UIDs use the passwd primary group when found, otherwise GID 0; an explicit group suppresses supplementary groups. Empty inherited User defaults to root. The worker preserves a nonempty explicit HOME, otherwise uses the resolved home or `/`, without adding it to image config.
 
@@ -198,8 +198,31 @@ Run `rpweld build -t yourname/app:latest --push .`, or select a named stage with
 `--target builder`. Only dependencies of the selected target are built. Stage
 names and zero-based indexes work for `COPY --from`; `FROM previous-stage`
 inherits image configuration and declared ARG values. COPY also supports
-`--chmod` and `--chown`; external-image COPY sources remain unsupported. Use a separate FROM stage for
-external images. Stage COPY bypasses the context ignore policy.
+`--chmod` and `--chown`. Literal external images are supported, for example
+`COPY --from=nginx:alpine /etc/nginx/nginx.conf /nginx.conf`. Prior stage names
+(case-insensitive) and numeric indexes take precedence; invalid numeric indexes,
+self/forward references and dynamic `--from=$IMAGE` are rejected. Other literal names
+resolve as images, including tag and SHA-256 digest references. Source paths
+start at image `/`, independent of its WorkingDir. Source config (USER, ENV,
+labels, commands, OnBuild) is never inherited or executed by COPY.
+
+External COPY uses the same authenticated, TLS-verified persistent base cache
+as FROM, including normalized digest pins, offline warm reuse and `--pull` tag
+refresh. `--base IMAGE=LAYOUT` supplies an explicit local binding instead. Only
+selected-target dependency images are fetched. Image layers are verified and
+replayed under retained build state and existing replay/rootfs budgets; no
+daemon, mount or extra privilege is introduced. Both stage and instruction cache
+keys bind the selected external manifest digest; instruction keys also include
+selected-source fingerprints. Stage and external-image COPY bypass context
+ignore rules and preserve source ownership unless overridden with `--chown`.
+
+These semantics follow the primary [Docker COPY reference](https://docs.docker.com/reference/dockerfile/#copy---from)
+and [BuildKit reference](https://github.com/moby/buildkit/blob/master/frontend/dockerfile/docs/reference.md#copy---from).
+Weld retains its documented prior-stage-only and static-reference subset.
+The offline Rust regressions cover explicit bindings and seeded base-cache reuse.
+`python3 tests/external_copy_https.py /absolute/path/to/rpweld` additionally tests
+the real Skopeo pull path against a temporary read-only loopback HTTPS fixture
+(Linux root, Skopeo and OpenSSL required; no public registry or credentials).
 
 Local COPY uses the context-root `.dockerignore`, unless a file named exactly
 `<selected Dockerfile>.dockerignore` exists beside the selected Dockerfile. That

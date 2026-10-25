@@ -186,7 +186,7 @@ fn unsupported_copy_does_not_create_build_directories() {
     let context = temp.path().join("context");
     fs::create_dir(&context).unwrap();
     let dockerfile = context.join("Dockerfile");
-    fs::write(&dockerfile, "FROM scratch\nCOPY --from=other a /a\n").unwrap();
+    fs::write(&dockerfile, "FROM scratch\nCOPY --from=$IMAGE a /a\n").unwrap();
     let output = temp.path().join("output");
     let work = temp.path().join("work");
     let result = cli()
