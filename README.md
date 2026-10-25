@@ -268,9 +268,9 @@ Each accepts `--json`. These Linux-only commands provide bounded, read-only
 observations: missing stores remain absent, and external image paths are not
 traversed. `Complete` means structurally complete, not digest-verified. Reported
 usage is not reclaimable space; legacy builds remain protected and ownership is
-not inferred from a tag. Cleanup mutation is not implemented.
+not inferred from a tag. Explicit cleanup is available on Linux.
 
-Dry-run cleanup plans are available on Linux:
+Cleanup commands (omit `--dry-run` to apply):
 
 ```sh
 rpweld cache prune --dry-run --json
@@ -279,8 +279,10 @@ rpweld builds rm BUILD_ID --dry-run --json
 rpweld image rm TAG --dry-run --json
 ```
 
-`--json` is optional. Omitting `--dry-run` returns an explicit not-implemented
-error. No command deletes, renames, or unlinks stored artifacts. A plan acquires
+`--json` is optional. Without `--dry-run`, cleanup applies a newly computed plan.
+`image rm` removes only the tag record; builds cleanup removes only validated
+listed components, retaining the run, ownership record, stages container and unknown
+siblings. Cache cleanup currently reports a protected no-op. A plan acquires
 the existing exclusive store lease without waiting; a busy store selects nothing
 and returns an error. There is no force option. Missing stores remain absent;
 legacy stores without a lock get a protected best-effort inventory, without
@@ -313,8 +315,31 @@ summed into reclaimable space. `shared_inode_count` counts selected regular-file
 inodes with more than one hardlink, once each.
 
 A dry run is a point-in-time report, not authorization for deletion. Saved JSON
-cannot be applied. Any future deletion implementation must acquire a new exclusive
-lease, rescan, and revalidate ownership and references.
+cannot be applied. Apply takes a typed selection, acquires the existing exclusive
+lease nonblocking, and keeps that same lease through recovery, fresh full scans,
+reference/identity checks, mutation and directory sync. Missing leases, malformed
+metadata and incomplete scans fail closed; there is no force override.
+
+Each selected component or tag record moves with `renameat2(RENAME_NOREPLACE)`
+into a private same-filesystem `.cleanup-txn-*` directory under the pinned root.
+A durable typed journal records the original relative components and store, run,
+parent, transaction and object identities. Descriptor-confined unlink checks
+statx mount IDs and never follows symlinks or chmods/truncates shared files.
+A nested `store.lock` is a protected store boundary and blocks component cleanup.
+Hardlinked external file contents and permissions remain unchanged (unlink changes
+link counts and ctime). The root and persistent `store.lock` are never moved or removed.
+
+Only explicit cleanup recovers transactions. All recognized journals must validate
+before recovery changes anything. Remaining payloads are restored without replacement
+and freshly scanned; a partially unlinked payload may have lost descendants. A fully
+unlinked component gets its durable version-2 removal tombstone. Unknown trash and
+unknown transaction children remain protected; malformed journals block cleanup.
+An interrupted journal publication may leave unknown trash requiring manual review.
+Dry runs never recover or mutate. Recovery may finish an earlier explicit selection
+before applying the current selection. Errors/cancellation report failure and completed
+removals, retaining recoverable trash; no freed-byte guarantee is made. Successful
+cleanup retains identity evidence for remaining components and rejects build-record
+updates that would resume a cleaned run.
 
 JSON schema v1 preserves UTF-8 paths as strings. Non-UTF-8 Unix paths use
 `{"unix_bytes":[...]}`; Windows equivalents use `{"windows_wide":[...]}`.
@@ -327,17 +352,18 @@ for safe teardown before restoring DNS or removing temporary transfer files;
 uninterruptible descendants can delay shutdown indefinitely. Do not kill the
 supervisors or replace `store.lock`. This is a cooperative local-store protocol,
 not isolation from hostile processes. Older binaries do not participate, so all
-old workers and transfers must exit before any future cleanup feature is used.
+old workers and transfers must exit before cleanup is used. This quiescence is a
+trusted operator contract; the lease cannot detect older nonparticipating binaries.
 
-### Build ownership records (no deletion)
+### Build ownership records
 
 New program-allocated `build-*` runs contain a private, bounded
-`build-record.json` (version 1), published before base pulls. Updates sync the
+`build-record.json` (version 1, upgraded to version 2 on component removal), published before base pulls. Updates sync the
 file and containing directory before returning and hold the shared store lease.
 Allocation interrupted before publication leaves an unknown, protected run.
 
 `rpweld builds inspect BUILD_ID --json` includes `build_record` only after schema,
-store/run identity, and every recorded owned-directory identity validate. Human
+store/run identity, every live owned-directory identity, and removal tombstones validate. Human
 output shows the same fields. The record reports `phase` (`preparing`, `building`,
 `image_ready`, `complete`, or `failed`), a manifest descriptor when available,
 requested output `references`, and separate `push` status. Requested references
@@ -353,10 +379,12 @@ non-UTF-8 native paths losslessly. These paths are never followed to establish
 ownership. Managed multi-stage intermediates live in the allocated run's `stages`
 directory, independent of explicit work/output locations.
 
-All inventory entries remain protected, including valid records, legacy runs,
-missing/malformed/mismatched records, and `store.lock`. There is no deletion,
-pruning, or deletion eligibility API. Failed and interrupted builds remain on disk;
-record publication failures fail closed and may leave unrecorded retained data.
+Inventory alone grants no deletion authority. Legacy runs, invalid records and
+`store.lock` remain protected. Explicit cleanup considers only freshly validated
+components under its exclusive lease. Version-2 `removed` component arrays retain
+the original ownership identities as tombstones; replacements at removed paths
+are unknown and block cleanup. Record publication failures fail closed and may
+leave unrecorded retained data.
 Inventory is a bounded best-effort observation, not a snapshot or proof that an
 image is valid. Same-user code that replaces store paths violates the cooperative
 lease protocol; identities are checked again when inventory reads the record.

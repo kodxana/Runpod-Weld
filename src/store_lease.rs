@@ -304,20 +304,34 @@ mod tests {
         StoreLease::try_exclusive_existing(path).unwrap()
     }
 
+    // Also isolate immediate-release assertions: unrelated test forks inherit locks until exec.
+    fn isolated(scenario: &str) -> bool {
+        if std::env::var("STORE_LEASE_TEST_SCENARIO").as_deref() == Ok(scenario) {
+            return false;
+        }
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "store_lease::tests::isolated_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("STORE_LEASE_TEST_SCENARIO", scenario);
+        if unsafe { libc::geteuid() } == 0 {
+            command.gid(65534).uid(65534);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{scenario}: {output:?}");
+        true
+    }
+
     // Process isolation is required for both umask and closing standard fds.
     #[test]
     fn isolated_creation_and_descriptor_regressions() {
-        use std::os::unix::process::CommandExt;
         for scenario in ["0400", "0777", "closed-stdio"] {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .args(["tests::isolated_child", "--nocapture"])
-                .env("STORE_LEASE_TEST_SCENARIO", scenario);
-            if unsafe { libc::geteuid() } == 0 {
-                command.gid(65534).uid(65534);
-            }
-            let output = command.output().unwrap();
-            assert!(output.status.success(), "{scenario}: {output:?}");
+            assert!(isolated(scenario));
         }
     }
 
@@ -327,6 +341,14 @@ mod tests {
             return;
         };
         assert_ne!(unsafe { libc::geteuid() }, 0);
+        match scenario.as_str() {
+            "shared-exclusive" => return shared_exclusive_and_persistent_inode(),
+            "cancellation" => return cancellation_before_open_and_during_contention(),
+            "duplicate" => return duplicate_survives_owner_drop_and_is_cloexec(),
+            "readonly" => return exclusive_missing_is_error_and_readonly_file_is_supported(),
+            "inherited" => return inherited_descriptor_keeps_lease_busy_until_child_exit(),
+            _ => {}
+        }
         let dir = store();
         if scenario == "closed-stdio" {
             let lease = shared(dir.path());
@@ -378,6 +400,9 @@ mod tests {
 
     #[test]
     fn shared_exclusive_and_persistent_inode() {
+        if isolated("shared-exclusive") {
+            return;
+        }
         let dir = store();
         let a = shared(dir.path());
         let b = shared(dir.path());
@@ -409,6 +434,9 @@ mod tests {
 
     #[test]
     fn cancellation_before_open_and_during_contention() {
+        if isolated("cancellation") {
+            return;
+        }
         let dir = store();
         assert_eq!(
             StoreLease::shared(dir.path(), &|| true).unwrap_err().kind(),
@@ -434,6 +462,9 @@ mod tests {
 
     #[test]
     fn duplicate_survives_owner_drop_and_is_cloexec() {
+        if isolated("duplicate") {
+            return;
+        }
         let dir = store();
         let lease = shared(dir.path());
         let fd = lease.duplicate_for_supervisor().unwrap();
@@ -444,6 +475,38 @@ mod tests {
         drop(lease);
         assert!(exclusive(dir.path()).is_none());
         drop(fd);
+        assert!(exclusive(dir.path()).is_some());
+    }
+
+    #[test]
+    fn inherited_descriptor_keeps_lease_busy_until_child_exit() {
+        if isolated("inherited") {
+            return;
+        }
+        use std::{io::Write, os::unix::net::UnixStream};
+        let dir = store();
+        let lease = shared(dir.path());
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        // SAFETY: the fork child only uses async-signal-safe calls, then _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                libc::close(parent.as_raw_fd());
+                let mut byte = 0u8;
+                let rc = libc::read(child.as_raw_fd(), (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(if rc == 1 { 0 } else { 1 });
+            }
+        }
+        drop(child);
+        drop(lease);
+        // No sleep/retry: the child cannot exit until the parent releases it.
+        let busy = exclusive(dir.path()).is_none();
+        parent.write_all(b"x").unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0);
+        assert!(busy, "inherited open file description must retain the lock");
         assert!(exclusive(dir.path()).is_some());
     }
 
@@ -478,6 +541,9 @@ mod tests {
 
     #[test]
     fn exclusive_missing_is_error_and_readonly_file_is_supported() {
+        if isolated("readonly") {
+            return;
+        }
         let dir = store();
         assert_eq!(
             StoreLease::try_exclusive_existing(dir.path())

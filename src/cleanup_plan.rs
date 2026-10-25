@@ -39,7 +39,10 @@ pub enum Request {
     ImageRemove(TagId),
 }
 
-fn path_json<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn path_json<S: serde::Serializer>(
+    path: &Path,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     if let Some(value) = path.to_str() {
         return serializer.serialize_str(value);
     }
@@ -111,7 +114,7 @@ pub fn inspect(
 ) -> io::Result<Plan> {
     #[cfg(target_os = "linux")]
     {
-        linux::inspect(store, request, limits, &cancelled)
+        linux::inspect(store, request, limits, &cancelled, None)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -121,6 +124,17 @@ pub fn inspect(
             "cleanup plans require Linux openat2 and store leases",
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect_locked(
+    store: &Path,
+    request: Request,
+    limits: Limits,
+    cancelled: &impl Fn() -> bool,
+    lease: &crate::store_lease::ExclusiveStoreLease,
+) -> io::Result<Plan> {
+    linux::inspect(store, request, limits, cancelled, Some(lease))
 }
 
 #[cfg(target_os = "linux")]
@@ -199,6 +213,9 @@ mod linux {
             for entry in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
                 self.check(depth + 1)?;
                 let name = entry?.file_name();
+                if name == "store.lock" {
+                    return Err(io::Error::other("nested store lease boundary"));
+                }
                 let st = stat(dir.as_raw_fd(), Path::new(&name), libc::AT_SYMLINK_NOFOLLOW)?;
                 if st.stx_mnt_id != mount {
                     return Err(io::Error::other("nested mount"));
@@ -254,6 +271,9 @@ mod linux {
             record.validate(root, &run, &entry.path, |_| budget.check(1))?;
             plan.protect(&entry.path, "run_record_and_unlisted_children_protected");
             for owned in &record.owned {
+                if record.removed.contains(&owned.components) {
+                    continue;
+                }
                 let relative: PathBuf = owned.components.iter().map(Component::as_str).collect();
                 let path = entry.path.join(&relative);
                 // The stages container also contains unrecorded siblings; only listed stages qualify.
@@ -376,6 +396,7 @@ mod linux {
         request: Request,
         limits: Limits,
         cancelled: &impl Fn() -> bool,
+        supplied: Option<&crate::store_lease::ExclusiveStoreLease>,
     ) -> io::Result<Plan> {
         let mut plan = Plan {
             schema_version: 1,
@@ -406,16 +427,20 @@ mod linux {
             Ok(_) => {}
         }
         // Never create a lock for legacy stores. Missing locks are not proof of inactivity.
-        let lease = match StoreLease::try_exclusive_existing(store) {
-            Ok(Some(lease)) => Some(lease),
-            Ok(None) => {
-                plan.status = "store_busy";
-                plan.protect(Path::new(""), "store_busy_nothing_selected");
-                return Ok(plan);
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
+        let acquired = match supplied {
+            Some(_) => None,
+            None => match StoreLease::try_exclusive_existing(store) {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
+                    plan.status = "store_busy";
+                    plan.protect(Path::new(""), "store_busy_nothing_selected");
+                    return Ok(plan);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            },
         };
+        let lease = supplied.or(acquired.as_ref());
         let root = build_record::open_dir(libc::AT_FDCWD, store)?;
         if let Some(lease) = &lease {
             let meta = root.metadata()?;

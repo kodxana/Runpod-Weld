@@ -19,10 +19,10 @@ Usage:
   rpweld cache du [--json]
   rpweld builds ls [--json]
   rpweld builds inspect BUILD_ID [--json]
-  rpweld cache prune --dry-run [--json]
-  rpweld builds prune --dry-run [--json]
-  rpweld builds rm BUILD_ID --dry-run [--json]
-  rpweld image rm TAG --dry-run [--json]
+  rpweld cache prune [--dry-run] [--json]
+  rpweld builds prune [--dry-run] [--json]
+  rpweld builds rm BUILD_ID [--dry-run] [--json]
+  rpweld image rm TAG [--dry-run] [--json]
 
   rpweld login REGISTRY [--username USER] [--password-stdin] [--authfile FILE] [--cert-dir DIR]
   rpweld logout REGISTRY [--authfile FILE]
@@ -65,10 +65,10 @@ Rootfs is checked between operations. No host RAM sizing or capacity guesses.
 Trusted images/commands and stable paths required; this is not a sandbox.
 Work/output must be new, disjoint paths outside context/base; failures retain them.
 Doctor is read-only. Observed resource limits are not per-build enforcement.
-Storage commands are read-only, Linux-only, bounded best-effort observations.
+Storage inspection is read-only, Linux-only, bounded best-effort observation.
 Missing stores are empty. Inspect uses an exact normalized tag or full build ID.
 Complete means structurally complete, not digest-verified. Unknown stays unknown.
-Usage is not reclaimable space. Cleanup plans require --dry-run; mutation is not implemented.
+Usage is not reclaimable space. Cleanup applies unless --dry-run is specified.
 ";
 
 fn execute(args: &[String], out: &mut impl Write) -> Result<(), String> {
@@ -199,9 +199,6 @@ fn storage_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(
 
 fn cleanup_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(), String> {
     use rpweld::cleanup_plan::{BuildId, Request, TagId};
-    if !args.iter().any(|s| s == "--dry-run") {
-        return Err("cleanup mutation is not implemented; --dry-run is required; nothing was selected or changed".into());
-    }
     let mut dry_run = false;
     let mut machine = false;
     let mut words = Vec::new();
@@ -221,6 +218,37 @@ fn cleanup_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(
         _ => return Err("invalid cleanup command; use 'rpweld --help'".into()),
     };
     let store = rpweld::store_inventory::resolve_store().map_err(|e| e.to_string())?;
+    if !dry_run {
+        let report = rpweld::cleanup_apply::apply(
+            &store,
+            request,
+            rpweld::store_inventory::Limits::default(),
+            || CANCELLED.load(Ordering::Relaxed),
+        )
+        .map_err(|e| format!("cannot apply cleanup: {e}"))?;
+        if machine {
+            serde_json::to_writer_pretty(&mut *out, &report).map_err(|e| e.to_string())?;
+            writeln!(out).map_err(|e| e.to_string())?;
+        } else {
+            writeln!(
+                out,
+                "Cleanup: {}. {} complete removals; {} recovered transactions.",
+                report.status,
+                report.removed.len(),
+                report.recovered.len()
+            )
+            .map_err(|e| e.to_string())?;
+            for item in &report.removed {
+                let safe = serde_json::to_string(item).map_err(|e| e.to_string())?;
+                writeln!(out, "removed: {}", safe.escape_default()).map_err(|e| e.to_string())?;
+            }
+            writeln!(out, "Protected entries and unknown siblings retained. Plan quantities are estimates, not guaranteed freed bytes.").map_err(|e| e.to_string())?;
+        }
+        return match report.failure {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        };
+    }
     let plan = rpweld::cleanup_plan::inspect(
         &store,
         request,

@@ -245,8 +245,9 @@ fn cli_json_missing_store_and_busy_store_are_usable() {
 }
 
 #[test]
-fn cli_requires_dry_run_rejects_paths_force_and_duplicate_flags() {
+fn cli_unleased_apply_rejects_paths_force_and_duplicate_flags() {
     let _serial = TEST_LOCK.lock().unwrap();
+    let missing = tempfile::tempdir().unwrap();
     for args in [
         vec!["cache", "prune"],
         vec!["builds", "prune"],
@@ -255,10 +256,11 @@ fn cli_requires_dry_run_rejects_paths_force_and_duplicate_flags() {
     ] {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_rpweld"))
             .args(args)
+            .env("RPWELD_HOME", missing.path().join("absent"))
             .output()
             .unwrap();
         assert!(!out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("mutation is not implemented"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("missing existing store lease"));
     }
     for value in ["../build-a", "build-a/x", "build-a\\x", "build-", "x"] {
         assert!(BuildId::parse(value).is_err());
