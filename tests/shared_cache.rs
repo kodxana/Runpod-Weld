@@ -318,7 +318,7 @@ fn concurrent_initialization_and_publication_validate_one_winner() {
 }
 
 #[test]
-fn existing_winner_must_match_source_and_receipt_and_never_gets_replaced() {
+fn existing_winner_is_self_consistent_not_required_to_match_losing_execution() {
     let t = tempfile::tempdir().unwrap();
     let a = t.path().join("a");
     fixture(&a, 1);
@@ -328,7 +328,15 @@ fn existing_winner_must_match_source_and_receipt_and_never_gets_replaced() {
     let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
     let entry = publish(&cache, &a, 1);
     let original = inode(&entry);
-    assert!(
+    let winner_manifest = image::load_layout(&entry, None, limits(), || false)
+        .unwrap()
+        .selected;
+    let loser_manifest = image::load_layout(&b, None, limits(), || false)
+        .unwrap()
+        .selected;
+    assert_ne!(winner_manifest, loser_manifest);
+    let winner_receipt = fs::read(entry.join("weld-copy-targets.json")).unwrap();
+    assert_eq!(
         cache
             .publish(
                 &b,
@@ -338,9 +346,10 @@ fn existing_winner_must_match_source_and_receipt_and_never_gets_replaced() {
                 1024,
                 &|| false
             )
-            .is_err()
+            .unwrap(),
+        entry
     );
-    assert!(
+    assert_eq!(
         cache
             .publish(
                 &a,
@@ -350,16 +359,111 @@ fn existing_winner_must_match_source_and_receipt_and_never_gets_replaced() {
                 1024,
                 &|| false
             )
-            .is_err()
+            .unwrap(),
+        entry
     );
     assert_eq!(inode(&entry), original);
+    assert_eq!(
+        image::load_layout(&entry, None, limits(), || false)
+            .unwrap()
+            .selected,
+        winner_manifest
+    );
+    assert_eq!(
+        image::load_layout(&b, None, limits(), || false)
+            .unwrap()
+            .selected,
+        loser_manifest
+    );
+    assert_eq!(
+        fs::read(entry.join("weld-copy-targets.json")).unwrap(),
+        winner_receipt
+    );
+    // Different receipt contents may reflect nondeterministic path resolution;
+    // a different number of COPY instructions is still an invalid same-key hit.
+    assert!(
+        cache
+            .publish(&b, &key(1), limits(), &[], 1024, &|| false)
+            .is_err()
+    );
+    assert!(
+        cache
+            .publish(&b, &key(1), limits(), &[vec![]], 0, &|| false)
+            .is_err()
+    );
     assert!(lookup(&cache, 1));
+    // Receipt self-integrity is still mandatory, even when a loser's receipt
+    // happens to match the corrupted (but structurally valid) bytes.
+    fs::write(entry.join("weld-copy-targets.json"), b"[[]]").unwrap();
+    assert!(
+        cache
+            .publish(&b, &key(1), limits(), &[vec![]], 1024, &|| false)
+            .is_err()
+    );
     fs::create_dir(t.path().join("cache-v2/entries").join(key(2))).unwrap();
     assert!(
         cache
             .publish(&a, &key(2), limits(), &[], 0, &|| false)
             .is_err()
     );
+}
+
+#[test]
+fn concurrent_distinct_executions_keep_one_complete_winner_and_all_sources() {
+    let t = tempfile::tempdir().unwrap();
+    let mut sources = Vec::new();
+    for n in 0..4 {
+        let path = t.path().join(format!("source-{n}"));
+        fixture(&path, n);
+        let manifest = image::load_layout(&path, None, limits(), || false)
+            .unwrap()
+            .selected;
+        sources.push((
+            path,
+            manifest,
+            vec![vec![format!("resolved-{n}").into_bytes()]],
+        ));
+    }
+    drop(StoreLease::shared(t.path(), &|| false).unwrap());
+    let barrier = Barrier::new(4);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = sources
+            .iter()
+            .map(|(source, _, receipt)| {
+                let barrier = &barrier;
+                let root = t.path();
+                scope.spawn(move || {
+                    let lease = StoreLease::shared(root, &|| false).unwrap();
+                    let cache = ManagedCache::open(root, &lease, &|| false).unwrap();
+                    barrier.wait();
+                    cache.publish(source, &key(1), limits(), receipt, 1024, &|| false)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    let path = results[0].as_ref().unwrap();
+    assert!(results.iter().all(|r| r.as_ref().unwrap() == path));
+    let winner = image::load_layout(path, None, limits(), || false).unwrap();
+    let receipt: Vec<Vec<Vec<u8>>> =
+        serde_json::from_slice(&fs::read(path.join("weld-copy-targets.json")).unwrap()).unwrap();
+    assert!(
+        sources
+            .iter()
+            .any(|(_, manifest, targets)| *manifest == winner.selected && *targets == receipt)
+    );
+    for (source, manifest, _) in sources {
+        assert_eq!(
+            image::load_layout(source, None, limits(), || false)
+                .unwrap()
+                .selected,
+            manifest
+        );
+    }
 }
 
 #[test]

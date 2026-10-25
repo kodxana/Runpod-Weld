@@ -219,8 +219,7 @@ impl<'a> ManagedCache<'a> {
             self.verify_winner(
                 &destination,
                 key,
-                &metadata.selected,
-                targets,
+                targets.len(),
                 limits,
                 receipt_metadata_limit,
                 cancelled,
@@ -291,8 +290,7 @@ impl<'a> ManagedCache<'a> {
                 self.verify_winner(
                     &destination,
                     key,
-                    &metadata.selected,
-                    targets,
+                    targets.len(),
                     limits,
                     receipt_metadata_limit,
                     cancelled,
@@ -612,28 +610,26 @@ impl<'a> ManagedCache<'a> {
         Ok((metadata, targets))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn verify_winner(
         &self,
         path: &Path,
         key: &str,
-        selected: &Descriptor,
-        targets: &[Vec<Vec<u8>>],
+        instructions: usize,
         limits: image::Limits,
         receipt_metadata_limit: u64,
         cancelled: &impl Fn() -> bool,
     ) -> Result<()> {
-        let (metadata, actual) = self.verify_entry(
+        // A key identifies inputs, not deterministic output bytes or resolved
+        // COPY paths. Keep the winner's manifest and receipt together; publishing
+        // a loser must neither replace them nor change that build's own output.
+        self.verify_entry(
             path,
             key,
             limits,
             receipt_metadata_limit,
-            targets.len(),
+            instructions,
             cancelled,
         )?;
-        if metadata.selected != *selected || actual != targets {
-            return Err("cache publication winner differs from source".into());
-        }
         self.audit_links(cancelled)?;
         self.sync_objects()?;
         sync_dirs(
