@@ -50,10 +50,12 @@ pub fn validate_path(path: &Path, lease: Option<&StoreLease>) -> io::Result<()> 
             continue;
         }
         let area = ancestor.file_name().and_then(|n| n.to_str());
-        let legacy_root = area.is_some_and(|n| n == "cache-v1" || n == "base-cache-v1");
+        let legacy_root =
+            area.is_some_and(|n| matches!(n, "cache-v1" | "cache-v2" | "base-cache-v1"));
         let root = if ancestor == configured
             || marker_exists(&ancestor.join("store.lock"))?
             || ancestor.join("cache-v1").is_dir()
+            || marker_exists(&ancestor.join("cache-v2"))?
             || ancestor.join("base-cache-v1").is_dir()
         {
             Some(ancestor)

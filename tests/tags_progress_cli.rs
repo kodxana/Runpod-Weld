@@ -88,7 +88,7 @@ fn multiple_tags_progress_cache_and_failure_preservation() {
     let b: serde_json::Value = serde_json::from_slice(&tags[1]).unwrap();
     assert_eq!(a["image"], b["image"]);
     let cache_entries = || {
-        let mut entries: Vec<_> = fs::read_dir(home.path().join("store/cache-v1"))
+        let mut entries: Vec<_> = fs::read_dir(home.path().join("store/cache-v2/entries"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();

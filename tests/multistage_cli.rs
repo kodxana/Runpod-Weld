@@ -325,7 +325,7 @@ fn cache_corruption_fails_closed_and_stage_copy_cannot_escape() {
     let mut f = Fixture::new("FROM scratch\nCOPY payload /payload\n");
     let (r, _, _) = f.build(&[]);
     success(&r);
-    let mut caches: Vec<_> = fs::read_dir(f.home.join("store/cache-v1"))
+    let mut caches: Vec<_> = fs::read_dir(f.home.join("store/cache-v2/entries"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|entry| entry.join("index.json").is_file())

@@ -300,7 +300,10 @@ count toward entry/metadata budgets. Reads, traversal and matching support
 cooperative cancellation. Trees must remain stable throughout a build.
 
 Managed builds automatically cache completed stages under
-`~/.local/share/rpweld/cache-v1` (or `RPWELD_HOME/cache-v1`). Hits print `CACHED`.
+`~/.local/share/rpweld/cache-v2/entries` (or `RPWELD_HOME/cache-v2/entries`).
+Verified blobs are shared within this explicitly owned cache; exported images
+receive independent copies. Legacy `cache-v1` entries are not migrated or adopted.
+Hits print `CACHED`.
 The key includes the builder executable, stage definition, arguments, limits,
 resolved base/dependency digests, and content/metadata of the context when that
 stage uses local COPY. Context hashing shares COPY's filtered traversal and
@@ -325,7 +328,17 @@ Re-executing such a COPY can change directory or symlink timestamps. Downstream
 instructions reuse cache only when the resulting verified filesystem identity
 matches; identical file contents alone do not guarantee a hit.
 
-Checkpoints are flattened OCI images. Both freshly created checkpoints and hits
+`--export-mode flattened` is the default. Opt in to `--export-mode layered` to
+preserve the immediate base image's layer descriptors and append one cumulative
+filesystem delta per stage. An inherited stage preserves its parent's complete
+layer chain. Deletions, replacements, hardlinks and preserved metadata participate
+in the delta; runtime configuration still comes from the evaluated Dockerfile.
+Layered capture verifies and temporarily replays the base under owned work and
+requires permission to use `O_NOATIME` for inventory reads. It can therefore use
+additional temporary disk space and fail where a flattened export succeeds.
+Public outputs do not share blob inodes with the base or managed cache.
+
+Checkpoints use the selected export mode. Both freshly created checkpoints and hits
 are replayed before subsequent execution so preserved metadata agrees. This adds
 disk I/O and retained roots; it does not preserve ctime, matching the existing
 export/replay limitation. Strict-atime source filesystems can cause cache misses

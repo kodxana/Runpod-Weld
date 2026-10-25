@@ -438,9 +438,9 @@ fn cli_offline_hit_ignores_invalid_credentials_even_with_no_cache() {
 }
 
 #[test]
-fn secrets_in_either_cache_area_are_rejected_without_reading() {
+fn secrets_in_all_cache_areas_are_rejected_without_reading() {
     let tmp = tempfile::tempdir().unwrap();
-    for name in ["cache-v1", "base-cache-v1"] {
+    for name in ["cache-v1", "cache-v2", "base-cache-v1"] {
         let area = tmp.path().join(name);
         fs::create_dir(&area).unwrap();
         let options = rpweld::registry::Options {

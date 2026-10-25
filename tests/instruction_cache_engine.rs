@@ -31,6 +31,8 @@ fn options(root: &Path) -> BuildOptions {
         host_dns: false,
         verbose: false,
         progress: true,
+        managed_cache: None,
+        export_mode: rpweld::build::ExportMode::Flattened,
         target: None,
         no_cache: false,
         limits: Limits {

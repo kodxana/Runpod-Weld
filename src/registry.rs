@@ -419,7 +419,11 @@ mod linux {
             .map(fs::canonicalize)
             .transpose()
             .map_err(err)?;
-        for area in [store.join("cache-v1"), store.join("base-cache-v1")] {
+        for area in [
+            store.join("cache-v1"),
+            store.join("cache-v2"),
+            store.join("base-cache-v1"),
+        ] {
             if auth.starts_with(&area) || cert.as_ref().is_some_and(|p| p.starts_with(&area)) {
                 return Err(
                     "registry credentials and certificates must be outside cache areas".into(),

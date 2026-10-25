@@ -85,6 +85,7 @@ fn inventory(
     }
     let mount = mount_id(root)?;
     let mut entries = BTreeMap::new();
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         root: &Path,
         path: &Path,
@@ -162,7 +163,8 @@ fn inventory(
         c,
     )?;
     // All aliases' metadata is captured before any readlink can touch atime.
-    let mut groups: HashMap<(u64, u64), (PathBuf, u64, u64, Option<[u8; 32]>, Option<PathBuf>)> =
+    type LinkGroup = (PathBuf, u64, u64, Option<[u8; 32]>, Option<PathBuf>);
+    let mut groups: HashMap<(u64, u64), LinkGroup> =
         HashMap::new();
     let mut bytes = 0u64;
     for (path, node) in &mut entries {
@@ -1550,7 +1552,7 @@ mod tests {
         fs::create_dir(&nested).unwrap();
         fs::hard_link(&shared, nested.join("shared")).unwrap();
         symlink(&external, nested.join("external-link")).unwrap();
-        fs::set_permissions(&nested, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o0)).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
         let result = finish_capture::<()>(temp, pin, 10, Err(Error::Cancelled));
         assert!(matches!(result, Err(Error::Cancelled)));

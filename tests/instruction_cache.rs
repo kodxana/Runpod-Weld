@@ -336,7 +336,7 @@ fn corrupt_checkpoint_fails_closed_before_tag_replacement() {
         );
         p.build(&[]).ok();
         let tag = p.tag();
-        let cache = p.temp.path().join("store/cache-v1");
+        let cache = p.temp.path().join("store/cache-v2/entries");
         let mut damaged = 0;
         for entry in fs::read_dir(cache).unwrap() {
             let entry = entry.unwrap().path();
@@ -424,7 +424,7 @@ fn concurrent_cold_publication_is_bounded_and_reusable() {
         assert_eq!(result.read("two"), b"parallel payload");
     }
     let entries = || {
-        fs::read_dir(p.temp.path().join("store/cache-v1"))
+        fs::read_dir(p.temp.path().join("store/cache-v2/entries"))
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect::<Vec<_>>()
@@ -441,7 +441,7 @@ fn concurrent_cold_publication_is_bounded_and_reusable() {
             .starts_with(".publish-")
     }));
     let before = published.len();
-    let cache = p.temp.path().join("store/cache-v1");
+    let cache = p.temp.path().join("store/cache-v2/entries");
     let warm = p.build(&[]);
     warm.ok();
     assert!(warm.log.contains("CACHED"), "{}", warm.log);

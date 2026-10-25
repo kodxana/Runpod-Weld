@@ -245,7 +245,7 @@ fn root_mode_export_cache_and_inheritance_do_not_depend_on_child_umask() {
                 );
             }
         }
-        let checkpoints: Vec<_> = fs::read_dir(f.temp.path().join("store/cache-v1"))
+        let checkpoints: Vec<_> = fs::read_dir(f.temp.path().join("store/cache-v2/entries"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.join("index.json").is_file())
@@ -526,7 +526,7 @@ fn cache_user_and_account_changes_preserve_real_identity() {
     assert!(groups.split_whitespace().any(|group| group == "12015"));
     assert!(!groups.split_whitespace().any(|group| group == "12005"));
     assert!(
-        fs::read_dir(f.temp.path().join("store/cache-v1"))
+        fs::read_dir(f.temp.path().join("store/cache-v2/entries"))
             .unwrap()
             .any(|entry| entry.unwrap().path().join("index.json").is_file())
     );

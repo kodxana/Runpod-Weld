@@ -36,6 +36,7 @@ Usage:
   rpweld build -f DOCKERFILE [--base NAME=LAYOUT] [--base-ref NAME=REFERENCE]
     --output NEWDIR --work-dir NEWDIR [--build-arg KEY=VALUE] [--host-dns] [--verbose]
     [--progress auto|plain|quiet] [--target STAGE] [--no-cache] [--pull] [--platform linux/amd64]
+    [--export-mode flattened|layered]
     [--max-rootfs-bytes N] [--max-layer-bytes N] [--metadata-budget N]
     [--run-timeout-seconds N] CONTEXT
 
@@ -325,6 +326,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
     let mut tags = Vec::new();
     let mut tag_count = 0;
     let mut progress = None;
+    let mut export_mode = None;
     let mut values = BTreeMap::new();
     let mut bases = BTreeMap::new();
     let mut references = BTreeMap::new();
@@ -349,12 +351,21 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
         let (option, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
-        if !positional && ["-t", "--tag", "--progress"].contains(&option) {
+        if !positional && ["-t", "--tag", "--progress", "--export-mode"].contains(&option) {
             let value = inline
                 .or_else(|| iter.next().map(String::as_str))
                 .filter(|v| !v.is_empty() && !v.starts_with('-') && !v.contains('\0'))
                 .ok_or_else(|| format!("missing value for {option}"))?;
-            if option == "--progress" {
+            if option == "--export-mode" {
+                if export_mode.is_some() {
+                    return Err("duplicate --export-mode".into());
+                }
+                export_mode = Some(match value {
+                    "flattened" => rpweld::build::ExportMode::Flattened,
+                    "layered" => rpweld::build::ExportMode::Layered,
+                    _ => return Err("--export-mode requires flattened or layered".into()),
+                });
+            } else if option == "--progress" {
                 if progress.is_some() {
                     return Err("duplicate --progress".into());
                 }
@@ -537,8 +548,10 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             host_dns,
             verbose,
             progress: progress.unwrap_or(true),
+            export_mode: export_mode.unwrap_or_default(),
             target: values.get("--target").map(|s| s.to_string()),
             cache: None,
+            managed_cache: None,
             no_cache,
             args: build_args,
             bases: bases
@@ -757,7 +770,9 @@ fn prepare_build(
                 .into(),
         );
     }
-    cli.options.cache = Some(registry::private_dir(&store.join("cache-v1"))?);
+    if !cli.options.no_cache {
+        cli.options.managed_cache = Some(store.clone());
+    }
     let auth = registry::auth_path(&cli.registry)?;
     registry::check_cache_secret_paths(&cli.registry, &store)?;
     if auth.starts_with(&context) {
@@ -1276,6 +1291,45 @@ mod tests {
         .chain(extra.iter().copied())
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    fn export_mode_is_explicit_and_validated() {
+        use rpweld::build::ExportMode;
+        assert_eq!(
+            parse_build_args(&build_args(&[]))
+                .unwrap()
+                .options
+                .export_mode,
+            ExportMode::Flattened
+        );
+        for (value, expected) in [
+            ("flattened", ExportMode::Flattened),
+            ("layered", ExportMode::Layered),
+        ] {
+            assert_eq!(
+                parse_build_args(&build_args(&["--export-mode", value]))
+                    .unwrap()
+                    .options
+                    .export_mode,
+                expected
+            );
+            assert_eq!(
+                parse_build_args(&build_args(&[&format!("--export-mode={value}")]))
+                    .unwrap()
+                    .options
+                    .export_mode,
+                expected
+            );
+        }
+        for extra in [
+            vec!["--export-mode"],
+            vec!["--export-mode="],
+            vec!["--export-mode=unknown"],
+            vec!["--export-mode=layered", "--export-mode=flattened"],
+        ] {
+            assert!(parse_build_args(&build_args(&extra)).is_err(), "{extra:?}");
+        }
     }
 
     #[test]

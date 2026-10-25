@@ -24,7 +24,7 @@ if __name__ == '__main__':
     base, destination = map(Path, sys.argv[1:])
     assert root_modes(base) == [], 'regression base must omit the root directory header'
     layouts = sorted(destination.glob('mask-*/output-*'))
-    checkpoints = [p for p in destination.glob('mask-*/store/cache-v1/*') if (p / 'index.json').is_file()]
+    checkpoints = [p for p in destination.glob('mask-*/store/cache-v2/entries/*') if (p / 'index.json').is_file()]
     assert checkpoints, 'managed builds must publish real OCI cache checkpoints'
     layouts += sorted(checkpoints)
     checked = 0

@@ -121,7 +121,9 @@ pub(crate) fn publish_created(
         }
         for e in fs::read_dir(source.join(&relative))? {
             let e = e?;
-            if relative.as_os_str().is_empty() && e.file_name() == COPY_TARGETS {
+            if relative.as_os_str().is_empty()
+                && (e.file_name() == COPY_TARGETS || e.file_name() == "weld-cache-entry.json")
+            {
                 continue;
             }
             let child = relative.join(e.file_name());

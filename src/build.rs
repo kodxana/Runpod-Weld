@@ -76,6 +76,13 @@ pub struct Limits {
     pub run_timeout_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExportMode {
+    #[default]
+    Flattened,
+    Layered,
+}
+
 /// Work/output must be new paths with existing, stable parents, disjoint from
 /// each other, context and base layouts. Work owns rootfs, spool and worker state.
 #[derive(Clone)]
@@ -96,12 +103,15 @@ pub struct BuildOptions {
     pub verbose: bool,
     /// Append-only engine progress; RUN streams and diagnostics remain visible when false.
     pub progress: bool,
+    pub export_mode: ExportMode,
     pub target: Option<String>,
     pub cache: Option<PathBuf>,
+    /// Explicit managed store for shared checkpoint blobs; mutually exclusive with cache.
+    pub managed_cache: Option<PathBuf>,
     pub no_cache: bool,
 }
 
-/// Successful flattened OCI publication and retained engine work directory.
+/// Successful OCI publication and retained engine work directory.
 #[derive(Debug)]
 pub struct BuildResult {
     pub manifest: Descriptor,
@@ -1097,13 +1107,108 @@ fn verify_checkpoint(
             .min(limits.max_replay_entries.saturating_sub(entries));
         let mut verified = layer::verify(&store, descriptor, diff, spool, budget, cancelled)?;
         bytes += verified.size();
-        entries += verified.entries().len();
+        entries += verified.physical_header_count();
         if let Some(root) = root {
             rootfs::apply_layer(root, &mut verified, cancelled)?;
             root_budget(root, limits, cancelled)?;
         }
     }
     Ok(metadata.selected)
+}
+
+struct StageCache<'a> {
+    root: PathBuf,
+    lease: Option<&'a crate::store_lease::StoreLease>,
+    #[cfg(target_os = "linux")]
+    managed: Option<crate::oci::ManagedCache<'a>>,
+}
+
+impl StageCache<'_> {
+    fn lookup(
+        &self,
+        entry: &Path,
+        limits: Limits,
+        instructions: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let Some(managed) = &self.managed {
+            let key = entry
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("invalid cache key")?;
+            return Ok(managed
+                .lookup(
+                    key,
+                    limits.image,
+                    limits.layer.max_metadata_bytes,
+                    instructions,
+                    cancelled,
+                )?
+                .is_some());
+        }
+        let _ = (limits, instructions, cancelled);
+        crate::build_cache::lookup(entry, self.lease)
+    }
+
+    fn publish(
+        &self,
+        source: &Path,
+        entry: &Path,
+        targets: &[Vec<Vec<u8>>],
+        limits: Limits,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(managed) = &self.managed {
+            let key = entry
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("invalid cache key")?;
+            managed.publish(
+                source,
+                key,
+                limits.image,
+                targets,
+                limits.layer.max_metadata_bytes,
+                cancelled,
+            )?;
+            return Ok(());
+        }
+        crate::build_cache::publish(
+            source,
+            self.lease,
+            entry,
+            Some((targets, limits.layer.max_metadata_bytes)),
+            cancelled,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_stage(
+    root: &Path,
+    destination: &Path,
+    config: &Value,
+    baseline: Option<&export::Baseline>,
+    limits: export::Limits,
+    cancelled: &impl Fn() -> bool,
+    created: impl FnOnce() -> std::io::Result<()>,
+) -> Result<Descriptor> {
+    Ok(match baseline {
+        Some(baseline) => export::export_delta_layout_created(
+            root,
+            destination,
+            config,
+            baseline,
+            limits,
+            cancelled,
+            created,
+        )?,
+        None => {
+            export::export_layout_created(root, destination, config, limits, cancelled, created)?
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1256,10 +1361,14 @@ fn build_inner(
         return Err("build requires Linux amd64".into());
     }
     check(&cancelled)?;
+    if options.cache.is_some() && options.managed_cache.is_some() {
+        return Err("choose either an external cache or a managed cache store".into());
+    }
     for path in [&options.work, &options.output, &options.context]
         .into_iter()
         .chain(options.bases.values().map(|b| &b.layout))
         .chain(options.cache.iter().filter(|_| !options.no_cache))
+        .chain(options.managed_cache.iter().filter(|_| !options.no_cache))
         .chain(options.dockerfile.iter())
     {
         crate::store_access::validate_path(path, lease)?;
@@ -1282,6 +1391,14 @@ fn build_inner(
     disjoint(&paths)?;
     if let Some(cache) = options.cache.as_ref().filter(|_| !options.no_cache) {
         let cache = fs::canonicalize(cache)?;
+        for path in &paths {
+            disjoint(&[cache.clone(), path.clone()])?;
+        }
+    }
+    if let Some(store) = options.managed_cache.as_ref().filter(|_| !options.no_cache) {
+        let lease = lease.ok_or("managed cache requires a borrowed store lease")?;
+        crate::store_access::validate_root(store, lease)?;
+        let cache = fs::canonicalize(store)?.join("cache-v2");
         for path in &paths {
             disjoint(&[cache.clone(), path.clone()])?;
         }
@@ -1409,7 +1526,7 @@ fn build_inner(
                 .min(options.limits.max_replay_entries.saturating_sub(entries));
             let mut verified = layer::verify(&store, descriptor, diff, &spool, budget, &cancelled)?;
             bytes += verified.size();
-            entries += verified.entries().len();
+            entries += verified.physical_header_count();
             rootfs::apply_layer(&root, &mut verified, &cancelled)?;
             root_budget(&root, options.limits, &cancelled)?;
         }
@@ -1564,7 +1681,33 @@ fn build_stage(
         Some(&mut checkpoints),
     )?;
     check_copy_sources(&steps, options, policy, &cancelled)?;
-    let cache_entry = if let Some(cache) = options.cache.as_ref().filter(|_| !options.no_cache) {
+    let stage_cache = if options.no_cache {
+        None
+    } else if let Some(store) = &options.managed_cache {
+        #[cfg(target_os = "linux")]
+        {
+            let lease = lease.ok_or("managed cache requires a borrowed store lease")?;
+            let managed = crate::oci::ManagedCache::open(store, lease, &cancelled)?;
+            Some(StageCache {
+                root: fs::canonicalize(store)?.join("cache-v2/entries"),
+                lease: Some(lease),
+                managed: Some(managed),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = store;
+            return Err("managed cache requires Linux".into());
+        }
+    } else {
+        options.cache.as_ref().map(|root| StageCache {
+            root: root.clone(),
+            lease,
+            #[cfg(target_os = "linux")]
+            managed: None,
+        })
+    };
+    let cache_entry = if let Some(cache) = &stage_cache {
         let dependencies: Vec<_> = plan.stages[index]
             .instructions
             .iter()
@@ -1574,7 +1717,7 @@ fn build_stage(
             })
             .collect();
         let input = format!(
-            "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{}\n{:?}",
+            "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{}\n{:?}\n{:?}",
             plan.global_args,
             plan.stages[index],
             options.args,
@@ -1583,7 +1726,8 @@ fn build_stage(
             inherited,
             metadata.as_ref().map(|m| &m.selected.digest),
             options.host_dns,
-            dependencies
+            dependencies,
+            options.export_mode
         );
         let uses_context = steps.iter().any(|s| {
             matches!(
@@ -1595,7 +1739,7 @@ fn build_stage(
                 }
             )
         });
-        Some(cache.join(crate::build_cache::key(
+        Some(cache.root.join(crate::build_cache::key(
             input.as_bytes(),
             uses_context.then_some(options.context.as_path()),
             options.limits,
@@ -1628,7 +1772,15 @@ fn build_stage(
     }
     let mut cache_hit = false;
     if let Some(entry) = &cache_entry
-        && crate::build_cache::lookup(entry, lease)?
+        && stage_cache.as_ref().unwrap().lookup(
+            entry,
+            options.limits,
+            steps
+                .iter()
+                .filter(|s| matches!(s, Step::Copy { .. }))
+                .count(),
+            &cancelled,
+        )?
     {
         let targets = crate::build_cache::copy_targets(
             entry,
@@ -1734,11 +1886,33 @@ fn build_stage(
                 .min(options.limits.max_replay_entries - entries);
             let mut verified = layer::verify(&store, descriptor, diff, &spool, limits, &cancelled)?;
             bytes += verified.size();
-            entries += verified.entries().len();
+            entries += verified.physical_header_count();
             rootfs::apply_layer(&root, &mut verified, &cancelled)?;
             root_budget(&root, options.limits, &cancelled)?;
         }
     }
+    let baseline = if options.export_mode == ExportMode::Layered && !cache_hit {
+        Some(match (&base_path, binding) {
+            (Some(layout), Some(binding)) => export::Baseline::capture(
+                &root,
+                layout,
+                binding.reference.as_deref(),
+                &work,
+                options.limits.export,
+                options.limits.image,
+                options.limits.layer,
+                export::ReplayLimits {
+                    max_bytes: options.limits.max_replay_bytes,
+                    max_entries: options.limits.max_replay_entries,
+                },
+                &cancelled,
+            )?,
+            (None, None) => export::Baseline::scratch(&root, options.limits.export, &cancelled)?,
+            _ => return Err("inconsistent layered export base".into()),
+        })
+    } else {
+        None
+    };
     let mut copied = context::Summary::default();
     let mut copy_targets = Vec::new();
     let mut materialized = metadata.is_some();
@@ -1818,22 +1992,34 @@ fn build_stage(
                 }
             }
             let inputs = format!(
-                "{builder}\n{prior_identity:?}\n{:?}\n{}\n{materialized}\n{:?}\n{:?}\n{instruction_steps:?}\n{dependency:?}",
-                options.limits, options.host_dns, boundary.config, boundary.args
+                "{builder}\n{prior_identity:?}\n{:?}\n{}\n{materialized}\n{:?}\n{:?}\n{instruction_steps:?}\n{dependency:?}\n{:?}",
+                options.limits,
+                options.host_dns,
+                boundary.config,
+                boundary.args,
+                options.export_mode
             );
             let inputs = serde_json::to_vec(&(inputs, selected))?;
             available.then(|| {
-                options
-                    .cache
+                stage_cache
                     .as_ref()
                     .unwrap()
+                    .root
                     .join(crate::build_cache::instruction_key(&inputs))
             })
         } else {
             None
         };
         if let Some(entry) = &entry
-            && crate::build_cache::lookup(entry, lease)?
+            && stage_cache.as_ref().unwrap().lookup(
+                entry,
+                options.limits,
+                instruction_steps
+                    .iter()
+                    .filter(|s| matches!(s, Step::Copy { .. }))
+                    .count(),
+                &cancelled,
+            )?
         {
             let targets = crate::build_cache::copy_targets(
                 entry,
@@ -1962,12 +2148,14 @@ fn build_stage(
             let snapshot = work.join(format!("checkpoint-image-{}", boundary.ordinal));
             let mut checkpoint_config = config.clone();
             checkpoint_config["config"] = boundary.config.clone();
-            export::export_layout(
+            export_stage(
                 &root,
                 &snapshot,
                 &checkpoint_config,
+                baseline.as_ref(),
                 options.limits.export,
                 &cancelled,
+                || Ok(()),
             )?;
             // Export traverses directories. Continue from the archived state on
             // cold builds too, so later RUNs observe the same atimes as cache hits.
@@ -1982,14 +2170,11 @@ fn build_stage(
             )?;
             check(&cancelled)?;
             if let Some(entry) = entry {
-                crate::build_cache::publish(
+                stage_cache.as_ref().unwrap().publish(
                     &snapshot,
-                    lease,
                     &entry,
-                    Some((
-                        &copy_targets[receipt_start..],
-                        options.limits.layer.max_metadata_bytes,
-                    )),
+                    &copy_targets[receipt_start..],
+                    options.limits,
                     &cancelled,
                 )?;
             }
@@ -2039,10 +2224,11 @@ fn build_stage(
         })?;
         manifest.clone()
     } else {
-        export::export_layout_created(
+        export_stage(
             &root,
             &output,
             &config,
+            baseline.as_ref(),
             options.limits.export,
             &cancelled,
             || {
@@ -2079,11 +2265,11 @@ fn build_stage(
         })?;
     }
     if !cache_hit && let Some(entry) = cache_entry {
-        crate::build_cache::publish(
+        stage_cache.as_ref().unwrap().publish(
             &output,
-            lease,
             &entry,
-            Some((&copy_targets, options.limits.layer.max_metadata_bytes)),
+            &copy_targets,
+            options.limits,
             &cancelled,
         )?;
     }
@@ -2352,6 +2538,8 @@ mod tests {
             host_dns: false,
             verbose: false,
             progress: true,
+            export_mode: ExportMode::Flattened,
+            managed_cache: None,
             target: None,
             cache: None,
             no_cache: false,
