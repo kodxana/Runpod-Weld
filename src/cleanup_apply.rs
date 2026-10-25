@@ -46,6 +46,11 @@ mod linux {
     use crate::{
         build_record::{self, Component, Identity, Record, identity, open_dir},
         cleanup_plan,
+        oci::ManagedCache,
+        store_inventory::{
+            self,
+            cache::{self, Kind, Retirement, Snapshot},
+        },
         store_lease::{ExclusiveStoreLease, StoreLease},
     };
     use serde::{Deserialize, de::DeserializeOwned};
@@ -428,15 +433,16 @@ mod linux {
     }
     // Recovery first validates ALL known journals. Unknown trash is never adopted.
     // Interrupted payloads are restored (possibly partly unlinked) and freshly planned.
-    fn recover(
+    fn validate_transactions(
         root: &File,
-        report: &mut Report,
         limits: Limits,
         cancelled: &impl Fn() -> bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<(Vec<Transaction>, bool)> {
         let mount = stat(root, Path::new(""))?.stx_mnt_id;
         let mut transactions = Vec::new();
         let mut targets = std::collections::HashSet::new();
+        let mut unknown = false;
+        let mut journal_bytes = 0usize;
         for name in names(root)? {
             check_cancel(cancelled)?;
             if !name.as_bytes().starts_with(PREFIX.as_bytes()) {
@@ -448,10 +454,27 @@ mod linux {
             let dir = open_dir(root.as_raw_fd(), Path::new(&name))?;
             private(&dir)?;
             if absent(&dir, Path::new(JOURNAL))? {
+                unknown |= !names(&dir)?.is_empty();
                 continue;
             }
-            let journal: Journal = read(&dir, JOURNAL, MAX_JOURNAL)?;
+            let data = bytes(
+                &dir,
+                Path::new(JOURNAL),
+                MAX_JOURNAL.min(limits.max_metadata_bytes.saturating_sub(journal_bytes)),
+            )?;
+            journal_bytes += data.len();
+            let journal: Journal =
+                serde_json::from_slice(&data).map_err(|_| invalid("malformed cleanup metadata"))?;
             journal.shape()?;
+            if targets
+                .iter()
+                .any(|p: &PathBuf| p.starts_with(journal.path()) || journal.path().starts_with(p))
+                || transactions
+                    .iter()
+                    .any(|t: &Transaction| t.journal.object == journal.object)
+            {
+                return Err(invalid("overlapping cleanup transactions"));
+            }
             if journal.store != identity(&root.metadata()?)
                 || journal.transaction != identity(&dir.metadata()?)
                 || journal.mount != mount
@@ -490,6 +513,14 @@ mod linux {
                 journal,
             });
         }
+        Ok((transactions, unknown))
+    }
+    fn recover(
+        root: &File,
+        transactions: Vec<Transaction>,
+        report: &mut Report,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<()> {
         for tx in transactions {
             check_cancel(cancelled)?;
             let source = parent(root, &tx.journal)?;
@@ -514,6 +545,274 @@ mod linux {
                 reason: "interrupted_transaction_recovered_descendants_may_already_be_removed",
             });
         }
+        Ok(())
+    }
+
+    fn cache_references(
+        store: &Path,
+        snapshot: &Snapshot,
+        limits: Limits,
+        cancelled: &impl Fn() -> bool,
+        validated_builds: &[(Record, Record)],
+    ) -> io::Result<()> {
+        let inventory = store_inventory::inspect_recovery_references(
+            store,
+            limits,
+            cancelled,
+            validated_builds,
+        )?;
+        let view = snapshot.reference_view();
+        let selected = cleanup_plan::cache_selection(store, &inventory, &view, cancelled)?;
+        let j = snapshot
+            .retirement
+            .as_ref()
+            .ok_or_else(|| invalid("missing retirement"))?;
+        if !selected.contains(&Path::new("cache-v2").join(j.source())) {
+            return Err(invalid(
+                "retirement target became referenced; nothing recovered",
+            ));
+        }
+        Ok(())
+    }
+    fn cache_journal(snapshot: &Snapshot, path: &Path, limits: Limits) -> io::Result<Retirement> {
+        let relative = path
+            .strip_prefix("cache-v2")
+            .map_err(|_| invalid("invalid cache candidate"))?;
+        let parts = relative
+            .iter()
+            .map(|p| p.to_str().ok_or_else(|| invalid("invalid cache candidate")))
+            .collect::<io::Result<Vec<_>>>()?;
+        let (kind, key) = match parts.as_slice() {
+            ["entries", key] if snapshot.entries.iter().any(|k| k == key) => (Kind::Entry, *key),
+            ["objects", key] if snapshot.unreferenced.iter().any(|k| k == key) => {
+                (Kind::Object, *key)
+            }
+            _ => return Err(invalid("cache target still referenced or unknown")),
+        };
+        let mut j = Retirement {
+            version: 1,
+            store: snapshot.store,
+            namespace: snapshot.namespace,
+            lock: snapshot.nodes["publication.lock"].identity,
+            parent: snapshot.nodes[parts[0]].identity,
+            kind,
+            key: key.into(),
+            nodes: Default::default(),
+        };
+        let source = j.source();
+        let pool = j.pool();
+        for (p, n) in &snapshot.nodes {
+            if p == &source
+                || p.starts_with(&(source.clone() + "/"))
+                || (j.kind == Kind::Object && p == &pool)
+            {
+                j.nodes.insert(p.clone(), n.clone());
+            }
+        }
+        let len = serde_json::to_vec(&j)?.len();
+        // Reserve the complete recovery read, including longer retired names.
+        if len
+            .saturating_add(snapshot.scan_bytes)
+            .saturating_add(j.nodes.len().saturating_mul(16))
+            > limits.max_metadata_bytes
+        {
+            return Err(invalid("cache retirement journal exceeds recovery budget"));
+        }
+        Ok(j)
+    }
+    fn publish_cache_journal(root: &File, cache_dir: &File, j: &Retirement) -> io::Result<()> {
+        // Construction outside cache-v2 cannot create an unauthenticated cache child.
+        let mut temp = tempfile::Builder::new()
+            .prefix(".cache-retirement-write-")
+            .tempfile_in(pinned(root))?;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+        temp.write_all(&serde_json::to_vec(j)?)?;
+        temp.as_file().sync_all()?;
+        let name = Path::new(temp.path().file_name().unwrap());
+        rename(root, name, cache_dir, Path::new(cache::JOURNAL))?;
+        // TempPath's old name is now absent; dropping it cannot unlink the journal.
+        Ok(())
+    }
+    fn check_cache_snapshot(
+        root: &File,
+        limits: Limits,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<Snapshot> {
+        ManagedCache::maintenance_inspect(root, limits, cancelled, true)?
+            .ok_or_else(|| invalid("cache disappeared"))
+    }
+    fn cache_journal_unchanged(dir: &File, snapshot: &Snapshot) -> io::Result<()> {
+        let st = stat(dir, Path::new(cache::JOURNAL))?;
+        let id = Identity {
+            device: libc::makedev(st.stx_dev_major, st.stx_dev_minor),
+            inode: st.stx_ino,
+        };
+        let expected = serde_json::to_vec(
+            snapshot
+                .retirement
+                .as_ref()
+                .ok_or_else(|| invalid("missing retirement"))?,
+        )?;
+        if Some(id) != snapshot.journal_identity
+            || st.stx_mnt_id != stat(dir, Path::new(""))?.stx_mnt_id
+            || bytes(dir, Path::new(cache::JOURNAL), expected.len())? != expected
+        {
+            return Err(invalid("cache retirement journal changed"));
+        }
+        Ok(())
+    }
+    fn finish_cache(
+        root: &File,
+        store: &Path,
+        snapshot: Snapshot,
+        report: &mut Report,
+        limits: Limits,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<()> {
+        let j = snapshot
+            .retirement
+            .as_ref()
+            .ok_or_else(|| invalid("missing retirement journal"))?
+            .clone();
+        cache_references(store, &snapshot, limits, cancelled, &[])?;
+        let cache_dir = open_dir(root.as_raw_fd(), Path::new("cache-v2"))?;
+        if identity(&cache_dir.metadata()?) != j.namespace {
+            return Err(invalid("cache namespace changed"));
+        }
+        let parent = open_dir(cache_dir.as_raw_fd(), Path::new(j.parent_path()))?;
+        if identity(&parent.metadata()?) != j.parent {
+            return Err(invalid("cache parent changed"));
+        }
+        let retired_leaf = format!(".retire-{}", j.key);
+        let pool = j.pool();
+        check_cancel(cancelled)?;
+        cache_journal_unchanged(&cache_dir, &snapshot)?;
+        if j.kind == Kind::Object && snapshot.nodes.contains_key(&pool) {
+            let pool_dir = open_dir(cache_dir.as_raw_fd(), Path::new("content/blobs/sha256"))?;
+            let st = stat(&pool_dir, Path::new(&j.key))?;
+            if snapshot.nodes[&pool].identity
+                != (Identity {
+                    device: libc::makedev(st.stx_dev_major, st.stx_dev_minor),
+                    inode: st.stx_ino,
+                })
+                || st.stx_mnt_id != stat(root, Path::new(""))?.stx_mnt_id
+            {
+                return Err(invalid("cache pool changed before retirement"));
+            }
+            unlink(&pool_dir, Path::new(&j.key), false)?;
+            check_cancel(cancelled)?;
+            cache_journal_unchanged(&cache_dir, &snapshot)?;
+        }
+        if !absent(&parent, Path::new(&j.key))? {
+            let st = stat(&parent, Path::new(&j.key))?;
+            if j.nodes[&j.source()].identity
+                != (Identity {
+                    device: libc::makedev(st.stx_dev_major, st.stx_dev_minor),
+                    inode: st.stx_ino,
+                })
+                || st.stx_mnt_id != stat(root, Path::new(""))?.stx_mnt_id
+            {
+                return Err(invalid("cache target changed before retirement"));
+            }
+            rename(
+                &parent,
+                Path::new(&j.key),
+                &parent,
+                Path::new(&retired_leaf),
+            )?;
+        }
+        check_cancel(cancelled)?;
+        let source = j.source();
+        let retired = j.retired();
+        let mut paths: Vec<_> = j.nodes.keys().filter(|p| *p != &pool).cloned().collect();
+        // Descendants before parents; retain the provenance record until all
+        // payload descendants are gone. The immutable journal survives everything.
+        let owner = if j.kind == Kind::Entry {
+            "weld-cache-entry.json"
+        } else {
+            "weld-cache-blob.json"
+        };
+        paths.sort_by(|a, b| {
+            let rank = |p: &String| {
+                if p == &source {
+                    0
+                } else if p == &format!("{source}/{owner}") {
+                    1
+                } else {
+                    p.split('/').count() + 2
+                }
+            };
+            rank(b).cmp(&rank(a)).then_with(|| a.cmp(b))
+        });
+        for p in paths {
+            check_cancel(cancelled)?;
+            // Fresh bounded global provenance/alias audit before every unlink.
+            let current = check_cache_snapshot(root, limits, cancelled)?;
+            cache_journal_unchanged(&cache_dir, &snapshot)?;
+            if current.journal_identity != snapshot.journal_identity
+                || serde_json::to_vec(current.retirement.as_ref().unwrap())?
+                    != serde_json::to_vec(&j)?
+            {
+                return Err(invalid("cache retirement journal changed"));
+            }
+            let actual = format!("{retired}{}", p.strip_prefix(&source).unwrap());
+            let Some(n) = current.nodes.get(&actual) else {
+                continue;
+            };
+            let path = Path::new(&actual);
+            let dir = open_dir(cache_dir.as_raw_fd(), path.parent().unwrap())?;
+            let st = stat(&dir, Path::new(path.file_name().unwrap()))?;
+            if n.identity
+                != (Identity {
+                    device: libc::makedev(st.stx_dev_major, st.stx_dev_minor),
+                    inode: st.stx_ino,
+                })
+                || st.stx_mnt_id != stat(root, Path::new(""))?.stx_mnt_id
+            {
+                return Err(invalid("retired cache identity or mount changed"));
+            }
+            let result = unlink(&dir, Path::new(path.file_name().unwrap()), n.directory);
+            if result.is_err()
+                && p == source
+                && absent(&dir, Path::new(path.file_name().unwrap())).unwrap_or(false)
+            {
+                report.removed.push(Item {
+                    path: Path::new("cache-v2").join(&source),
+                    reason: "cache_retirement_finalization_pending",
+                });
+            }
+            result?;
+        }
+        report.removed.push(Item {
+            path: Path::new("cache-v2").join(&source),
+            reason: "cache_retirement_finalization_pending",
+        });
+        check_cancel(cancelled)?;
+        let final_state = check_cache_snapshot(root, limits, cancelled)?;
+        if final_state.journal_identity != snapshot.journal_identity
+            || serde_json::to_vec(final_state.retirement.as_ref().unwrap())?
+                != serde_json::to_vec(&j)?
+        {
+            return Err(invalid("cache retirement journal changed"));
+        }
+        cache_references(store, &final_state, limits, cancelled, &[])?;
+        // The journal's virtual target validates provenance only; all actual
+        // remaining names now constitute an independently valid normal cache.
+        if final_state.nodes.keys().any(|p| {
+            p == &source
+                || p.starts_with(&(source.clone() + "/"))
+                || p == &retired
+                || p.starts_with(&(retired.clone() + "/"))
+                || (j.kind == Kind::Object && p == &pool)
+        }) {
+            return Err(invalid("cache retirement payload still present"));
+        }
+        cache_journal_unchanged(&cache_dir, &snapshot)?;
+        unlink(&cache_dir, Path::new(cache::JOURNAL), false)?;
+        report.removed.last_mut().unwrap().reason =
+            "owned_cache_entry_or_unreferenced_object_removed";
+        check_cancel(cancelled)?;
         Ok(())
     }
     fn journal(root: &File, plan: &Plan, path: &Path) -> io::Result<Journal> {
@@ -645,7 +944,38 @@ mod linux {
                 return Err(invalid("store changed after lease"));
             }
             check_cancel(cancelled)?;
-            recover(&root, &mut report, limits, cancelled)?;
+            let _publication = ManagedCache::maintenance_lock(&root, &lease)?;
+            let (transactions, unknown) = validate_transactions(&root, limits, cancelled)?;
+            let cache_state = ManagedCache::maintenance_inspect(&root, limits, cancelled, true)?;
+            let cache_pending = cache_state.as_ref().is_some_and(|s| s.retirement.is_some());
+            if unknown && (!transactions.is_empty() || cache_pending) {
+                return Err(invalid("unknown cleanup transaction prevents recovery"));
+            }
+            if let Some(state) = cache_state.as_ref().filter(|s| s.retirement.is_some()) {
+                let mut validated_builds = Vec::new();
+                for tx in &transactions {
+                    if let Target::Build { record, component } = &tx.journal.target {
+                        let source = parent(&root, &tx.journal)?;
+                        if absent(&source, Path::new(tx.journal.path().file_name().unwrap()))? {
+                            let mut after = (**record).clone();
+                            after.version = 2;
+                            after.removed.push(component.clone());
+                            validated_builds.push(((**record).clone(), after));
+                        }
+                    }
+                }
+                cache_references(store, state, limits, cancelled, &validated_builds)?;
+            }
+            // All journal and reference validation precedes ALL recovery mutation.
+            recover(&root, transactions, &mut report, cancelled)?;
+            if let Some(state) = cache_state.filter(|s| s.retirement.is_some()) {
+                let path = Path::new("cache-v2").join(state.retirement.as_ref().unwrap().source());
+                finish_cache(&root, store, state, &mut report, limits, cancelled)?;
+                report.recovered.push(Item {
+                    path,
+                    reason: "cache_retirement_completed",
+                });
+            }
             let initial = fresh(store, &selection, limits, cancelled, &lease)?;
             let paths = initial
                 .candidates
@@ -660,6 +990,19 @@ mod linux {
                     return Err(invalid(
                         "candidate became protected; nothing further removed",
                     ));
+                }
+                if path.starts_with("cache-v2") {
+                    let snapshot =
+                        ManagedCache::maintenance_inspect(&root, limits, cancelled, false)?
+                            .ok_or_else(|| invalid("cache disappeared"))?;
+                    let j = cache_journal(&snapshot, &path, limits)?;
+                    let cache_dir = open_dir(root.as_raw_fd(), Path::new("cache-v2"))?;
+                    check_cancel(cancelled)?;
+                    publish_cache_journal(&root, &cache_dir, &j)?;
+                    check_cancel(cancelled)?;
+                    let snapshot = check_cache_snapshot(&root, limits, cancelled)?;
+                    finish_cache(&root, store, snapshot, &mut report, limits, cancelled)?;
+                    continue;
                 }
                 let mut j = journal(&root, &plan, &path)?;
                 let source = parent(&root, &j)?;

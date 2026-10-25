@@ -138,6 +138,9 @@ pub(crate) fn inspect_locked(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) use linux::cache_selection;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use crate::{
@@ -157,6 +160,108 @@ mod linux {
     };
 
     type Key = (u32, u32, u64);
+
+    pub(crate) fn cache_selection(
+        store: &Path,
+        inventory: &Inventory,
+        cache: &store_inventory::cache::Snapshot,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<Vec<PathBuf>> {
+        if !inventory.scan_complete || inventory.issues_truncated || inventory.partial {
+            return Err(io::Error::other("incomplete reference inventory"));
+        }
+        let canonical_store = fs::canonicalize(store)?;
+        let mut targets = Vec::new();
+        for tag in &inventory.tags {
+            if tag.status != Status::Present || tag.image.is_none() {
+                return Err(io::Error::other("unresolved cache reference"));
+            }
+            targets.push(tag.image.clone().unwrap());
+        }
+        for record in inventory
+            .builds
+            .iter()
+            .filter_map(|b| b.build_record.as_ref())
+        {
+            targets.extend(
+                record
+                    .external
+                    .iter()
+                    .map(|e| PathBuf::from(OsString::from_vec(e.unix_bytes.clone()))),
+            );
+        }
+        let mut protected_paths = Vec::new();
+        let mut protected_inodes = HashSet::new();
+        for target in targets {
+            if cancelled() || !target.is_absolute() {
+                return Err(io::Error::other("unresolved cache reference"));
+            }
+            let canonical = fs::canonicalize(&target)?;
+            let st = stat(libc::AT_FDCWD, &canonical, libc::AT_SYMLINK_NOFOLLOW)?;
+            let relative = canonical.strip_prefix(&canonical_store).ok();
+            if let Some(p) = relative {
+                if p.as_os_str().is_empty()
+                    || Path::new("cache-v2").starts_with(p)
+                    || p.starts_with("cache-v2")
+                {
+                    protected_paths.push(p.to_owned());
+                } else if st.stx_mode as u32 & libc::S_IFMT == libc::S_IFDIR {
+                    // An unscanned reference directory may hide aliases.
+                    return Err(io::Error::other("cache reference alias scope uncertain"));
+                }
+            } else if st.stx_mode as u32 & libc::S_IFMT == libc::S_IFDIR {
+                return Err(io::Error::other(
+                    "cache external directory reference scope uncertain",
+                ));
+            }
+            protected_inodes.insert((
+                libc::makedev(st.stx_dev_major, st.stx_dev_minor),
+                st.stx_ino,
+            ));
+        }
+        let protected = |relative: &str| {
+            let path = Path::new("cache-v2").join(relative);
+            protected_paths
+                .iter()
+                .any(|p| p.starts_with(&path) || path.starts_with(p))
+                || cache.nodes.iter().any(|(p, n)| {
+                    (p == relative || p.starts_with(&(relative.to_owned() + "/")))
+                        && protected_inodes.contains(&(n.identity.device, n.identity.inode))
+                })
+        };
+        let mut selected = Vec::new();
+        let mut retained = HashSet::new();
+        for key in &cache.entries {
+            let path = format!("entries/{key}");
+            if protected(&path) {
+                for (p, n) in &cache.nodes {
+                    if p.starts_with(&(path.clone() + "/blobs/sha256/")) {
+                        retained.insert((n.identity.device, n.identity.inode));
+                    }
+                }
+            } else {
+                selected.push(Path::new("cache-v2").join(path));
+            }
+        }
+        for (p, n) in &cache.nodes {
+            if !p.starts_with("objects/") || p.split('/').count() != 2 || !n.directory {
+                continue;
+            }
+            let digest = p.rsplit('/').next().unwrap();
+            let anchor = &cache.nodes[&format!("{p}/blobs/sha256/{digest}")];
+            let pool = format!("content/blobs/sha256/{digest}");
+            if !retained.contains(&(anchor.identity.device, anchor.identity.inode))
+                && !protected(p)
+                && !protected(&pool)
+            {
+                selected.push(Path::new("cache-v2").join(p));
+            }
+        }
+        if cancelled() {
+            return Err(io::Error::other("cache selection cancelled"));
+        }
+        Ok(selected)
+    }
     fn key(st: &libc::statx) -> Key {
         (st.stx_dev_major, st.stx_dev_minor, st.stx_ino)
     }
@@ -450,6 +555,14 @@ mod linux {
                 return Err(io::Error::other("store changed after acquiring lease"));
             }
         }
+        let _publication = if matches!(plan.request, Request::CachePrune) && supplied.is_none() {
+            lease
+                .map(|l| crate::oci::ManagedCache::maintenance_lock(&root, l))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         let inventory = store_inventory::inspect(store, limits, cancelled)?;
         let check = build_record::open_dir(libc::AT_FDCWD, store)?;
         if build_record::identity(&check.metadata()?) != build_record::identity(&root.metadata()?) {
@@ -523,6 +636,64 @@ mod linux {
             plan.candidates.clear();
             plan.estimate = Estimate::default();
             plan.protect(Path::new(""), "incomplete_component_scan_selection_unknown");
+        }
+        if matches!(plan.request, Request::CachePrune) && plan.consistent {
+            let result = (|| -> io::Result<()> {
+                let Some(cache) =
+                    crate::oci::ManagedCache::maintenance_inspect(&root, limits, cancelled, false)?
+                else {
+                    return Ok(());
+                };
+                let selected = cache_selection(store, &inventory, &cache, cancelled)?;
+                let mut files = HashMap::new();
+                let mut selected_nodes = HashSet::new();
+                for path in &selected {
+                    let relative = path.strip_prefix("cache-v2").unwrap().to_str().unwrap();
+                    let pool = relative
+                        .strip_prefix("objects/")
+                        .map(|d| format!("content/blobs/sha256/{d}"));
+                    for (p, n) in &cache.nodes {
+                        if p == relative
+                            || p.starts_with(&(relative.to_owned() + "/"))
+                            || pool.as_ref() == Some(p)
+                        {
+                            if !selected_nodes.insert(p.clone()) {
+                                continue;
+                            }
+                            plan.estimate.selected_entries += 1;
+                            if !n.directory {
+                                let value = files
+                                    .entry((n.identity.device, n.identity.inode))
+                                    .or_insert((n.size, n.allocated, n.links, 0u64));
+                                value.3 += 1;
+                            }
+                        }
+                    }
+                    plan.candidates.push(Item {
+                        path: path.clone(),
+                        reason: "validated_owned_cache_retirement",
+                    });
+                }
+                plan.protected.retain(|i| !selected.contains(&i.path));
+                for (_, (size, allocated, links, count)) in files {
+                    plan.estimate.unique_logical_bytes += size;
+                    plan.estimate.shared_inode_count += u64::from(links > 1);
+                    if links == count {
+                        plan.estimate.reclaimable_file_allocated_bytes += allocated;
+                    }
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                plan.consistent = false;
+                plan.status = "partial";
+                plan.candidates.clear();
+                plan.estimate = Estimate::default();
+                plan.protect(
+                    Path::new("cache-v2"),
+                    "cache_ownership_closure_or_reference_uncertain",
+                );
+            }
         }
         for tag in &inventory.tags {
             let selected = matches!(&plan.request, Request::ImageRemove(id) if tag.reference.as_ref() == Some(&id.0));

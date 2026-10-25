@@ -52,6 +52,89 @@ pub struct Limits {
     pub max_record_bytes: usize,
     pub max_metadata_bytes: usize,
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) mod cache {
+    use crate::build_record::Identity;
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+
+    pub const JOURNAL: &str = "retirement.json";
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Node {
+        pub identity: Identity,
+        pub directory: bool,
+        pub mode: u32,
+        pub size: u64,
+        pub links: u64,
+        pub allocated: u64,
+        // Only private metadata is read; blob bytes are not journalled.
+        pub data: Option<Vec<u8>>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Kind {
+        Entry,
+        Object,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Retirement {
+        pub version: u32,
+        pub store: Identity,
+        pub namespace: Identity,
+        pub lock: Identity,
+        pub parent: Identity,
+        pub kind: Kind,
+        pub key: String,
+        pub nodes: BTreeMap<String, Node>,
+    }
+    impl Retirement {
+        pub fn parent_path(&self) -> &'static str {
+            match self.kind {
+                Kind::Entry => "entries",
+                Kind::Object => "objects",
+            }
+        }
+        pub fn source(&self) -> String {
+            format!("{}/{}", self.parent_path(), self.key)
+        }
+        pub fn retired(&self) -> String {
+            format!("{}/.retire-{}", self.parent_path(), self.key)
+        }
+        pub fn pool(&self) -> String {
+            format!("content/blobs/sha256/{}", self.key)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Snapshot {
+        pub store: Identity,
+        pub namespace: Identity,
+        pub nodes: BTreeMap<String, Node>,
+        pub entries: Vec<String>,
+        pub unreferenced: Vec<String>,
+        pub retirement: Option<Retirement>,
+        pub scan_bytes: usize,
+        pub journal_identity: Option<Identity>,
+    }
+    impl Snapshot {
+        pub fn reference_view(&self) -> Self {
+            let mut view = self.clone();
+            if let Some(j) = &self.retirement {
+                let retired = j.retired();
+                view.nodes
+                    .retain(|p, _| p != &retired && !p.starts_with(&(retired.clone() + "/")));
+                view.nodes.extend(j.nodes.clone());
+            }
+            view
+        }
+    }
+}
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -218,7 +301,7 @@ pub fn inspect(
 ) -> std::io::Result<Inventory> {
     #[cfg(target_os = "linux")]
     {
-        linux::inspect(store, limits, &cancelled)
+        linux::inspect(store, limits, &cancelled, false, &[])
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -227,6 +310,16 @@ pub fn inspect(
             "safe store inventory requires Linux openat2",
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect_recovery_references(
+    store: &Path,
+    limits: Limits,
+    cancelled: &impl Fn() -> bool,
+    validated_builds: &[(crate::build_record::Record, crate::build_record::Record)],
+) -> std::io::Result<Inventory> {
+    linux::inspect(store, limits, cancelled, true, validated_builds)
 }
 
 #[cfg(target_os = "linux")]
@@ -1115,6 +1208,8 @@ mod linux {
         store: &Path,
         limits: Limits,
         cancel: &dyn Fn() -> bool,
+        cache_validated_separately: bool,
+        validated_builds: &[(crate::build_record::Record, crate::build_record::Record)],
     ) -> io::Result<Inventory> {
         if !store.is_absolute()
             || store
@@ -1180,7 +1275,9 @@ mod linux {
             } else if ["base-cache-v1", "cache-v1"].contains(&s) {
                 scan.area(&root, p);
             } else if s == "cache-v2" {
-                scan.shared_cache(&root);
+                if !cache_validated_separately {
+                    scan.shared_cache(&root);
+                }
             } else if s.starts_with("build-") {
                 let mut build = entry(p.into(), Status::LegacyUnknown, Ownership::Unknown);
                 if scan.limits.max_depth >= 2
@@ -1206,7 +1303,15 @@ mod linux {
                         )
                     };
                     scan.limits.max_record_bytes = limit;
-                    if let Some(record) = record {
+                    if let Some(mut record) = record {
+                        // A validated pending build journal can explain its own
+                        // missing component without hiding any unrelated scan error.
+                        for (before, after) in validated_builds {
+                            if serde_json::to_value(&record)? == serde_json::to_value(before)? {
+                                record = after.clone();
+                                break;
+                            }
+                        }
                         if record
                             .validate(&root, &d, p, |depth| {
                                 if scan.stop() {
@@ -1291,7 +1396,14 @@ mod linux {
         ] {
             let cancel = || code == "cancelled";
             let mut scan = Scan {
-                out: inspect(&temp.path().join("missing"), Limits::default(), &|| false).unwrap(),
+                out: inspect(
+                    &temp.path().join("missing"),
+                    Limits::default(),
+                    &|| false,
+                    false,
+                    &[],
+                )
+                .unwrap(),
                 limits: Limits::default(),
                 cancel: &cancel,
                 entries: 0,

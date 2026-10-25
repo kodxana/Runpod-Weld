@@ -104,6 +104,7 @@ impl<'a> ManagedCache<'a> {
         let store = fs::canonicalize(store)?;
         private_dir(&store)?;
         let root = store.join("cache-v2");
+        retirement_barrier(&root)?;
         if !exists(&root)? {
             let temp = tempfile::Builder::new()
                 .prefix(".cache-v2-")
@@ -302,6 +303,7 @@ impl<'a> ManagedCache<'a> {
     }
 
     fn validate(&self) -> Result<()> {
+        retirement_barrier(&self.root)?;
         store_access::validate_root(&self.store, self.lease)?;
         private_dir(&self.root)?;
         let durable: Namespace = read_record(&self.root.join(OWNER))?;
@@ -639,6 +641,653 @@ impl<'a> ManagedCache<'a> {
         sync_dirs(path, &["blobs/sha256", "blobs", ""])?;
         File::open(self.root.join("entries"))?.sync_all()?;
         Ok(())
+    }
+}
+
+fn retirement_barrier(root: &Path) -> Result<()> {
+    if exists(&root.join(crate::store_inventory::cache::JOURNAL))? {
+        return Err("cache retirement pending; run explicit cache prune recovery".into());
+    }
+    Ok(())
+}
+
+impl ManagedCache<'_> {
+    pub(crate) fn maintenance_inspect(
+        root: &File,
+        limits: crate::store_inventory::Limits,
+        cancelled: &impl Fn() -> bool,
+        recovery: bool,
+    ) -> io::Result<Option<crate::store_inventory::cache::Snapshot>> {
+        maintenance::inspect(root, limits, cancelled, recovery)
+    }
+
+    pub(crate) fn maintenance_lock(
+        root: &File,
+        lease: &crate::store_lease::ExclusiveStoreLease,
+    ) -> io::Result<Option<File>> {
+        let id = lease.root_identity();
+        maintenance::require(
+            identity(&root.metadata()?)
+                == Identity {
+                    device: id.device,
+                    inode: id.inode,
+                },
+        )?;
+        let cache = match open_dir(root.as_raw_fd(), Path::new("cache-v2")) {
+            Ok(cache) => cache,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let file = maintenance::open(&cache, LOCK, false)?;
+        let m = file.metadata()?;
+        maintenance::require(
+            m.is_file()
+                && m.nlink() == 1
+                && m.mode() & 0o077 == 0
+                && m.uid() == unsafe { libc::geteuid() },
+        )?;
+        // The exclusive store lease excludes all cooperative holders of this lock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(file))
+    }
+}
+
+mod maintenance {
+    use super::*;
+    use crate::store_inventory::{
+        Limits,
+        cache::{JOURNAL, Kind, Node, Retirement, Snapshot},
+    };
+    use std::os::fd::FromRawFd;
+
+    pub(super) fn require(ok: bool) -> io::Result<()> {
+        if ok {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "cache ownership, closure or retirement validation failed",
+            ))
+        }
+    }
+    fn key(s: &str) -> bool {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+    pub(super) fn open(dir: &File, name: &str, directory: bool) -> io::Result<File> {
+        #[repr(C)]
+        struct How {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        let name = CString::new(name)?;
+        let how = How {
+            flags: (libc::O_RDONLY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK
+                | if directory { libc::O_DIRECTORY } else { 0 }) as u64,
+            mode: 0,
+            resolve: 0x01 | 0x02 | 0x04 | 0x08,
+        };
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &how,
+                std::mem::size_of::<How>(),
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(fd as i32) })
+        }
+    }
+    fn mount(file: &File) -> io::Result<u64> {
+        let mut st: libc::statx = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                libc::STATX_MNT_ID,
+                &mut st,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        require(st.stx_mask & libc::STATX_MNT_ID != 0)?;
+        Ok(st.stx_mnt_id)
+    }
+    struct Budget<'a, F> {
+        limits: Limits,
+        entries: usize,
+        bytes: usize,
+        cancel: &'a F,
+    }
+    impl<F: Fn() -> bool> Budget<'_, F> {
+        fn charge(&mut self, bytes: usize) -> io::Result<()> {
+            if (self.cancel)() {
+                return Err(io::Error::other("cache maintenance cancelled"));
+            }
+            require(bytes <= self.limits.max_metadata_bytes.saturating_sub(self.bytes))?;
+            self.bytes += bytes;
+            Ok(())
+        }
+        fn read(&mut self, f: File, limit: usize) -> io::Result<Vec<u8>> {
+            let len = f.metadata()?.len();
+            require(len <= limit as u64)?;
+            self.charge(len as usize)?;
+            let mut bytes = Vec::new();
+            f.take(len + 1).read_to_end(&mut bytes)?;
+            require(bytes.len() as u64 == len)?;
+            Ok(bytes)
+        }
+    }
+    // Recognize only the protocol tree, before opening any unknown file contents.
+    // 0 directory, 1 private metadata, 2 immutable blob alias.
+    fn shape(path: &str) -> io::Result<u8> {
+        let p: Vec<_> = path.split('/').collect();
+        let kind = match p.as_slice() {
+            [""]
+            | ["entries"]
+            | ["objects"]
+            | ["content"]
+            | ["content", "blobs"]
+            | ["content", "blobs", "sha256"] => 0,
+            [OWNER] | [LOCK] => 1,
+            ["entries", k] | ["objects", k] if key(k) => 0,
+            ["entries", k, "blobs"] | ["objects", k, "blobs"] if key(k) => 0,
+            ["entries", k, "blobs", "sha256"] | ["objects", k, "blobs", "sha256"] if key(k) => 0,
+            [
+                "entries",
+                k,
+                ENTRY | COPY_TARGETS | "index.json" | "oci-layout",
+            ] if key(k) => 1,
+            ["objects", k, BLOB_OWNER] if key(k) => 1,
+            ["content", "blobs", "sha256", d] if key(d) => 2,
+            ["entries", k, "blobs", "sha256", d] if key(k) && key(d) => 2,
+            ["objects", k, "blobs", "sha256", d] if key(k) && k == d => 2,
+            _ => return Err(io::Error::other("unknown cache child protected")),
+        };
+        Ok(kind)
+    }
+    fn canonical(path: &str, j: Option<&Retirement>) -> String {
+        if let Some(j) = j {
+            let retired = j.retired();
+            if path == retired {
+                return j.source();
+            }
+            if let Some(suffix) = path.strip_prefix(&(retired + "/")) {
+                return format!("{}/{suffix}", j.source());
+            }
+        }
+        path.into()
+    }
+    fn walk<F: Fn() -> bool>(
+        dir: &File,
+        path: &str,
+        mount_id: u64,
+        j: Option<&Retirement>,
+        budget: &mut Budget<'_, F>,
+        nodes: &mut BTreeMap<String, Node>,
+    ) -> io::Result<()> {
+        for e in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+            let name = e?
+                .file_name()
+                .into_string()
+                .map_err(|_| io::Error::other("non-UTF8 cache child"))?;
+            let p = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}/{name}")
+            };
+            if p == JOURNAL && j.is_some() {
+                continue;
+            }
+            budget.entries += 1;
+            require(
+                budget.entries <= budget.limits.max_entries
+                    && p.split('/').count() <= budget.limits.max_depth,
+            )?;
+            budget.charge(p.len() + 256)?;
+            let kind = shape(&canonical(&p, j))?;
+            let f = open(dir, &name, kind == 0)?;
+            let m = f.metadata()?;
+            require(
+                m.uid() == unsafe { libc::geteuid() }
+                    && mount(&f)? == mount_id
+                    && if kind == 0 {
+                        m.is_dir() && m.mode() & 0o022 == 0
+                    } else {
+                        m.is_file() && m.mode() & 0o077 == 0 && (kind == 2 || m.nlink() == 1)
+                    },
+            )?;
+            let mut node = Node {
+                identity: identity(&m),
+                directory: kind == 0,
+                mode: m.mode(),
+                size: if kind == 0 { 0 } else { m.len() },
+                links: m.nlink(),
+                allocated: m.blocks() * 512,
+                data: None,
+            };
+            if kind == 0 {
+                walk(&f, &p, mount_id, j, budget, nodes)?;
+            } else if kind == 1 {
+                node.data = Some(budget.read(f, budget.limits.max_record_bytes)?);
+            }
+            nodes.insert(p, node);
+        }
+        Ok(())
+    }
+    fn parse<T: DeserializeOwned>(nodes: &BTreeMap<String, Node>, path: &str) -> io::Result<T> {
+        let n = nodes
+            .get(path)
+            .ok_or_else(|| io::Error::other("missing cache metadata"))?;
+        serde_json::from_slice(
+            n.data
+                .as_deref()
+                .ok_or_else(|| io::Error::other("missing cache metadata bytes"))?,
+        )
+        .map_err(|_| io::Error::other("malformed cache metadata"))
+    }
+    fn node<'a>(nodes: &'a BTreeMap<String, Node>, path: &str) -> io::Result<&'a Node> {
+        nodes
+            .get(path)
+            .ok_or_else(|| io::Error::other("incomplete cache tree"))
+    }
+    fn same(a: &Node, b: &Node) -> bool {
+        a.identity == b.identity
+            && a.directory == b.directory
+            && a.mode == b.mode
+            && a.size == b.size
+            && a.data == b.data
+    }
+    fn children(nodes: &BTreeMap<String, Node>, path: &str) -> BTreeSet<String> {
+        let prefix = format!("{path}/");
+        nodes
+            .keys()
+            .filter_map(|p| p.strip_prefix(&prefix))
+            .filter(|p| !p.contains('/'))
+            .map(str::to_owned)
+            .collect()
+    }
+    fn exact(nodes: &BTreeMap<String, Node>, path: &str, expected: &[&str]) -> io::Result<()> {
+        require(children(nodes, path) == expected.iter().map(|s| s.to_string()).collect())
+    }
+    fn validate_journal(
+        j: &Retirement,
+        root: &File,
+        cache: &File,
+        limits: Limits,
+    ) -> io::Result<()> {
+        require(
+            j.version == 1
+                && key(&j.key)
+                && j.store == identity(&root.metadata()?)
+                && j.namespace == identity(&cache.metadata()?)
+                && !j.nodes.is_empty()
+                && j.nodes.len() <= limits.max_entries,
+        )?;
+        let source = j.source();
+        require(node(&j.nodes, &source)?.directory)?;
+        for (p, n) in &j.nodes {
+            require(
+                p == &source
+                    || p.starts_with(&(source.clone() + "/"))
+                    || (j.kind == Kind::Object && p == &j.pool()),
+            )?;
+            require(p.split('/').count() <= limits.max_depth)?;
+            let kind = shape(p)?;
+            require(
+                n.directory == (kind == 0)
+                    && n.data.is_some() == (kind == 1)
+                    && n.mode & libc::S_IFMT
+                        == if kind == 0 {
+                            libc::S_IFDIR
+                        } else {
+                            libc::S_IFREG
+                        }
+                    && n.mode & if kind == 0 { 0o022 } else { 0o077 } == 0
+                    && n.data.as_ref().is_none_or(|b| {
+                        b.len() <= limits.max_record_bytes && b.len() as u64 == n.size
+                    })
+                    && (kind != 1 || n.links == 1),
+            )?;
+        }
+        Ok(())
+    }
+    pub(super) fn inspect(
+        root: &File,
+        limits: Limits,
+        cancel: &impl Fn() -> bool,
+        recovery: bool,
+    ) -> io::Result<Option<Snapshot>> {
+        let cache = match open(root, "cache-v2", true) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        require(
+            cache.metadata()?.uid() == unsafe { libc::geteuid() }
+                && cache.metadata()?.mode() & 0o022 == 0,
+        )?;
+        let mut budget = Budget {
+            limits,
+            entries: 0,
+            bytes: 0,
+            cancel,
+        };
+        budget.charge(0)?;
+        let mut journal_identity = None;
+        let journal = match open(&cache, JOURNAL, false) {
+            Ok(f) => {
+                if !recovery {
+                    return Err(io::Error::other(
+                        "cache retirement pending; run explicit cache prune recovery",
+                    ));
+                }
+                let m = f.metadata()?;
+                require(
+                    m.is_file()
+                        && m.nlink() == 1
+                        && m.mode() & 0o077 == 0
+                        && m.uid() == unsafe { libc::geteuid() },
+                )?;
+                journal_identity = Some(identity(&m));
+                let bytes = budget.read(f, limits.max_metadata_bytes)?;
+                let j: Retirement = serde_json::from_slice(&bytes)
+                    .map_err(|_| io::Error::other("malformed cache retirement"))?;
+                validate_journal(&j, root, &cache, limits)?;
+                Some(j)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let mut actual = BTreeMap::new();
+        walk(
+            &cache,
+            "",
+            mount(root)?,
+            journal.as_ref(),
+            &mut budget,
+            &mut actual,
+        )?;
+        let mut nodes = BTreeMap::new();
+        for (p, n) in &actual {
+            require(
+                nodes
+                    .insert(canonical(p, journal.as_ref()), n.clone())
+                    .is_none(),
+            )?;
+        }
+        if let Some(j) = &journal {
+            require(
+                node(&nodes, LOCK)?.identity == j.lock
+                    && node(&nodes, j.parent_path())?.identity == j.parent,
+            )?;
+            let source = j.source();
+            let retired = j.retired();
+            require(!(actual.contains_key(&source) && actual.contains_key(&retired)))?;
+            for (p, n) in &actual {
+                let c = canonical(p, Some(j));
+                if c == source
+                    || c.starts_with(&(source.clone() + "/"))
+                    || (j.kind == Kind::Object && c == j.pool())
+                {
+                    require(j.nodes.get(&c).is_some_and(|expected| same(n, expected)))?;
+                }
+            }
+            // Only a renamed target may have lost descendants. The pool is
+            // removed before an object rename, so it may already be absent.
+            if actual.contains_key(&source) {
+                for p in j.nodes.keys().filter(|p| **p != j.pool()) {
+                    require(actual.contains_key(p))?;
+                }
+            }
+            if j.kind == Kind::Object && !actual.contains_key(&source) {
+                require(!actual.contains_key(&j.pool()))?;
+            }
+            for (p, n) in &j.nodes {
+                nodes.entry(p.clone()).or_insert_with(|| n.clone());
+            }
+        }
+        require(nodes.len() <= limits.max_entries)?;
+        let ns: Namespace = parse(&nodes, OWNER)?;
+        require(
+            ns.version == 2
+                && ns.store == identity(&root.metadata()?)
+                && ns.root == identity(&cache.metadata()?),
+        )?;
+        for (p, id) in [
+            ("entries", ns.entries),
+            ("objects", ns.objects),
+            ("content", ns.content),
+            ("content/blobs", ns.blobs),
+            ("content/blobs/sha256", ns.sha256),
+            (LOCK, ns.lock),
+        ] {
+            require(node(&nodes, p)?.identity == id)?;
+        }
+        for p in [
+            OWNER,
+            LOCK,
+            "entries",
+            "objects",
+            "content",
+            "content/blobs",
+            "content/blobs/sha256",
+        ] {
+            node(&nodes, p)?;
+        }
+        let mut blobs = BTreeMap::new();
+        let mut identities = BTreeSet::new();
+        for digest in children(&nodes, "objects") {
+            let p = format!("objects/{digest}");
+            let owner: BlobOwner = parse(&nodes, &format!("{p}/{BLOB_OWNER}"))?;
+            let anchor = node(&nodes, &format!("{p}/blobs/sha256/{digest}"))?;
+            require(
+                owner.version == 1
+                    && owner.namespace == ns.root
+                    && owner.directory == node(&nodes, &p)?.identity
+                    && owner.digest == format!("sha256:{digest}")
+                    && owner.inode == anchor.identity
+                    && owner.size == anchor.size
+                    && identities.insert((owner.inode.device, owner.inode.inode)),
+            )?;
+            exact(&nodes, &p, &[BLOB_OWNER, "blobs"])?;
+            exact(&nodes, &format!("{p}/blobs"), &["sha256"])?;
+            exact(&nodes, &format!("{p}/blobs/sha256"), &[&digest])?;
+            blobs.insert(digest, (owner.inode, owner.size, 0usize));
+        }
+        // Account actual surviving names, including only journal-validated retired
+        // names. Never infer ownership from link count or digest spelling alone.
+        let mut links = BTreeMap::<(u64, u64), (u64, u64)>::new();
+        for (p, n) in &actual {
+            if shape(&canonical(p, journal.as_ref()))? != 2 {
+                continue;
+            }
+            let digest = p.rsplit('/').next().unwrap();
+            let b = blobs
+                .get(digest)
+                .ok_or_else(|| io::Error::other("unproven cache inode"))?;
+            require(n.identity == b.0 && n.size == b.1)?;
+            let count = links
+                .entry((n.identity.device, n.identity.inode))
+                .or_insert((n.links, 0));
+            require(count.0 == n.links)?;
+            count.1 += 1;
+        }
+        require(links.values().all(|(actual, counted)| actual == counted))?;
+        for digest in children(&nodes, "content/blobs/sha256") {
+            let n = node(&nodes, &format!("content/blobs/sha256/{digest}"))?;
+            let b = blobs
+                .get(&digest)
+                .ok_or_else(|| io::Error::other("unproven cache pool"))?;
+            require(n.identity == b.0 && n.size == b.1)?;
+        }
+        let mut entries = Vec::new();
+        for key in children(&nodes, "entries") {
+            let p = format!("entries/{key}");
+            let owner: Entry = parse(&nodes, &format!("{p}/{ENTRY}"))?;
+            require(
+                owner.version == 1
+                    && owner.store == ns.store
+                    && owner.namespace == ns.root
+                    && owner.directory == node(&nodes, &p)?.identity
+                    && owner.key == key,
+            )?;
+            exact(
+                &nodes,
+                &p,
+                &[ENTRY, COPY_TARGETS, "index.json", "oci-layout", "blobs"],
+            )?;
+            exact(&nodes, &format!("{p}/blobs"), &["sha256"])?;
+            let receipt = node(&nodes, &format!("{p}/{COPY_TARGETS}"))?
+                .data
+                .as_ref()
+                .unwrap();
+            let targets: Vec<Vec<Vec<u8>>> = serde_json::from_slice(receipt)
+                .map_err(|_| io::Error::other("malformed cache receipt"))?;
+            require(targets.len() == owner.instructions && hash(receipt) == owner.receipt)?;
+            build_cache::receipt_bytes(&targets, limits.max_record_bytes as u64)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let layout: serde_json::Value = parse(&nodes, &format!("{p}/oci-layout"))?;
+            require(layout["imageLayoutVersion"] == "1.0.0")?;
+            let index: serde_json::Value = parse(&nodes, &format!("{p}/index.json"))?;
+            require(
+                index["schemaVersion"] == 2
+                    && index["manifests"].as_array().is_some_and(|a| a.len() == 1),
+            )?;
+            let selected: Descriptor = serde_json::from_value(index["manifests"][0].clone())
+                .map_err(|_| io::Error::other("invalid cache descriptor"))?;
+            require(
+                selected.digest == owner.manifest
+                    && selected.media_type == "application/vnd.oci.image.manifest.v1+json",
+            )?;
+            let manifest = blob_json(&cache, &nodes, &selected, &mut budget)?;
+            require(
+                manifest["schemaVersion"] == 2
+                    && manifest.get("subject").is_none()
+                    && manifest.get("artifactType").is_none(),
+            )?;
+            require(
+                manifest
+                    .get("mediaType")
+                    .is_none_or(|m| m == "application/vnd.oci.image.manifest.v1+json"),
+            )?;
+            let config: Descriptor = serde_json::from_value(manifest["config"].clone())
+                .map_err(|_| io::Error::other("invalid config descriptor"))?;
+            require(config.media_type == "application/vnd.oci.image.config.v1+json")?;
+            let config_json = blob_json(&cache, &nodes, &config, &mut budget)?;
+            require(
+                config_json["architecture"] == "amd64"
+                    && config_json["os"] == "linux"
+                    && config_json
+                        .get("config")
+                        .is_none_or(|c| c.is_null() || c.is_object()),
+            )?;
+            let layers: Vec<Descriptor> = serde_json::from_value(manifest["layers"].clone())
+                .map_err(|_| io::Error::other("invalid cache layers"))?;
+            require(
+                layers.len() <= limits.max_entries
+                    && config_json["rootfs"]["type"] == "layers"
+                    && config_json["rootfs"]["diff_ids"]
+                        .as_array()
+                        .is_some_and(|a| {
+                            a.len() == layers.len()
+                                && a.iter().all(|d| {
+                                    d.as_str()
+                                        .and_then(|s| s.strip_prefix("sha256:"))
+                                        .is_some_and(self::key)
+                                })
+                        }),
+            )?;
+            require(layers.iter().all(|d| {
+                matches!(
+                    d.media_type.as_str(),
+                    "application/vnd.oci.image.layer.v1.tar"
+                        | "application/vnd.oci.image.layer.v1.tar+gzip"
+                        | "application/vnd.oci.image.layer.v1.tar+zstd"
+                )
+            }))?;
+            let mut expected = BTreeSet::new();
+            for d in std::iter::once(&selected)
+                .chain(std::iter::once(&config))
+                .chain(layers.iter())
+            {
+                let digest = d
+                    .digest
+                    .strip_prefix("sha256:")
+                    .filter(|s| self::key(s))
+                    .ok_or_else(|| io::Error::other("invalid digest"))?;
+                require(d.size >= 0)?;
+                let alias = node(&nodes, &format!("{p}/blobs/sha256/{digest}"))?;
+                let pool = node(&nodes, &format!("content/blobs/sha256/{digest}"))?;
+                require(
+                    alias.identity == pool.identity
+                        && alias.size == d.size as u64
+                        && pool.size == alias.size,
+                )?;
+                expected.insert(digest.to_owned());
+            }
+            require(children(&nodes, &format!("{p}/blobs/sha256")) == expected)?;
+            for d in expected {
+                blobs
+                    .get_mut(&d)
+                    .ok_or_else(|| io::Error::other("missing owned object"))?
+                    .2 += 1;
+            }
+            entries.push(key);
+        }
+        if let Some(j) = &journal
+            && j.kind == Kind::Object
+        {
+            require(blobs.get(&j.key).is_some_and(|b| b.2 == 0))?;
+        }
+        budget.charge(0)?;
+        let unreferenced = blobs
+            .into_iter()
+            .filter_map(|(key, (_, _, refs))| (refs == 0).then_some(key))
+            .collect();
+        Ok(Some(Snapshot {
+            store: ns.store,
+            namespace: ns.root,
+            nodes: actual,
+            entries,
+            unreferenced,
+            retirement: journal,
+            scan_bytes: budget.bytes,
+            journal_identity,
+        }))
+    }
+    fn blob_json<F: Fn() -> bool>(
+        cache: &File,
+        nodes: &BTreeMap<String, Node>,
+        d: &Descriptor,
+        budget: &mut Budget<'_, F>,
+    ) -> io::Result<serde_json::Value> {
+        let digest = d
+            .digest
+            .strip_prefix("sha256:")
+            .filter(|s| key(s))
+            .ok_or_else(|| io::Error::other("invalid metadata digest"))?;
+        let path = format!("content/blobs/sha256/{digest}");
+        let n = node(nodes, &path)?;
+        require(d.size >= 0 && n.size == d.size as u64)?;
+        let f = open(cache, &path, false)?;
+        require(identity(&f.metadata()?) == n.identity)?;
+        let bytes = budget.read(f, budget.limits.max_record_bytes)?;
+        require(hash(&bytes) == digest)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| io::Error::other("malformed cache blob metadata"))
     }
 }
 
