@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in Linux CLI acceptance. Run only after the parent supplies a frozen binary."""
 import argparse
+import gzip
 from decimal import Decimal
 import hashlib
 import io
@@ -17,6 +18,20 @@ import time
 
 from oracle import load, replay, snapshot, verified
 from fixture_tar import FixtureInfo
+
+
+def delta_members(output, base_count):
+    manifest, _ = load(output)
+    assert len(manifest["layers"]) == base_count + 1
+    desc = manifest["layers"][-1]
+    data = verified(output, desc)
+    if desc["mediaType"].endswith("+gzip"):
+        data = gzip.decompress(data)
+    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+        members = archive.getmembers()
+    names = [str(Path(m.name)) for m in members]
+    assert len(names) == len(set(names)), "duplicate delta paths"
+    return data, dict(zip(names, members))
 
 
 def loaded_reference(output):
@@ -160,6 +175,112 @@ def main():
     assert {k: v for k, v in before.items() if k.startswith("probe")} == {
         k: v for k, v in after.items() if k.startswith("probe")}
 
+    # Independently identified RUN inputs, not a budget inferred from emitted size.
+    runtime_files = ["bin/busybox", "lib/ld-musl-x86_64.so.1", "etc/passwd"]
+    rich_payloads = {name: (original / name).lstat().st_size for name in runtime_files}
+    rich_payloads.update({"probe/alias": len(b"preserved\n"), "probe/app": len(b"application-v1\n"),
+                          "probe/split-main": len(b"new inode\n"), "probe/split-peer": len(b"old inode\n"),
+                          "probe/to-file": len(b"replacement")})
+    rich_paths = set(rich_payloads) | {".", "bin", "etc", "lib", "var", "var/run", "probe",
+        "probe/keep", "probe/.wh.deleted", "probe/to-dir", "probe/xattr-dir"} | {
+        "bin/" + name for name in ["chmod", "chown", "mkdir", "rm", "rmdir", "sh", "touch"]}
+    sizes = {}
+
+    def rich_size(name, output, tree):
+        data, members = delta_members(output, len(base_manifest["layers"]))
+        assert set(members) <= rich_paths, (name, set(members) - rich_paths)
+        for path, member in members.items():
+            if member.isdir():
+                assert path == "." or tree[path] != before.get(path) or any(
+                    other.startswith(path + "/") for other in members), (name, "unneeded parent", path)
+            if path in before and not member.isdir():
+                assert tree[path] != before[path], (name, "unchanged path exported", path)
+            if member.isfile() and not Path(path).name.startswith(".wh."):
+                assert path in rich_payloads and member.size == rich_payloads[path], (name, path, member.size)
+        for path in runtime_files:
+            # RUN may access these files, but must preserve all other metadata/content.
+            assert {k: v for k, v in tree[path].items() if k != "atime_ns"} == {
+                k: v for k, v in before[path].items() if k != "atime_ns"}, (name, path)
+            source_root = a.evidence / (name + "-work") / "rootfs-final-export"
+            if not source_root.exists():
+                source_root = a.evidence / (name + "-work") / "rootfs"
+            assert tree[path]["atime_ns"] == (source_root / path).lstat().st_atime_ns, (name, path)
+        # At most one full payload per known inode; 4KiB/entry covers headers,
+        # PAX and block padding for this bounded fixture, plus a tar end record.
+        limit = sum(rich_payloads.values()) + 4096 * len(rich_paths) + 10240
+        sizes[name] = {"actual_bytes": len(data), "payload_bound": sum(rich_payloads.values()),
+                       "overhead_bound": limit - sum(rich_payloads.values()), "limit": limit,
+                       "paths": sorted(members)}
+        (a.evidence / "delta-sizes.json").write_text(json.dumps(sizes, indent=2))
+        assert len(data) <= limit, (name, len(data), limit)
+
+    # A real managed COPY workload isolates payload selectivity from RUN access.
+    copy_file = "FROM fixture\nCOPY app /probe/app\n"
+    copy_store = a.evidence / "copy-store"
+    copy_trees = {}
+    for name, payload, extra in [("copy-cold", b"application-v1\n", ()),
+                                  ("copy-warm", b"application-v1\n", ()),
+                                  ("copy-app-edit", b"application-v2\n", ()),
+                                  ("copy-no-cache", b"application-v2\n", ("--no-cache",))]:
+        if name in {"copy-cold", "copy-app-edit"}:
+            (context / "app").write_bytes(payload)
+        output, log = build(name, "layered", copy_file, extra, copy_store)
+        manifest, config = preserved(output)
+        assert config["config"] == base_config["config"]
+        if name == "copy-warm":
+            assert b"CACHED instruction 2 COPY" in log
+        if name in {"copy-cold", "copy-no-cache"}:
+            assert b"CACHED" not in log
+        data, members = delta_members(output, len(base_manifest["layers"]))
+        assert set(members) == {".", "probe", "probe/app"}, (name, set(members))
+        assert members["probe/app"].isfile() and members["probe/app"].size == len(payload)
+        assert manifest["layers"][-1]["size"] < 128 * 1024, "COPY-only app edit exported the base"
+        root = a.evidence / (name + "-replay")
+        replay(output, root)
+        tree = snapshot(root)
+        assert set(tree) == set(before) | {"probe/app"}
+        assert {k: v for k, v in tree.items() if k not in {"probe", "probe/app"}} == {
+            k: v for k, v in before.items() if k != "probe"}
+        # COPY changes the containing directory's times; explicit root metadata
+        # is preserved exactly, never normalized to an extraction clock.
+        assert tree["."] == before["."]
+        assert {k: v for k, v in tree["probe"].items() if k not in {"atime_ns", "mtime_ns"}} == {
+            k: v for k, v in before["probe"].items() if k not in {"atime_ns", "mtime_ns"}}
+        assert tree["probe/app"]["sha256"] == hashlib.sha256(payload).hexdigest()
+        assert (root / "probe/app").read_bytes() == payload
+        assert tree["probe/app"]["mode"] == stat.S_IFREG | 0o644
+        assert tree["probe/app"]["uid"] == tree["probe/app"]["gid"] == 0
+        assert tree["probe/app"]["xattrs"] == {}
+        # Exact COPY times come from the retained build filesystem, before
+        # any oracle content read; separate builds need not share wall clocks.
+        source_root = a.evidence / (name + "-work") / "rootfs-final-export"
+        if not source_root.exists():
+            source_root = a.evidence / (name + "-work") / "rootfs"
+        for path in ["probe", "probe/app"]:
+            source = (source_root / path).lstat()
+            assert tree[path]["atime_ns"] == source.st_atime_ns, (name, path)
+            assert tree[path]["mtime_ns"] == source.st_mtime_ns, (name, path)
+        copy_trees[name] = tree
+        sizes[name] = {"actual_bytes": len(data), "limit": 128 * 1024, "paths": sorted(members)}
+    assert copy_trees["copy-cold"] == copy_trees["copy-warm"], "warm COPY metadata changed"
+    (a.evidence / "delta-sizes.json").write_text(json.dumps(sizes, indent=2))
+    # Minimal COPY versus RUN regression: actual executions, no synthetic timing.
+    minimal, _ = build("copy-run-true", "layered", copy_file + "RUN true\n", ["--no-cache"], copy_store)
+    preserved(minimal)
+    minimal_root = a.evidence / "copy-run-true-replay"
+    replay(minimal, minimal_root)
+    minimal_tree = snapshot(minimal_root)
+    minimal_data, minimal_members = delta_members(minimal, len(base_manifest["layers"]))
+    assert set(minimal_members) == {".", "probe", "probe/app", "bin", "bin/sh", "bin/busybox", "lib", "lib/ld-musl-x86_64.so.1"}
+    for path in runtime_files[:2]:
+        assert minimal_tree[path]["atime_ns"] != before[path]["atime_ns"], path
+        assert {k: v for k, v in minimal_tree[path].items() if k != "atime_ns"} == {
+            k: v for k, v in before[path].items() if k != "atime_ns"}, path
+        assert minimal_members[path].isfile() and minimal_members[path].size == rich_payloads[path]
+    assert len(minimal_data) > 128 * 1024 > sizes["copy-app-edit"]["actual_bytes"]
+    sizes["copy-run-true"] = {"actual_bytes": len(minimal_data), "paths": sorted(minimal_members)}
+    (context / "app").write_text("application-v1\n")
+
     dockerfile = ("FROM fixture AS parent\nCOPY app /probe/app\n"
                   "RUN rm /probe/deleted /probe/to-dir && mkdir /probe/to-dir && "
                   "rm -rf /probe/to-file && printf replacement > /probe/to-file && "
@@ -200,6 +321,7 @@ def main():
                               "Labels": {"fixture": "layered"}, "User": "0:0"}.items():
             assert config["config"][key] == expected, (key, config["config"].get(key))
         tree = snapshot(dest)
+        rich_size(name, output, tree)
         selected = {k: v for k, v in tree.items() if k == "." or k.startswith("probe")}
         trees.append(selected)
         assert "probe/deleted" not in tree and "probe/to-file/child" not in tree
@@ -263,6 +385,7 @@ def main():
     bypass_root = a.evidence / "corrupt-cache-bypass-replay"
     replay(bypass, bypass_root)
     bypass_snapshot = snapshot(bypass_root)
+    rich_size("corrupt-cache-bypass", bypass, bypass_snapshot)
     assert {k: v for k, v in bypass_snapshot.items() if k == "." or k.startswith("probe")} == trees[0]
     inherited_file = dockerfile + "FROM parent\nENV INHERITED=yes\n"
     parent, _ = build("parent-target", "layered", inherited_file, ["--target", "parent"])
@@ -270,7 +393,6 @@ def main():
     child_manifest, child_config = preserved(child, parent)
     assert "INHERITED=yes" in child_config["config"]["Env"]
     for desc in child_manifest["layers"][len(load(parent)[0]["layers"]):]:
-        import gzip
         data = verified(child, desc)
         if desc["mediaType"].endswith("+gzip"):
             data = gzip.decompress(data)
@@ -297,7 +419,14 @@ def main():
     edited, _ = build("app-edit", "layered", dockerfile)
     edited_manifest, _ = preserved(edited)
     assert edited_manifest["layers"][-1]["digest"] != first_manifest["layers"][-1]["digest"]
-    assert edited_manifest["layers"][-1]["size"] < 128 * 1024, "tiny app edit exported the base"
+    edited_root = a.evidence / "app-edit-replay"
+    replay(edited, edited_root)
+    edited_tree = snapshot(edited_root)
+    assert edited_tree["probe/app"]["sha256"] == hashlib.sha256(b"application-v2\n").hexdigest()
+    expected_edit = {path: dict(item) for path, item in trees[0].items()}
+    expected_edit["probe/app"]["sha256"] = hashlib.sha256(b"application-v2\n").hexdigest()
+    assert {k: v for k, v in edited_tree.items() if k == "." or k.startswith("probe")} == expected_edit
+    rich_size("app-edit", edited, edited_tree)
     build("budget", "layered", dockerfile, ["--max-layer-bytes", "1024"], expect=False)
     build("metadata-budget", "layered", dockerfile, ["--metadata-budget", "128"], expect=False)
     # Corrupt a private base only; the original offline Alpine remains untouched.

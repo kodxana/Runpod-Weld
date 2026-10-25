@@ -84,7 +84,36 @@ no-cache bypass, both cache namespace versions, explicit expected content/modes/
 owners/timestamps/config, budgets, RUN cancellation, and same-size corruption of
 accessed original-base and populated-checkpoint paths. Cache corruption targets
 all cached non-base layer inodes, not an arbitrary entry; originals are restored
-in `finally`. These candidate/Docker checks remain unexecuted until frozen handoff.
+in `finally`. Run these candidate/Docker checks only against a frozen handoff.
+
+The unchanged 128 KiB app-edit budget applies to a separate real managed
+`FROM fixture; COPY app /probe/app` workload: cold, unchanged warm, edited app,
+and no-cache. Every case verifies base descriptors/diff IDs/bytes/history and
+config, exact app contents, and exactly three delta paths (`.`, `probe`,
+`probe/app`). The full unchanged tree, including explicit root metadata, must
+remain equal to a fresh base replay. COPY changes `probe` directory times and
+sets app times; these are compared exactly with the retained build filesystem,
+not normalized across independently executed builds. Cold/warm full snapshots
+must match. Warm does not rewrite its input and must hit the COPY checkpoint.
+
+The rich RUN workload retains its exact metadata/content assertions, cache and
+failure coverage. It records actual delta bytes in `delta-sizes.json` and checks
+a separate accounted bound: original sizes of the independently identified RUN
+inputs (BusyBox, musl loader, passwd), literal fixture payload lengths once per
+emitted inode, plus 4 KiB per allowed entry for tar/PAX/padding and 10 KiB for the
+end record. An explicit path allowlist rejects unrelated base files; emitted
+existing nondirectories must actually differ from the base snapshot and unchanged
+directories must be required ancestors. RUN inputs must retain every field except
+their access time. This check diagnoses atime changes; it does not exclude atime
+from existing exact replay or rich fixture comparisons.
+
+Exact atime can legitimately make RUN recopy unchanged executables and their ELF
+loader. A real `COPY` versus `COPY; RUN true` acceptance control requires identical
+binary contents/other metadata, changed atimes and full binary payloads only in
+the RUN delta. The exported cumulative baseline is FROM, not the previous app
+build. There is no generic claim that app edits followed by RUN fit under 128 KiB.
+The previous rich app-edit failure (1,515,008 bytes versus 128 KiB) remains in the
+preserved diagnostic evidence; this correction separates the two contracts.
 
 CLI cancellation is synchronized to a marker inside RUN. It does **not** prove
 cancellation during serialization or publication. No deterministic export-phase
