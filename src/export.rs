@@ -19,10 +19,160 @@ use std::{fmt, io, path::Path};
 /// counts path/link bytes, PAX records, headers and serialized OCI JSON in total.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
+    /// Also caps total unique regular-file bytes hashed per inventory in layered
+    /// mode. Base blobs use the image limits supplied to Baseline::capture.
     pub max_layer_bytes: u64,
     /// Logical filesystem entries, including the root directory; not tar headers.
     pub max_entries: usize,
     pub max_metadata_bytes: u64,
+}
+
+/// Aggregate bounds for the temporary verified base replay (uncompressed tar
+/// bytes and archive entries, summed across all layers).
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayLimits {
+    pub max_bytes: u64,
+    pub max_entries: usize,
+}
+
+/// Immutable fingerprints of a just-replayed base. The caller attests that the
+/// root is the replay of the selected layout, with stable exclusive ownership.
+/// In particular, symlink targets come from a private verified replay: matching
+/// stat metadata cannot independently prove the caller's symlink target bytes.
+pub struct Baseline {
+    #[cfg(target_os = "linux")]
+    state: linux::delta::State,
+}
+impl Baseline {
+    /// Capture BEFORE any build instruction. `workspace` is an owned canonical
+    /// directory for a bounded temporary replay, removed on return. Keep the
+    /// original layout immutable and available until the final delta export.
+    /// Directory reads use O_NOATIME; real baseline symlinks are never read.
+    /// Capture replays and scans the base once in workspace, then fingerprints
+    /// the real root. This uses transient disk for a full base replay, plus one
+    /// verified-layer spool, and requires permissions to replay its metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture(
+        root: &Path,
+        layout: &Path,
+        reference: Option<&str>,
+        workspace: &Path,
+        limits: Limits,
+        image_limits: crate::image::Limits,
+        layer_limits: crate::layer::Limits,
+        replay_limits: ReplayLimits,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::delta::capture(
+                root,
+                layout,
+                reference,
+                workspace,
+                limits,
+                image_limits,
+                layer_limits,
+                replay_limits,
+                &cancelled,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                root,
+                layout,
+                reference,
+                workspace,
+                limits,
+                image_limits,
+                layer_limits,
+                replay_limits,
+                cancelled,
+            );
+            Err(Error::Invalid("export requires Linux"))
+        }
+    }
+    /// Capture an empty, newly created scratch root, including its metadata.
+    pub fn scratch(
+        root: &Path,
+        limits: Limits,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::delta::scratch(root, limits, &cancelled)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root, limits, cancelled);
+            Err(Error::Invalid("export requires Linux"))
+        }
+    }
+}
+
+/// Export original base blobs plus one cumulative filesystem delta. The source
+/// ownership, destination, cancellation and failure contracts of export_layout
+/// apply. Symlink target reads may update live source atime; archived metadata
+/// is captured first, including all hardlink aliases. Callers continuing a build
+/// must replay this snapshot, as for flattened export. No timestamp restoration
+/// is performed (it would change ctime). Root metadata is always emitted.
+/// Base history is preserved and extended when present; absent history on a
+/// nonempty base stays absent rather than inventing historical entries. Base
+/// blobs are verified and hardlinked; only cross-device links use verified copy.
+pub fn export_delta_layout(
+    root: &Path,
+    destination: &Path,
+    config: &Value,
+    baseline: &Baseline,
+    limits: Limits,
+    cancelled: impl Fn() -> bool,
+) -> Result<Descriptor, Error> {
+    export_delta_layout_created(
+        root,
+        destination,
+        config,
+        baseline,
+        limits,
+        cancelled,
+        || Ok(()),
+    )
+}
+
+pub(crate) fn export_delta_layout_created(
+    root: &Path,
+    destination: &Path,
+    config: &Value,
+    baseline: &Baseline,
+    limits: Limits,
+    cancelled: impl Fn() -> bool,
+    created: impl FnOnce() -> std::io::Result<()>,
+) -> Result<Descriptor, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::export(
+            root,
+            destination,
+            config,
+            limits,
+            &cancelled,
+            created,
+            Some(baseline),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            root,
+            destination,
+            config,
+            baseline,
+            limits,
+            cancelled,
+            created,
+        );
+        Err(Error::Invalid("export requires Linux"))
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -502,6 +652,9 @@ pub enum Error {
     Io(io::Error),
     Blob(crate::oci::Error),
     Json(serde_json::Error),
+    Image(crate::image::Error),
+    Layer(crate::layer::Error),
+    Replay(crate::rootfs::Error),
     Invalid(&'static str),
     Limit(&'static str),
     Cancelled,
@@ -566,7 +719,7 @@ pub(crate) fn export_layout_created(
 ) -> Result<Descriptor, Error> {
     #[cfg(target_os = "linux")]
     {
-        linux::export(root, destination, config, limits, &cancelled, created)
+        linux::export(root, destination, config, limits, &cancelled, created, None)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -577,6 +730,9 @@ pub(crate) fn export_layout_created(
 
 #[cfg(target_os = "linux")]
 mod linux {
+    pub(super) mod delta {
+        include!("export_delta.rs");
+    }
     use super::*;
     use crate::oci::BlobStore;
     use serde_json::json;
@@ -659,6 +815,7 @@ mod linux {
         remaining_entries: usize,
         remaining_metadata: u64,
         cancelled: &'a C,
+        noatime: bool,
     }
     impl<C: Fn() -> bool> Preflight<'_, C> {
         fn visit(&mut self, path: &Path, depth: usize) -> Result<(), Error> {
@@ -683,8 +840,14 @@ mod linux {
                     return Err(Error::Invalid("source/destination inode alias"));
                 }
                 self.directories.insert(path.to_owned(), m);
-                for entry in fs::read_dir(path)? {
-                    self.visit(&entry?.path(), depth + 1)?;
+                if self.noatime {
+                    for name in delta::names(path, self.cancelled)? {
+                        self.visit(&path.join(name?), depth + 1)?;
+                    }
+                } else {
+                    for entry in fs::read_dir(path)? {
+                        self.visit(&entry?.path(), depth + 1)?;
+                    }
                 }
             }
             Ok(())
@@ -826,6 +989,7 @@ mod linux {
         links: HashMap<(u64, u64), (PathBuf, u64, u64, Metadata)>,
         directories: HashMap<PathBuf, Metadata>,
         cancelled: &'a C,
+        snapshot: Option<&'a delta::Inventory>,
     }
     impl<C: Fn() -> bool> Walk<'_, C> {
         fn entry(&mut self, root: &Path, relative: &Path, depth: usize) -> Result<(), Error> {
@@ -846,9 +1010,17 @@ mod linux {
                 return Err(Error::Invalid("nested mount"));
             }
             let mut m = self
-                .directories
-                .remove(&path)
-                .map_or_else(|| fs::symlink_metadata(&path), Ok)?;
+                .snapshot
+                .and_then(|s| s.entries.get(relative))
+                .map(|e| e.metadata.clone())
+                .map_or_else(
+                    || {
+                        self.directories
+                            .remove(&path)
+                            .map_or_else(|| fs::symlink_metadata(&path), Ok)
+                    },
+                    Ok,
+                )?;
             if let Some((_, _, expected, original)) = self.links.get(&identity(&m)) {
                 if *expected != m.nlink() {
                     return Err(Error::Invalid("hardlink topology changed"));
@@ -868,6 +1040,10 @@ mod linux {
                 return Err(Error::Invalid("reserved OCI whiteout name"));
             }
             let mut pax = xattrs(&path, &mut self.remaining)?;
+            if self.snapshot.is_some() {
+                // Filesystem xattr enumeration order may change after replay.
+                pax.sort();
+            }
             if kind.is_symlink() && (!pax.is_empty() || m.mode() & 0o7777 != 0o777) {
                 return Err(Error::Invalid("unsupported symlink metadata"));
             }
@@ -901,7 +1077,14 @@ mod linux {
                 self.links
                     .insert(identity(&m), (relative.to_owned(), 1, m.nlink(), m.clone()));
                 header.set_entry_type(tar::EntryType::Symlink);
-                link = Some(bounded_link(&path, m.len(), &mut self.remaining)?);
+                link = Some(if let Some(s) = self.snapshot {
+                    s.entries[relative]
+                        .target
+                        .clone()
+                        .ok_or(Error::Invalid("missing symlink target"))?
+                } else {
+                    bounded_link(&path, m.len(), &mut self.remaining)?
+                });
             } else {
                 header.set_entry_type(tar::EntryType::Regular);
                 header.set_size(m.len());
@@ -942,7 +1125,7 @@ mod linux {
             } else {
                 self.tar.append_data(&mut header, name, io::empty())?;
             }
-            if kind.is_dir() {
+            if kind.is_dir() && self.snapshot.is_none() {
                 for child in fs::read_dir(&path)? {
                     check(self.cancelled)?;
                     self.entry(root, &relative.join(child?.file_name()), depth + 1)?;
@@ -1006,6 +1189,7 @@ mod linux {
         limits: Limits,
         c: &impl Fn() -> bool,
         created: impl FnOnce() -> std::io::Result<()>,
+        baseline: Option<&Baseline>,
     ) -> Result<Descriptor, Error> {
         check(c)?;
         canonical_dir(root)?;
@@ -1057,6 +1241,9 @@ mod linux {
         let input = json_bytes(config, &mut remaining)?;
         let mut output: Value = serde_json::from_slice(&input)?;
         drop(input);
+        let plan = baseline
+            .map(|base| delta::plan(root, base, limits, &mut remaining, c))
+            .transpose()?;
         let mut preflight = Preflight {
             forbidden: parent
                 .ancestors()
@@ -1067,6 +1254,7 @@ mod linux {
             remaining_entries: limits.max_entries,
             remaining_metadata: remaining,
             cancelled: c,
+            noatime: baseline.is_some(),
         };
         preflight.visit(root, 0)?;
         remaining = preflight.remaining_metadata;
@@ -1091,9 +1279,32 @@ mod linux {
                 links: HashMap::new(),
                 directories: preflight.directories,
                 cancelled: c,
+                snapshot: plan.as_ref().map(|p| &p.inventory),
             };
             walk.tar.follow_symlinks(false);
-            walk.entry(root, Path::new(""), 0)?;
+            if let Some(plan) = &plan {
+                for path in &plan.whiteouts {
+                    check(c)?;
+                    if walk.entries >= walk.max_entries {
+                        return Err(Error::Limit("entries"));
+                    }
+                    walk.entries += 1;
+                    charge(&mut walk.remaining, path.as_os_str().len() as u64 + 2048)?;
+                    let mut header = tar::Header::new_ustar();
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_size(0);
+                    header.set_mode(0);
+                    header.set_uid(0);
+                    header.set_gid(0);
+                    header.set_mtime(0);
+                    walk.tar.append_data(&mut header, path, io::empty())?;
+                }
+                for path in &plan.changed {
+                    walk.entry(root, path, 0)?;
+                }
+            } else {
+                walk.entry(root, Path::new(""), 0)?;
+            }
             if walk
                 .links
                 .values()
@@ -1107,14 +1318,37 @@ mod linux {
         };
         spool.seek(SeekFrom::Start(0))?;
         store.ingest(&mut spool, &layer, limits.max_layer_bytes, c)?;
-        output["rootfs"] = json!({"type":"layers", "diff_ids":[layer.digest]});
-        output["history"] = json!([{"created_by":"Weld flattened rootfs export", "comment":"Full filesystem snapshot; original layer history replaced."}]);
+        if baseline.is_some() {
+            let diff_id = layer.digest.parse().map_err(Error::Blob)?;
+            crate::layer::verify(
+                &store,
+                &layer,
+                &diff_id,
+                dest,
+                crate::layer::Limits {
+                    max_blob_bytes: limits.max_layer_bytes,
+                    max_uncompressed_bytes: limits.max_layer_bytes,
+                    max_entries: limits.max_entries,
+                    max_metadata_bytes: limits.max_metadata_bytes,
+                    max_gzip_header_bytes: 0,
+                },
+                c,
+            )
+            .map_err(Error::Layer)?;
+        }
+        let layers = if let Some(base) = baseline {
+            delta::inherit(base, &store, &layer, &mut output, &mut remaining, c)?
+        } else {
+            output["rootfs"] = json!({"type":"layers", "diff_ids":[layer.digest]});
+            output["history"] = json!([{"created_by":"Weld flattened rootfs export", "comment":"Full filesystem snapshot; original layer history replaced."}]);
+            vec![layer]
+        };
         let config = blob(&store, CONFIG, &json_bytes(&output, &mut remaining)?, c)?;
         let manifest = blob(
             &store,
             MANIFEST,
             &json_bytes(
-                &json!({"schemaVersion":2,"mediaType":MANIFEST,"config":config,"layers":[layer]}),
+                &json!({"schemaVersion":2,"mediaType":MANIFEST,"config":config,"layers":layers}),
                 &mut remaining,
             )?,
             c,
