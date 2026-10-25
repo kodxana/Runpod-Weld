@@ -117,8 +117,9 @@ mod linux {
     fn inline_copy_expansion_metadata_and_cache_invalidation() {
         let mut p = Project::new();
         let source = "FROM scratch\nARG X=argument\nENV X=environment\nCOPY --chmod=0751 --chown=1234:2345 <<EOF /expanded\n'$X' \"${X}\" \\$X\nEOF\nCOPY <<'EOF' /literal\n$X\nEOF\nCOPY <<EOF /crlf\r\nbytes\r\nEOF\r\n";
-        for serial in 0..2 {
-            let (ok, log, root) = p.build(source, &[]);
+        for serial in 0..3 {
+            let extra: &[&str] = if serial == 2 { &["--no-cache"] } else { &[] };
+            let (ok, log, root) = p.build(source, extra);
             assert!(ok, "{log}");
             assert_eq!(
                 fs::read(root.join("expanded")).unwrap(),

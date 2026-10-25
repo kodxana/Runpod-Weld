@@ -1603,20 +1603,27 @@ fn build_stage(
     } else {
         None
     };
-    check(&cancelled)?;
-    fs::create_dir(&work)?;
-    #[cfg(target_os = "linux")]
-    if let Some(r) = record.as_deref_mut() {
-        r.created(&work, lease.unwrap())?;
+    // Only inline cache validation needs owned source files before replay.
+    // Ordinary cached COPY must reject its budgets before creating any work.
+    let inline_cache_sources = cache_entry.is_some()
+        && steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::Copy {
+                    inline: Some(_),
+                    ..
+                }
+            )
+        });
+    if inline_cache_sources {
+        check(&cancelled)?;
+        fs::create_dir(&work)?;
+        #[cfg(target_os = "linux")]
+        if let Some(r) = record.as_deref_mut() {
+            r.created(&work, lease.unwrap())?;
+        }
+        prepare_inline_sources(&steps, &work, &cancelled)?;
     }
-    let root = work.join("rootfs");
-    let spool = work.join("spool");
-    let state = work.join("state");
-    create_image_root(&root)?;
-    for p in [&spool, &state] {
-        fs::create_dir(p)?;
-    }
-    prepare_inline_sources(&steps, &work, &cancelled)?;
     let mut cache_hit = false;
     if let Some(entry) = &cache_entry
         && crate::build_cache::lookup(entry, lease)?
@@ -1693,6 +1700,22 @@ fn build_stage(
         eprintln!(
             "Note: Weld runs trusted Dockerfiles only; RUN commands can access the Pod's devices and process information."
         );
+    }
+    check(&cancelled)?;
+    if !inline_cache_sources {
+        fs::create_dir(&work)?;
+        #[cfg(target_os = "linux")]
+        if let Some(r) = record.as_deref_mut() {
+            r.created(&work, lease.unwrap())?;
+        }
+        prepare_inline_sources(&steps, &work, &cancelled)?;
+    }
+    let root = work.join("rootfs");
+    let spool = work.join("spool");
+    let state = work.join("state");
+    create_image_root(&root)?;
+    for p in [&spool, &state] {
+        fs::create_dir(p)?;
     }
     if let (Some(m), Some(p)) = (&metadata, &base_path) {
         let store = BlobStore::open(p)?;
