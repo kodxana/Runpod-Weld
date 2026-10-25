@@ -4,6 +4,7 @@
 use std::io::Read;
 use std::os::unix::{fs::MetadataExt, process::CommandExt};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -161,6 +162,94 @@ fn exported_file(layout: &Path, name: &str) -> (Vec<u8>, u32, u64, u64, u64) {
     found.unwrap_or_else(|| panic!("missing exported file {name}"))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ExportedEntry {
+    kind: u8,
+    link: Option<PathBuf>,
+    bytes: Vec<u8>,
+    mode: u32,
+    uid: u64,
+    gid: u64,
+    mtime: u64,
+    pax: BTreeMap<String, Vec<u8>>,
+}
+
+fn inline_export(layout: &Path) -> (BTreeMap<PathBuf, ExportedEntry>, serde_json::Value) {
+    let manifest = manifest(layout);
+    let blob =
+        |digest: &str| fs::read(layout.join("blobs").join(digest.replace(':', "/"))).unwrap();
+    let mut entries = BTreeMap::new();
+    for layer in manifest["layers"].as_array().unwrap() {
+        let bytes = blob(layer["digest"].as_str().unwrap());
+        let input: Box<dyn Read> = if bytes.starts_with(&[0x1f, 0x8b]) {
+            Box::new(flate2::read::GzDecoder::new(&bytes[..]))
+        } else {
+            Box::new(&bytes[..])
+        };
+        for entry in tar::Archive::new(input).entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            let mut observed = ExportedEntry {
+                kind: entry.header().entry_type().as_byte(),
+                link: entry.link_name().unwrap().map(|p| p.into_owned()),
+                bytes: Vec::new(),
+                mode: entry.header().mode().unwrap() & 0o7777,
+                uid: entry.header().uid().unwrap(),
+                gid: entry.header().gid().unwrap(),
+                mtime: entry.header().mtime().unwrap(),
+                pax: BTreeMap::new(),
+            };
+            if let Some(pax) = entry.pax_extensions().unwrap() {
+                for attribute in pax {
+                    let attribute = attribute.unwrap();
+                    observed.pax.insert(
+                        attribute.key().unwrap().to_owned(),
+                        attribute.value_bytes().to_vec(),
+                    );
+                }
+            }
+            entry.read_to_end(&mut observed.bytes).unwrap();
+            if path == Path::new(".") {
+                // Only the generated file promises fixed times. Root metadata otherwise stays checked.
+                observed.mtime = 0;
+                observed.pax.remove("atime");
+                observed.pax.remove("mtime");
+            }
+            assert!(
+                entries.insert(path, observed).is_none(),
+                "unexpected duplicate export path"
+            );
+        }
+    }
+    assert_eq!(
+        entries.keys().cloned().collect::<Vec<_>>(),
+        [PathBuf::from("."), PathBuf::from("file")]
+    );
+    let root = &entries[Path::new(".")];
+    assert_eq!(
+        (root.kind, root.mode, root.uid, root.gid),
+        (b'5', 0o755, 0, 0)
+    );
+    assert!(root.link.is_none() && root.bytes.is_empty());
+    let file = &entries[Path::new("file")];
+    assert_eq!(
+        (file.kind, file.mode, file.uid, file.gid, file.mtime),
+        (b'0', 0o644, 0, 0, 0)
+    );
+    assert!(file.link.is_none());
+    for time in ["atime", "mtime"] {
+        assert_eq!(
+            file.pax.get(time).map(Vec::as_slice),
+            Some(b"0.000000000".as_slice())
+        );
+    }
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&blob(manifest["config"]["digest"].as_str().unwrap())).unwrap();
+    // Layer hashes encode the excluded root timestamps; every other config field must match.
+    config["rootfs"].as_object_mut().unwrap().remove("diff_ids");
+    (entries, config)
+}
+
 fn assert_copy(out: &Path, crlf: bool) {
     for (name, bytes, mode, uid, gid) in [
         (
@@ -232,9 +321,9 @@ fn copy_cache_tracks_body_quoting_args_and_not_ignored_context() {
         success(&r);
         assert!(!cached(&r));
         assert_eq!(
-            manifest(&out)["layers"],
-            manifest(&fresh)["layers"],
-            "inline source metadata must be deterministic"
+            inline_export(&out),
+            inline_export(&fresh),
+            "inline file bytes, metadata and image config must match; only root timestamps are dynamic"
         );
     }
 }
