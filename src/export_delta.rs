@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 // fdopendir owns this O_NOATIME descriptor; one name is allocated at a time.
 pub(super) struct Names(*mut libc::DIR);
@@ -299,7 +299,14 @@ pub(crate) fn capture(
     let metadata =
         crate::image::load_layout(layout, reference, image_limits, c).map_err(Error::Image)?;
     let store = BlobStore::open(layout)?;
+    // Permit implicit parents up to the inventory depth bound, plus temp/root.
+    let cleanup_entries = replay_limits
+        .max_entries
+        .checked_mul(257)
+        .and_then(|n| n.checked_add(2))
+        .ok_or(Error::Limit("cleanup entries"))?;
     let temp = tempfile::tempdir_in(workspace)?;
+    let cleanup_root = pin_directory(temp.path())?;
     let result = (|| {
         let replay = temp.path().join("root");
         fs::create_dir(&replay)?;
@@ -321,7 +328,7 @@ pub(crate) fn capture(
                 .checked_add(layer.size())
                 .ok_or(Error::Limit("replay bytes"))?;
             entries = entries
-                .checked_add(layer.entries().len())
+                .checked_add(layer.physical_header_count())
                 .ok_or(Error::Limit("replay entries"))?;
             crate::rootfs::apply_layer(&replay, &mut layer, c).map_err(Error::Replay)?;
         }
@@ -344,8 +351,124 @@ pub(crate) fn capture(
             },
         })
     })();
-    temp.close()?;
-    result
+    finish_capture(temp, cleanup_root, cleanup_entries, result)
+}
+
+// Only the disposable replay namespace is modified. Pin each directory before
+// chmod, so even mode 000 is removable without following archive symlinks.
+fn pin_directory(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn fd_mount(file: &File) -> io::Result<u64> {
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            &mut stat,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(io::Error::other("cleanup requires mount IDs"));
+    }
+    Ok(stat.stx_mnt_id)
+}
+
+fn make_replay_removable(path: &Path, root: File, mut entries: usize) -> io::Result<()> {
+    fn visit(file: File, depth: usize, mount: u64, entries: &mut usize) -> io::Result<()> {
+        *entries = entries
+            .checked_sub(1)
+            .ok_or_else(|| io::Error::other("cleanup entry limit exceeded"))?;
+        if fd_mount(&file)? != mount {
+            return Err(io::Error::other("cleanup mount crossing refused"));
+        }
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+        if depth > 257 {
+            return Err(io::Error::other("cleanup directory depth exceeded"));
+        }
+        let fd_path = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        // This kernel fd link targets the pinned directory, never a user link.
+        if unsafe { libc::chmod(fd_path.as_ptr(), metadata.mode() | 0o700) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe {
+            libc::openat(
+                file.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let dir = unsafe { libc::fdopendir(fd) };
+        if dir.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error);
+        }
+        for name in Names(dir) {
+            let name = CString::new(name?.as_bytes()).unwrap();
+            let fd = unsafe {
+                libc::openat(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            visit(unsafe { File::from_raw_fd(fd) }, depth + 1, mount, entries)?;
+        }
+        Ok(())
+    }
+    let current = pin_directory(path)?;
+    let mount = fd_mount(&root)?;
+    if identity(&current.metadata()?) != identity(&root.metadata()?) || fd_mount(&current)? != mount
+    {
+        return Err(io::Error::other("cleanup root identity changed"));
+    }
+    visit(root, 0, mount, &mut entries)
+}
+
+fn finish_capture<T>(
+    temp: tempfile::TempDir,
+    root: File,
+    entries: usize,
+    result: Result<T, Error>,
+) -> Result<T, Error> {
+    let path = temp.path().to_owned();
+    let cleanup = match make_replay_removable(&path, root, entries) {
+        Ok(()) => temp.close(),
+        Err(error) => {
+            // Drop must not retry path-based deletion after a safety refusal.
+            let _ = temp.keep();
+            Err(error)
+        }
+    };
+    match cleanup {
+        Ok(()) => result,
+        Err(cleanup) => Err(Error::Cleanup {
+            primary: result.err().map(Box::new),
+            path,
+            cleanup,
+        }),
+    }
 }
 
 pub(crate) fn scratch(
@@ -1208,5 +1331,284 @@ mod tests {
             result.layers.last().unwrap().size,
             baseline.state.inventory.entries.len()
         );
+    }
+
+    #[test]
+    fn aggregate_replay_budget_counts_extension_headers() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let work = temp.path();
+        let root = work.join("root");
+        fs::create_dir(&root).unwrap();
+        let base = work.join("base");
+        export_layout(&root, &base, &config(), LIMITS, || false).unwrap();
+        let mut image = load(&base);
+        let descriptor = image.layers[0].clone();
+        image.config["rootfs"]["diff_ids"] = json!([descriptor.digest, descriptor.digest]);
+        image.config["history"] = json!([{"created_by":"first"},{"created_by":"second"}]);
+        let store = BlobStore::open(&base).unwrap();
+        let config_blob = blob(
+            &store,
+            CONFIG,
+            &serde_json::to_vec(&image.config).unwrap(),
+            &|| false,
+        )
+        .unwrap();
+        image.manifest["config"] = serde_json::to_value(config_blob).unwrap();
+        image.manifest["layers"] = json!([descriptor, descriptor]);
+        let manifest = blob(
+            &store,
+            MANIFEST,
+            &serde_json::to_vec(&image.manifest).unwrap(),
+            &|| false,
+        )
+        .unwrap();
+        fs::write(
+            base.join("index.json"),
+            serde_json::to_vec(
+                &json!({"schemaVersion":2,"mediaType":INDEX,"manifests":[manifest]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let current = work.join("current");
+        replay(&base, &current, work);
+        let result = Baseline::capture(
+            &current,
+            &base,
+            None,
+            work,
+            LIMITS,
+            image_limits(),
+            layer_limits(),
+            ReplayLimits {
+                max_bytes: LIMITS.max_layer_bytes,
+                max_entries: 3,
+            },
+            || false,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Layer(crate::layer::Error::Limit("entry count")))
+        ));
+        Baseline::capture(
+            &current,
+            &base,
+            None,
+            work,
+            LIMITS,
+            image_limits(),
+            layer_limits(),
+            ReplayLimits {
+                max_bytes: LIMITS.max_layer_bytes,
+                max_entries: 4,
+            },
+            || false,
+        )
+        .unwrap();
+        let layer = delta_entries(&base, work);
+        assert_eq!(layer.entries().len(), 1);
+        assert_eq!(layer.physical_header_count(), 2);
+    }
+
+    #[test]
+    fn exact_logical_entry_budget_allows_writer_extensions() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let mut limits = LIMITS;
+        limits.max_entries = 1;
+        let baseline = Baseline::scratch(&root, limits, || false).unwrap();
+        export_delta_layout(
+            &root,
+            &temp.path().join("output"),
+            &config(),
+            &baseline,
+            limits,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            delta_entries(&temp.path().join("output"), temp.path()).physical_header_count(),
+            2
+        );
+        symlink("t".repeat(180), root.join("n".repeat(180))).unwrap();
+        limits.max_entries = 2;
+        let long = temp.path().join("long");
+        export_delta_layout(&root, &long, &config(), &baseline, limits, || false).unwrap();
+        let layer = delta_entries(&long, temp.path());
+        assert_eq!(layer.entries().len(), 2);
+        assert_eq!(layer.physical_header_count(), 6); // root PAX+entry; link PAX+GNU name+GNU target+entry
+        let image = load(&long);
+        let mut bounded = layer_limits();
+        bounded.max_entries = 5;
+        assert!(matches!(
+            crate::layer::verify(
+                &BlobStore::open(&long).unwrap(),
+                &image.layers[0],
+                &image.diff_ids[0],
+                temp.path(),
+                bounded,
+                || false
+            ),
+            Err(crate::layer::Error::Limit("entry count"))
+        ));
+        limits.max_entries = usize::MAX;
+        let overflow = temp.path().join("overflow");
+        assert!(matches!(
+            export_delta_layout(&root, &overflow, &config(), &baseline, limits, || false),
+            Err(Error::Limit("physical header count"))
+        ));
+        assert!(!overflow.exists());
+    }
+
+    #[test]
+    fn whiteouts_still_consume_logical_entry_budget() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let work = temp.path();
+        let root = work.join("root");
+        fs::create_dir(&root).unwrap();
+        for name in ["a", "b"] {
+            fs::write(root.join(name), b"old").unwrap();
+        }
+        let base = work.join("base");
+        export_layout(&root, &base, &config(), LIMITS, || false).unwrap();
+        let baseline = capture(&root, &base, work);
+        for name in ["a", "b"] {
+            fs::remove_file(root.join(name)).unwrap();
+        }
+        let mut limits = LIMITS;
+        limits.max_entries = 2;
+        let output = work.join("output");
+        assert!(matches!(
+            export_delta_layout(&root, &output, &config(), &baseline, limits, || false),
+            Err(Error::Limit("entries"))
+        ));
+        assert!(!output.join("index.json").exists());
+        limits.max_entries = 3;
+        let allowed = work.join("allowed");
+        export_delta_layout(&root, &allowed, &config(), &baseline, limits, || false).unwrap();
+        let layer = delta_entries(&allowed, work);
+        assert_eq!(layer.entries().len(), 3);
+        assert_eq!(layer.physical_header_count(), 4);
+    }
+
+    #[test]
+    fn capture_cleans_readonly_owned_replay_directories() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let work = temp.path();
+        let root = work.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("readonly")).unwrap();
+        fs::write(root.join("readonly/file"), b"file").unwrap();
+        fs::set_permissions(root.join("readonly"), fs::Permissions::from_mode(0o555)).unwrap();
+        let base = work.join("base");
+        export_layout(&root, &base, &config(), LIMITS, || false).unwrap();
+        let workspace = work.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let result = Baseline::capture(
+            &root,
+            &base,
+            None,
+            &workspace,
+            LIMITS,
+            image_limits(),
+            layer_limits(),
+            ReplayLimits {
+                max_bytes: LIMITS.max_layer_bytes,
+                max_entries: LIMITS.max_entries,
+            },
+            || false,
+        );
+        let empty = fs::read_dir(&workspace).unwrap().next().is_none();
+        // Keep the failing reproduction fixture removable too.
+        fn writable(path: &Path) {
+            if fs::symlink_metadata(path).unwrap().is_dir() {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+                for child in fs::read_dir(path).unwrap() {
+                    writable(&child.unwrap().path());
+                }
+            }
+        }
+        writable(work);
+        assert!(result.is_ok(), "capture failed: {:?}", result.err());
+        assert!(empty, "temporary replay was left behind");
+    }
+
+    #[test]
+    fn cleanup_preserves_cancellation_and_never_chmods_symlinks_or_shared_files() {
+        let work = tempfile::tempdir_in("/tmp").unwrap();
+        let external = work.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let shared = external.join("shared");
+        fs::write(&shared, b"external data").unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o555)).unwrap();
+        let temp = tempfile::tempdir_in(work.path()).unwrap();
+        let path = temp.path().to_owned();
+        let pin = pin_directory(&path).unwrap();
+        let nested = path.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::hard_link(&shared, nested.join("shared")).unwrap();
+        symlink(&external, nested.join("external-link")).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = finish_capture::<()>(temp, pin, 10, Err(Error::Cancelled));
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(!path.exists());
+        assert_eq!(fs::metadata(&external).unwrap().mode() & 0o7777, 0o555);
+        assert_eq!(fs::metadata(&shared).unwrap().mode() & 0o7777, 0o444);
+        assert_eq!(fs::read(&shared).unwrap(), b"external data");
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn cleanup_refusals_retain_path_and_primary_error() {
+        let work = tempfile::tempdir_in("/tmp").unwrap();
+        let temp = tempfile::tempdir_in(work.path()).unwrap();
+        let path = temp.path().to_owned();
+        let pin = pin_directory(&path).unwrap();
+        let result = finish_capture::<()>(temp, pin, 0, Err(Error::Cancelled)).unwrap_err();
+        assert!(path.exists());
+        assert!(
+            matches!(&result, Error::Cleanup { path: retained, primary: Some(primary), .. }
+            if retained == &path && matches!(primary.as_ref(), Error::Cancelled))
+        );
+        assert!(
+            std::error::Error::source(&result)
+                .unwrap()
+                .downcast_ref::<Error>()
+                .is_some_and(|e| matches!(e, Error::Cancelled))
+        );
+        fs::remove_dir(&path).unwrap();
+        let temp = tempfile::tempdir_in(work.path()).unwrap();
+        let path = temp.path().to_owned();
+        let pin = pin_directory(&path).unwrap();
+        let original = work.path().join("original");
+        fs::rename(&path, &original).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(matches!(
+            finish_capture::<()>(temp, pin, 10, Err(Error::Invalid("primary"))),
+            Err(Error::Cleanup { .. })
+        ));
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o555);
+        assert!(original.exists());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let temp = tempfile::tempdir_in(work.path()).unwrap();
+        let path = temp.path().to_owned();
+        let pin = pin_directory(&path).unwrap();
+        let mut nested = path.clone();
+        for _ in 0..258 {
+            nested.push("d");
+            fs::create_dir(&nested).unwrap();
+        }
+        let error =
+            finish_capture::<()>(temp, pin, 1000, Err(Error::Limit("primary limit"))).unwrap_err();
+        assert!(
+            matches!(error, Error::Cleanup { primary: Some(primary), cleanup, .. }
+            if matches!(*primary, Error::Limit("primary limit")) && cleanup.to_string().contains("depth"))
+        );
+        assert!(path.exists());
+        fs::remove_dir_all(&path).unwrap();
     }
 }

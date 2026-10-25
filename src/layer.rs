@@ -150,6 +150,7 @@ pub struct VerifiedLayer {
     diff_id: Sha256Digest,
     size: u64,
     entries: Vec<Entry>,
+    physical_header_count: usize,
 }
 impl VerifiedLayer {
     pub fn diff_id(&self) -> &Sha256Digest {
@@ -160,6 +161,11 @@ impl VerifiedLayer {
     }
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+    /// Verified nonzero tar headers, including PAX/GNU extension records.
+    /// Use this count when accumulating the physical max_entries replay budget.
+    pub fn physical_header_count(&self) -> usize {
+        self.physical_header_count
     }
 }
 impl Read for VerifiedLayer {
@@ -283,7 +289,7 @@ fn spool<R: Read>(
         return Err(Error::DiffIdMismatch);
     }
     output.seek(SeekFrom::Start(0))?;
-    let entries = inspect(&mut output, size, limits, cancelled)?;
+    let (entries, physical_header_count) = inspect(&mut output, size, limits, cancelled)?;
     output.seek(SeekFrom::Start(0))?;
     check_cancel(cancelled)?;
     Ok(VerifiedLayer {
@@ -291,6 +297,7 @@ fn spool<R: Read>(
         diff_id: diff_id.clone(),
         size,
         entries,
+        physical_header_count,
     })
 }
 
@@ -568,7 +575,7 @@ fn inspect(
     size: u64,
     limits: Limits,
     cancelled: &impl Fn() -> bool,
-) -> Result<Vec<Entry>, Error> {
+) -> Result<(Vec<Entry>, usize), Error> {
     if size > limits.max_uncompressed_bytes {
         return Err(Error::Limit("uncompressed bytes"));
     }
@@ -819,7 +826,7 @@ fn inspect(
     if zero_blocks < 2 {
         return Err(Error::Invalid("missing two-block tar end marker"));
     }
-    Ok(entries)
+    Ok((entries, headers))
 }
 fn check_padding(file: &mut File, end: u64, next: u64) -> Result<(), Error> {
     file.seek(SeekFrom::Start(end))?;
@@ -1658,7 +1665,7 @@ mod tests {
         let size = next + 1536;
         let mut l = limits();
         l.max_uncompressed_bytes = size;
-        let entries = inspect(&mut file, size, l, &|| false).unwrap();
+        let (entries, _) = inspect(&mut file, size, l, &|| false).unwrap();
         assert_eq!(entries[0].size, length);
         assert_eq!(entries[1].path, b"sentinel");
         assert_eq!(entries[1].data_offset, next + 512);

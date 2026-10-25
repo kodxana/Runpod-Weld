@@ -28,7 +28,7 @@ pub struct Limits {
 }
 
 /// Aggregate bounds for the temporary verified base replay (uncompressed tar
-/// bytes and archive entries, summed across all layers).
+/// bytes and physical nonzero tar headers, including extensions, across layers).
 #[derive(Clone, Copy, Debug)]
 pub struct ReplayLimits {
     pub max_bytes: u64,
@@ -656,6 +656,12 @@ pub enum Error {
     Image(crate::image::Error),
     Layer(crate::layer::Error),
     Replay(crate::rootfs::Error),
+    /// Cleanup failed; the owned path may remain. Preserve any primary failure.
+    Cleanup {
+        primary: Option<Box<Error>>,
+        path: std::path::PathBuf,
+        cleanup: io::Error,
+    },
     Invalid(&'static str),
     Limit(&'static str),
     Cancelled,
@@ -668,7 +674,18 @@ impl fmt::Display for Error {
         )
     }
 }
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cleanup {
+                primary: Some(error),
+                ..
+            } => Some(error.as_ref()),
+            Self::Cleanup { cleanup, .. } => Some(cleanup),
+            _ => None,
+        }
+    }
+}
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         if let Some(cause) = e.get_ref().and_then(|e| e.downcast_ref::<Error>()) {
@@ -1193,6 +1210,16 @@ mod linux {
         baseline: Option<&Baseline>,
     ) -> Result<Descriptor, Error> {
         check(c)?;
+        // Our writer emits at most PAX + GNU long path + GNU long link + entry
+        // for each logical record. Untrusted base replay gets no multiplier.
+        let physical_limit = baseline
+            .map(|_| {
+                limits
+                    .max_entries
+                    .checked_mul(4)
+                    .ok_or(Error::Limit("physical header count"))
+            })
+            .transpose()?;
         canonical_dir(root)?;
         let root_c = CString::new(root.as_os_str().as_bytes()).unwrap();
         let mut fs_info: libc::statfs = unsafe { std::mem::zeroed() };
@@ -1329,7 +1356,7 @@ mod linux {
                 crate::layer::Limits {
                     max_blob_bytes: limits.max_layer_bytes,
                     max_uncompressed_bytes: limits.max_layer_bytes,
-                    max_entries: limits.max_entries,
+                    max_entries: physical_limit.unwrap(),
                     max_metadata_bytes: limits.max_metadata_bytes,
                     max_gzip_header_bytes: 0,
                 },
