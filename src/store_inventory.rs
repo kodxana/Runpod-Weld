@@ -240,7 +240,7 @@ mod linux {
         fs::File,
         io::{self, Read},
         os::{
-            fd::{AsRawFd, FromRawFd},
+            fd::{AsRawFd, FromRawFd, IntoRawFd},
             unix::{
                 ffi::{OsStrExt, OsStringExt},
                 fs::MetadataExt,
@@ -367,11 +367,14 @@ mod linux {
         }
         fn names(&mut self, dir: &File, path: &Path) -> Vec<OsString> {
             let mut names = Vec::new();
-            let fd = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-            if fd < 0 {
-                self.issue(path, "directory_read_failed");
-                return names;
-            }
+            // dup shares the directory cursor: validation and usage need independent scans.
+            let fd = match open(dir.as_raw_fd(), Path::new("."), true, false) {
+                Ok(f) => f.into_raw_fd(),
+                Err(_) => {
+                    self.issue(path, "directory_read_failed");
+                    return names;
+                }
+            };
             let stream = unsafe { libc::fdopendir(fd) };
             if stream.is_null() {
                 unsafe {
@@ -730,7 +733,10 @@ mod linux {
                                 }
                             }
                             count(&mut self.out.usage, &mut self.seen, &m);
-                            if path.starts_with("cache-v1") || path.starts_with("base-cache-v1") {
+                            if path.starts_with("cache-v1")
+                                || path.starts_with("cache-v2")
+                                || path.starts_with("base-cache-v1")
+                            {
                                 count(&mut self.out.cache_usage, &mut self.cache_seen, &m);
                             } else {
                                 count(&mut self.out.builds_usage, &mut self.builds_seen, &m);
@@ -745,6 +751,276 @@ mod linux {
                     self.issue(&p, "symlink_or_special_file_skipped");
                 }
             }
+        }
+        // Provenance census only: no payload hashing, lease acquisition or repair.
+        // A valid census is not proof of OCI closure or deletion eligibility.
+        fn shared_cache(&mut self, root: &File) {
+            use crate::build_record::{Identity, identity};
+            use std::collections::HashMap;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Namespace {
+                version: u32,
+                store: Identity,
+                root: Identity,
+                entries: Identity,
+                content: Identity,
+                blobs: Identity,
+                sha256: Identity,
+                objects: Identity,
+                lock: Identity,
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Object {
+                version: u32,
+                namespace: Identity,
+                directory: Identity,
+                inode: Identity,
+                digest: String,
+                size: u64,
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Alias {
+                version: u32,
+                store: Identity,
+                namespace: Identity,
+                directory: Identity,
+                key: String,
+                manifest: String,
+                receipt: String,
+                instructions: usize,
+            }
+            fn need(ok: bool) -> io::Result<()> {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("cache provenance unknown"))
+                }
+            }
+            let path = Path::new("cache-v2");
+            let start = self.out.stages.len();
+            let result = (|| -> io::Result<()> {
+                need(self.limits.max_depth >= 7 && !self.stop())?;
+                let dir = open(root.as_raw_fd(), path, true, false)?;
+                owned_dir(&dir)?;
+                let ns: Namespace = self
+                    .record(
+                        &dir,
+                        Path::new("weld-cache-owner.json"),
+                        &path.join("weld-cache-owner.json"),
+                    )
+                    .ok_or_else(|| io::Error::other("namespace"))?;
+                need(
+                    ns.version == 2
+                        && ns.store == identity(&root.metadata()?)
+                        && ns.root == identity(&dir.metadata()?),
+                )?;
+                self.exact(
+                    &dir,
+                    path,
+                    &[
+                        "weld-cache-owner.json",
+                        "entries",
+                        "content",
+                        "objects",
+                        "publication.lock",
+                    ],
+                )?;
+                for (name, expected) in [
+                    ("entries", ns.entries),
+                    ("content", ns.content),
+                    ("content/blobs", ns.blobs),
+                    ("content/blobs/sha256", ns.sha256),
+                    ("objects", ns.objects),
+                ] {
+                    let d = open(dir.as_raw_fd(), Path::new(name), true, false)?;
+                    owned_dir(&d)?;
+                    need(identity(&d.metadata()?) == expected)?;
+                }
+                let lock = open(dir.as_raw_fd(), Path::new("publication.lock"), false, false)?
+                    .metadata()?;
+                need(
+                    lock.is_file()
+                        && lock.nlink() == 1
+                        && lock.uid() == unsafe { libc::geteuid() }
+                        && lock.mode() & 0o077 == 0
+                        && identity(&lock) == ns.lock,
+                )?;
+                for (name, expected) in [("content", "blobs"), ("content/blobs", "sha256")] {
+                    let d = open(dir.as_raw_fd(), Path::new(name), true, false)?;
+                    self.exact(&d, &path.join(name), &[expected])?;
+                }
+                let objects = open(dir.as_raw_fd(), Path::new("objects"), true, false)?;
+                let mut blobs = HashMap::new();
+                let mut inodes = HashSet::new();
+                for name in self.names(&objects, &path.join("objects")) {
+                    need(!self.stop())?;
+                    let digest = name
+                        .to_str()
+                        .filter(|s| hex(s))
+                        .ok_or_else(|| io::Error::other("unknown object"))?;
+                    let p = path.join("objects").join(&name);
+                    let object = open(objects.as_raw_fd(), Path::new(&name), true, false)?;
+                    owned_dir(&object)?;
+                    let owner: Object = self
+                        .record(
+                            &object,
+                            Path::new("weld-cache-blob.json"),
+                            &p.join("weld-cache-blob.json"),
+                        )
+                        .ok_or_else(|| io::Error::other("object"))?;
+                    need(
+                        owner.version == 1
+                            && owner.namespace == ns.root
+                            && owner.directory == identity(&object.metadata()?)
+                            && owner.digest == format!("sha256:{digest}"),
+                    )?;
+                    self.exact(&object, &p, &["weld-cache-blob.json", "blobs"])?;
+                    let b = open(object.as_raw_fd(), Path::new("blobs"), true, false)?;
+                    owned_dir(&b)?;
+                    self.exact(&b, &p.join("blobs"), &["sha256"])?;
+                    let sha = open(b.as_raw_fd(), Path::new("sha256"), true, false)?;
+                    owned_dir(&sha)?;
+                    self.exact(&sha, &p.join("blobs/sha256"), &[digest])?;
+                    let m = Self::cache_blob(&sha, Path::new(digest))?;
+                    need(
+                        identity(&m) == owner.inode
+                            && m.len() == owner.size
+                            && inodes.insert((m.dev(), m.ino())),
+                    )?;
+                    blobs.insert(digest.to_owned(), (owner.inode, m.len(), m.nlink(), 1u64));
+                }
+                let pool = open(
+                    dir.as_raw_fd(),
+                    Path::new("content/blobs/sha256"),
+                    true,
+                    false,
+                )?;
+                let mut pooled = HashSet::new();
+                for name in self.names(&pool, &path.join("content/blobs/sha256")) {
+                    need(!self.stop())?;
+                    let digest = name
+                        .to_str()
+                        .filter(|s| hex(s))
+                        .ok_or_else(|| io::Error::other("unknown pool"))?;
+                    let m = Self::cache_blob(&pool, Path::new(&name))?;
+                    let b = blobs
+                        .get_mut(digest)
+                        .ok_or_else(|| io::Error::other("unproven pool"))?;
+                    need(identity(&m) == b.0 && m.len() == b.1 && m.nlink() == b.2)?;
+                    b.3 += 1;
+                    pooled.insert(digest.to_owned());
+                }
+                let entries = open(dir.as_raw_fd(), Path::new("entries"), true, false)?;
+                for name in self.names(&entries, &path.join("entries")) {
+                    need(!self.stop())?;
+                    let key = name
+                        .to_str()
+                        .filter(|s| hex(s))
+                        .ok_or_else(|| io::Error::other("incomplete publication"))?;
+                    let p = path.join("entries").join(&name);
+                    let d = open(entries.as_raw_fd(), Path::new(&name), true, false)?;
+                    owned_dir(&d)?;
+                    let alias: Alias = self
+                        .record(
+                            &d,
+                            Path::new("weld-cache-entry.json"),
+                            &p.join("weld-cache-entry.json"),
+                        )
+                        .ok_or_else(|| io::Error::other("entry"))?;
+                    need(
+                        alias.version == 1
+                            && alias.store == ns.store
+                            && alias.namespace == ns.root
+                            && alias.directory == identity(&d.metadata()?)
+                            && alias.key == key
+                            && alias.manifest.strip_prefix("sha256:").is_some_and(hex)
+                            && hex(&alias.receipt)
+                            && alias.instructions <= self.limits.max_entries,
+                    )?;
+                    self.exact(
+                        &d,
+                        &p,
+                        &[
+                            "weld-cache-entry.json",
+                            "weld-copy-targets.json",
+                            "oci-layout",
+                            "index.json",
+                            "blobs",
+                        ],
+                    )?;
+                    // Parse bounded metadata, but deliberately retain Unknown until a
+                    // shared validator can prove descriptor/receipt closure as well.
+                    for name in ["weld-copy-targets.json", "oci-layout", "index.json"] {
+                        let _: serde_json::Value = self
+                            .record(&d, Path::new(name), &p.join(name))
+                            .ok_or_else(|| io::Error::other("entry metadata"))?;
+                    }
+                    let b = open(d.as_raw_fd(), Path::new("blobs"), true, false)?;
+                    owned_dir(&b)?;
+                    self.exact(&b, &p.join("blobs"), &["sha256"])?;
+                    let sha = open(b.as_raw_fd(), Path::new("sha256"), true, false)?;
+                    owned_dir(&sha)?;
+                    for name in self.names(&sha, &p.join("blobs/sha256")) {
+                        need(!self.stop())?;
+                        let digest = name
+                            .to_str()
+                            .filter(|s| hex(s))
+                            .ok_or_else(|| io::Error::other("unknown alias"))?;
+                        let m = Self::cache_blob(&sha, Path::new(&name))?;
+                        let b = blobs
+                            .get_mut(digest)
+                            .ok_or_else(|| io::Error::other("unproven alias"))?;
+                        need(
+                            pooled.contains(digest)
+                                && identity(&m) == b.0
+                                && m.len() == b.1
+                                && m.nlink() == b.2,
+                        )?;
+                        b.3 += 1;
+                    }
+                    self.out
+                        .stages
+                        .push(entry(p, Status::Unknown, Ownership::Managed));
+                }
+                need(blobs.values().all(|b| b.2 == b.3) && !self.stop() && self.out.scan_complete)?;
+                self.usage(&dir, path, 1);
+                need(!self.stop() && self.out.scan_complete)?;
+                Ok(())
+            })();
+            if result.is_err() {
+                for entry in &mut self.out.stages[start..] {
+                    entry.status = Status::Unknown;
+                    entry.ownership = Ownership::Unknown;
+                }
+                self.issue(path, "cache_provenance_incomplete_or_unknown");
+            }
+            self.out.protected_entries.push(entry(
+                path.into(),
+                Status::Unknown,
+                Ownership::Unknown,
+            ));
+        }
+        fn cache_blob(dir: &File, name: &Path) -> io::Result<std::fs::Metadata> {
+            let m = open(dir.as_raw_fd(), name, false, false)?.metadata()?;
+            if !m.is_file() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
+                return Err(io::Error::other("unsafe cache blob"));
+            }
+            Ok(m)
+        }
+        fn exact(&mut self, dir: &File, path: &Path, expected: &[&str]) -> io::Result<()> {
+            let names = self.names(dir, path);
+            if self.stop()
+                || names.len() != expected.len()
+                || names.iter().any(|n| !expected.iter().any(|e| n == *e))
+            {
+                return Err(io::Error::other(
+                    "unknown cache children or incomplete scan",
+                ));
+            }
+            Ok(())
         }
         fn area(&mut self, root: &File, name: &Path) {
             // Classification looks two levels into an OCI layout. A shallower
@@ -903,6 +1179,8 @@ mod linux {
                 scan.tag(&root, p);
             } else if ["base-cache-v1", "cache-v1"].contains(&s) {
                 scan.area(&root, p);
+            } else if s == "cache-v2" {
+                scan.shared_cache(&root);
             } else if s.starts_with("build-") {
                 let mut build = entry(p.into(), Status::LegacyUnknown, Ownership::Unknown);
                 if scan.limits.max_depth >= 2

@@ -505,7 +505,9 @@ mod linux {
         for entry in inventory.generations.iter().chain(&inventory.stages) {
             plan.protect(
                 &entry.path,
-                if entry.status == Status::Current {
+                if entry.path.starts_with("cache-v2") {
+                    "cache_census_only_closure_and_recovery_protocol_required"
+                } else if entry.status == Status::Current {
                     "current_base_generation"
                 } else {
                     "cache_ownership_provenance_unavailable_structural_status_is_not_ownership"
