@@ -29,9 +29,10 @@ with tempfile.TemporaryDirectory(prefix="rpweld-scan-") as directory:
     report = run(b"FROM ubuntu:24.04\nRUN echo " + b"\\" * 3 + b"\nUSER root\n", 0)
     assert report["scan_complete"] is True
     assert not any(d["code"] == "user_excluded" for d in report["diagnostics"])
-    report = run(b"FROM ubuntu:24.04\nRUN <<EOF\nUSER text\nEOF\n", 2)
-    assert report["scan_complete"] is False
-    run(b"# syntax=docker/dockerfile:1\nFROM ubuntu:24.04\n", 2)
+    report = run(b"FROM ubuntu:24.04\nRUN <<EOF\nUSER text\nEOF\n", 0)
+    assert report["scan_complete"] is True
+    run(b"# syntax=docker/dockerfile:1\nFROM ubuntu:24.04\nCMD []\n", 0)
+    run(b"# syntax=docker/dockerfile:1.7\nFROM ubuntu:24.04\n", 2)
     run(b"FROM ubuntu:24.04\nRUN --mount=type=cache echo hello\n", 2)
     assert run(b"x" * 1_048_577, 2) is None
     assert run(b"\xff", 2) is None

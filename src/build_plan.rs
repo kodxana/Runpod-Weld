@@ -12,9 +12,11 @@
 //! result before doing any work. Base image reference grammar and availability
 //! are validated by the evaluator before dependency selection or image lookup.
 //!
-//! Deliberate limits: default backslash escape only, no parser directives,
+//! Deliberate limits: default backslash escape only, only the exact first-line
+//! `# syntax=docker/dockerfile:1` subset declaration (never an external frontend),
 //! complex heredocs, dynamic COPY --from, flags except
-//! FROM --platform, COPY --from/--chmod/--chown and HEALTHCHECK options, legacy ENV/LABEL,
+//! FROM --platform, COPY --from/--chmod/--chown, optional absent RUN secrets and
+//! HEALTHCHECK options, legacy ENV/LABEL,
 //! or other instructions.
 //! Empty continuation lines, repeated trailing escapes and non-ASCII syntax
 //! whitespace are rejected rather than guessed. This is not full Dockerfile.
@@ -87,6 +89,8 @@ pub struct Instruction {
     pub raw_payload: String,
     pub kind: InstructionKind,
     pub heredoc: Option<Heredoc>,
+    /// RUN-only optional secret profile: no secret is supplied or mounted.
+    pub absent_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +359,9 @@ pub fn parse(source: &str) -> Result<BuildPlan> {
         }
         let text = physical.trim_start_matches([' ', '\t']);
         if let Some(comment) = text.strip_prefix('#') {
+            if line == 1 && physical == "# syntax=docker/dockerfile:1" {
+                continue;
+            }
             // Reject directive-shaped comments anywhere, even during continuation.
             if let Some((key, _)) = comment.trim().split_once('=')
                 && matches!(
@@ -505,6 +512,12 @@ fn parse_instruction(
     if payload.is_empty() {
         return error(line, format!("{name} requires a payload"));
     }
+    let raw_payload = payload;
+    let (absent_secret, payload) = if name == "RUN" {
+        optional_secret(payload, line)?
+    } else {
+        (None, payload)
+    };
     let heredoc = heredoc_header(&name, payload, line)?;
     if payload
         .chars()
@@ -752,10 +765,51 @@ fn parse_instruction(
     Ok(Instruction {
         line,
         end_line,
-        raw_payload: payload.into(),
+        raw_payload: raw_payload.into(),
         kind,
         heredoc,
+        absent_secret,
     })
+}
+
+/// Deliberately accepts only an explicitly optional, absent file secret.
+pub(crate) fn optional_secret(payload: &str, line: usize) -> Result<(Option<String>, &str)> {
+    if !payload.starts_with("--") {
+        return Ok((None, payload));
+    }
+    let invalid = "RUN supports only --mount=type=secret,id=<simple-id>,required=false; no secret is supplied";
+    let Some((flag, command)) = payload.split_once([' ', '\t']) else {
+        return error(line, invalid);
+    };
+    let Some(options) = flag.strip_prefix("--mount=") else {
+        return error(line, invalid);
+    };
+    let mut kind = false;
+    let mut required = false;
+    let mut id = None;
+    for option in options.split(',') {
+        match option {
+            "type=secret" if !kind => kind = true,
+            "required=false" if !required => required = true,
+            _ if option.starts_with("id=") && id.is_none() => {
+                let value = &option[3..];
+                if value.is_empty()
+                    || !value
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                {
+                    return error(line, invalid);
+                }
+                id = Some(value.to_owned());
+            }
+            _ => return error(line, invalid),
+        }
+    }
+    let command = command.trim_start_matches([' ', '\t']);
+    if !kind || !required || id.is_none() || command.is_empty() || command.starts_with("--") {
+        return error(line, invalid);
+    }
+    Ok((id, command))
 }
 
 /// Deliberately narrow grammar shared with the policy scanner. Other possible
@@ -1066,7 +1120,7 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
             "FROM ''",
             "FROM --platform=linux/amd64 --platform=linux/amd64 alpine",
             "# escape=`\nFROM alpine",
-            "# syntax=docker/dockerfile:1\nFROM alpine",
+            "# syntax=docker/dockerfile:1.7\nFROM alpine",
             "RUN hi",
             "FROM alpine\nUSER root:group:extra",
             "FROM alpine\nADD a b",

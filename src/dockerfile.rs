@@ -96,6 +96,11 @@ pub fn scan(source: &str) -> Report {
                         continue;
                     }
                     "syntax" => {
+                        if line == 1
+                            && physical.trim_end_matches('\r') == "# syntax=docker/dockerfile:1"
+                        {
+                            continue;
+                        }
                         report.diagnostic(line, "review", "external_frontend",
                             "External syntax frontends are outside the initial planned profile; their syntax is not validated.", None);
                         continue;
@@ -137,21 +142,26 @@ pub fn scan(source: &str) -> Report {
         let name = name.to_ascii_uppercase();
         let mut end_line = line;
         if arguments.contains("<<") {
-            let result =
-                crate::build_plan::heredoc_header(&name, arguments, start).and_then(|doc| {
-                    let mut doc = doc.expect("marker was present");
-                    let end = crate::build_plan::read_heredoc(&mut doc, &mut lines, start)?;
-                    if name == "RUN" && doc.body.starts_with("#!") {
-                        report.diagnostic(
-                            start,
-                            "review",
-                            "unsupported_heredoc",
-                            "Shebang RUN heredocs are unsupported by the builder.",
-                            Some(&name),
-                        );
-                    }
-                    Ok(end)
-                });
+            let result = (if name == "RUN" {
+                crate::build_plan::optional_secret(arguments, start).map(|(_, command)| command)
+            } else {
+                Ok(arguments)
+            })
+            .and_then(|arguments| crate::build_plan::heredoc_header(&name, arguments, start))
+            .and_then(|doc| {
+                let mut doc = doc.expect("marker was present");
+                let end = crate::build_plan::read_heredoc(&mut doc, &mut lines, start)?;
+                if name == "RUN" && doc.body.starts_with("#!") {
+                    report.diagnostic(
+                        start,
+                        "review",
+                        "unsupported_heredoc",
+                        "Shebang RUN heredocs are unsupported by the builder.",
+                        Some(&name),
+                    );
+                }
+                Ok(end)
+            });
             match result {
                 Ok(end) => end_line = end,
                 Err(e) => {
@@ -177,7 +187,7 @@ pub fn scan(source: &str) -> Report {
                     start,
                     "review",
                     "multiple_stages",
-                    "Multi-stage build behavior is not implemented or validated.",
+                    "Stage resolution has not been validated against the supported builder subset.",
                     Some(&name),
                 );
             }
@@ -225,6 +235,50 @@ pub fn scan(source: &str) -> Report {
             None,
         );
     }
+    // Only retire lexical warnings with proof from the bounded builder parser.
+    // Failed parses retain every warning, including dynamic/self/forward COPY.
+    if report.scan_complete
+        && let Ok(plan) = crate::build_plan::parse(source)
+    {
+        use crate::build_plan::{Base, CopySource, InstructionKind};
+        let mut stages = std::collections::BTreeSet::new();
+        let mut copies = std::collections::BTreeSet::new();
+        for (index, stage) in plan.stages.iter().enumerate() {
+            let static_base = match &stage.base {
+                Base::Stage(_) => true,
+                Base::Image(name) => {
+                    !name.contains('$')
+                        && !plan.stages[index..].iter().any(|later| {
+                            later
+                                .name
+                                .as_deref()
+                                .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+                        })
+                }
+            };
+            if static_base {
+                stages.insert(stage.instructions[0].line);
+            }
+            for instruction in &stage.instructions {
+                if matches!(
+                    instruction.kind,
+                    InstructionKind::Copy {
+                        from: Some(CopySource::Stage(_)),
+                        ..
+                    }
+                ) {
+                    copies.insert(instruction.line);
+                }
+            }
+        }
+        report
+            .diagnostics
+            .retain(|diagnostic| match diagnostic.code {
+                "multiple_stages" | "stage_alias" => !stages.contains(&diagnostic.line),
+                "instruction_flags" => !copies.contains(&diagnostic.line),
+                _ => true,
+            });
+    }
     report.policy_status = if report.diagnostics.iter().any(|d| d.severity == "error") {
         "excluded_or_invalid"
     } else if !report.diagnostics.is_empty() || !report.scan_complete {
@@ -241,6 +295,18 @@ fn split_instruction(text: &str) -> (&str, &str) {
 }
 
 fn inspect(report: &mut Report, line: usize, name: &str, arguments: &str) {
+    let arguments = if name == "RUN" && arguments.starts_with("--") {
+        match crate::build_plan::optional_secret(arguments, line) {
+            Ok((Some(id), command)) => {
+                report.diagnostic(line, "review", "optional_absent_secret",
+                    &format!("No secret supplied for {id}; builder requires /run/secrets/{id} absent and rejects symlinks before RUN or cache reuse."), Some(name));
+                command
+            }
+            _ => arguments,
+        }
+    } else {
+        arguments
+    };
     if matches!(name, "STOPSIGNAL" | "HEALTHCHECK") {
         match crate::build_plan::parse(&format!("FROM scratch\n{name} {arguments}")) {
             Err(error) => report.diagnostic(
@@ -365,9 +431,9 @@ fn inspect(report: &mut Report, line: usize, name: &str, arguments: &str) {
         && arguments.starts_with('[')
     {
         match serde_json::from_str::<Vec<String>>(arguments) {
-            Ok(values) if !values.is_empty() => json_args = Some(values),
+            Ok(values) if !values.is_empty() || matches!(name, "CMD" | "ENTRYPOINT") => json_args = Some(values),
             _ => report.diagnostic(line, "error", "invalid_json_form",
-                "JSON form must be a nonempty array of strings; full instruction arity is not checked.", Some(name)),
+                "JSON form must be an array of strings (empty only for CMD/ENTRYPOINT); full instruction arity is not checked.", Some(name)),
         }
     } else if name == "SHELL" {
         report.diagnostic(
@@ -465,7 +531,7 @@ mod tests {
     #[test]
     fn backtick_directive_and_external_frontend() {
         let report = scan(
-            "# syntax=docker/dockerfile:1\n# escape=`\nFROM alpine\nRUN echo `\nUSER root\nUSER app\n",
+            "# syntax=custom/frontend:1\n# escape=`\nFROM alpine\nRUN echo `\nUSER root\nUSER app\n",
         );
         assert!(has(&report, "external_frontend", 1));
         assert!(

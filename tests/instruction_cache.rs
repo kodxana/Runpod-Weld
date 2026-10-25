@@ -23,6 +23,68 @@ struct Build {
     image: PathBuf,
 }
 
+#[test]
+#[ignore = "requires Linux root and RPWELD_TEST_LAYOUT (local Alpine OCI)"]
+fn optional_secret_absence_runs_offline_and_reuses_guarded_checkpoints() {
+    let mut p = Project::new("python");
+    let source = "# syntax=docker/dockerfile:1\nFROM alpine\nSHELL [\"/bin/sh\",\"-eu\",\"-c\"]\nUSER 0:0\nRUN --mount=type=secret,id=HF_TOKEN,required=false <<EOF\nif [ -e /run/secrets/HF_TOKEN ]; then exit 81; fi\nprintf '%s%s\\n' IC_EXEC_ ABSENT\nprintf public > /result\nEOF\nCMD []\n";
+    p.write("Dockerfile", source);
+    let cold = p.build(&[]);
+    cold.ok();
+    assert!(cold.executed("ABSENT"));
+    assert!(cold.log.contains("no secret supplied"));
+    assert_eq!(cold.read("result"), b"public");
+    let hit = p.build(&[]);
+    hit.ok();
+    hit.cached(4, "RUN");
+    assert!(hit.log.contains("verified absent"));
+    assert!(!hit.executed("ABSENT"));
+    assert_eq!(hit.read("result"), b"public");
+    p.write(
+        "Dockerfile",
+        &source.replace("id=HF_TOKEN", "id=other-token"),
+    );
+    let changed_id = p.build(&[]);
+    changed_id.ok();
+    assert!(
+        changed_id.executed("ABSENT"),
+        "ID must change cache identity"
+    );
+    let uncached = p.build(&["--no-cache"]);
+    uncached.ok();
+    assert!(uncached.executed("ABSENT"));
+}
+
+#[test]
+#[ignore = "requires Linux root and RPWELD_TEST_LAYOUT (local Alpine OCI)"]
+fn optional_secret_rejects_inherited_files_and_symlinks_after_cached_prefix() {
+    for setup in [
+        "mkdir -p /run/secrets; printf canary > /run/secrets/HF_TOKEN",
+        "mkdir -p /run/secrets; ln -s /outside-canary /run/secrets/HF_TOKEN",
+        "mkdir -p /run; ln -s /missing /run/secrets",
+        "mkdir -p /run; printf canary > /run/secrets",
+    ] {
+        let mut p = Project::new("python");
+        // Populate a reusable stage with the inherited path. The protected stage
+        // must reject both cold execution and reuse of this populated base.
+        let source = format!(
+            "FROM alpine AS inherited\nRUN {setup}\nFROM inherited\nRUN --mount=type=secret,id=HF_TOKEN,required=false printf '%s%s\\n' IC_EXEC_ BAD\n"
+        );
+        p.write("Dockerfile", &source);
+        for args in [vec!["--no-cache"], vec![], vec![]] {
+            let result = p.build(&args);
+            assert!(!result.success, "{}", result.log);
+            assert!(
+                result.log.contains("optional absent secret HF_TOKEN"),
+                "setup={setup}; args={args:?}\n{}",
+                result.log
+            );
+            assert!(!result.executed("BAD"));
+            assert!(!result.image.exists());
+        }
+    }
+}
+
 impl Build {
     fn ok(&self) {
         assert!(self.success, "{}", self.log);

@@ -139,6 +139,7 @@ enum Step {
         workdir: String,
         env: Vec<String>,
         user: String,
+        absent_secret: Option<String>,
     },
 }
 
@@ -148,6 +149,60 @@ struct Checkpoint {
     operation: &'static str,
     config: Value,
     args: BTreeMap<String, String>,
+}
+
+/// Verify absence without reading data, following links, or modifying the image.
+/// Like the rest of the builder this requires an exclusively owned, stable tree.
+#[cfg(target_os = "linux")]
+fn validate_absent_secret(root: &Path, id: &str) -> Result<()> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::fs::OpenOptionsExt,
+    };
+    #[repr(C)]
+    struct How {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let root = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?;
+    let path = std::ffi::CString::new(format!("run/secrets/{id}"))?;
+    let how = How {
+        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        // NO_XDEV | NO_MAGICLINKS | NO_SYMLINKS | BENEATH. Even dangling
+        // symlinks reject; only ENOENT proves this profile's absence.
+        resolve: 1 | 2 | 4 | 8,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<How>(),
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(format!(
+            "optional absent secret {id}: cannot prove /run/secrets/{id} absent: {error}"
+        )
+        .into());
+    }
+    drop(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+    Err(format!("optional absent secret {id}: /run/secrets/{id} exists; refusing inherited secret path (no secret supplied)").into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_absent_secret(_root: &Path, _id: &str) -> Result<()> {
+    Err("optional absent secret validation requires Linux".into())
 }
 
 // The stage directory is newly created and leased before this function. Source
@@ -881,6 +936,7 @@ fn preflight_checkpoints(
                 charge = charge
                     .checked_add(
                         command.len()
+                            + i.absent_secret.as_ref().map_or(0, String::len)
                             + wd.len()
                             + user.len()
                             + entries.iter().map(String::len).sum::<usize>(),
@@ -891,6 +947,7 @@ fn preflight_checkpoints(
                     workdir: wd.clone(),
                     env: entries,
                     user: user.clone(),
+                    absent_secret: i.absent_secret.clone(),
                 });
             }
         }
@@ -1772,6 +1829,9 @@ fn build_stage(
     }
     let mut cache_hit = false;
     if let Some(entry) = &cache_entry
+        // Whole-stage replay cannot validate an intermediate RUN's input tree.
+        // Keep instruction caching, whose guard runs against each input rootfs.
+        && !steps.iter().any(|s| matches!(s, Step::Run { absent_secret: Some(_), .. }))
         && stage_cache.as_ref().unwrap().lookup(
             entry,
             options.limits,
@@ -1941,6 +2001,18 @@ fn build_stage(
             );
         }
         let instruction_steps = &steps[start..boundary.end];
+        for step in instruction_steps {
+            if let Step::Run {
+                absent_secret: Some(id),
+                ..
+            } = step
+            {
+                validate_absent_secret(&root, id)?;
+                eprintln!(
+                    "Note: optional secret {id}: no secret supplied; /run/secrets/{id} verified absent."
+                );
+            }
+        }
         let mut fingerprint_summary: Option<context::Summary> = None;
         let entry = if let Some(builder) = &builder_identity {
             let mut selected: Vec<u8> = Vec::new();
@@ -2121,7 +2193,11 @@ fn build_stage(
                     workdir,
                     env,
                     user,
+                    absent_secret,
                 } => {
+                    if let Some(id) = absent_secret {
+                        validate_absent_secret(&root, id)?;
+                    }
                     let run_state = state.join(index.to_string());
                     fs::create_dir(&run_state)?;
                     let dns = if options.host_dns {
@@ -2419,6 +2495,33 @@ fn worker(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    #[test]
+    fn absent_secret_guard_never_reads_deletes_or_follows_inherited_paths() {
+        use std::{fs, os::unix::fs::symlink};
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        fs::create_dir(&root).unwrap();
+        super::validate_absent_secret(&root, "HF_TOKEN").unwrap();
+        fs::create_dir_all(root.join("run/secrets")).unwrap();
+        super::validate_absent_secret(&root, "HF_TOKEN").unwrap();
+        let target = root.join("run/secrets/HF_TOKEN");
+        fs::write(&target, b"inherited-canary").unwrap();
+        assert!(super::validate_absent_secret(&root, "HF_TOKEN").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"inherited-canary");
+        fs::remove_file(&target).unwrap();
+        let outside = t.path().join("outside-canary");
+        fs::write(&outside, b"outside-canary").unwrap();
+        for link in [&outside, &t.path().join("missing-canary")] {
+            symlink(link, &target).unwrap();
+            assert!(super::validate_absent_secret(&root, "HF_TOKEN").is_err());
+            assert_eq!(fs::read_link(&target).unwrap(), *link);
+            fs::remove_file(&target).unwrap();
+        }
+        fs::remove_dir(root.join("run/secrets")).unwrap();
+        symlink(t.path(), root.join("run/secrets")).unwrap();
+        assert!(super::validate_absent_secret(&root, "HF_TOKEN").is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside-canary");
+    }
     use super::*;
     #[test]
     fn automatic_platform_globals_and_from_validation() {
@@ -3056,6 +3159,7 @@ mod tests {
                     workdir,
                     env,
                     command,
+                    ..
                 } => Some((user.as_str(), workdir.as_str(), env, command.as_str())),
                 _ => None,
             })

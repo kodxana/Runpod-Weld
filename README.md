@@ -93,6 +93,31 @@ Explicit WORKDIR resolves the current USER when it must create directories, and 
 
 Global ARG values and `--build-arg` overrides can select FROM images before pulls and cache lookup. Redeclare a global ARG inside a stage to use it there. Expansion supports basic `$NAME` and `${NAME}` forms, not shell expressions. Dynamic COPY `--from` and dynamic forward/self stage references remain unsupported. Explicit `--base` bindings use the resolved image reference.
 
+The exact first line `# syntax=docker/dockerfile:1` declares use of Weld's supported
+subset. Weld never downloads or executes a Dockerfile frontend. Other versions,
+custom frontends, repeated/misplaced declarations and other parser directives
+remain rejected by the builder.
+
+`RUN --mount=type=secret,id=HF_TOKEN,required=false command` has a deliberately
+limited **optional absent-secret** profile. No secret is supplied or mounted;
+there is no `--secret` injection or ARG/environment fallback. IDs accept only
+ASCII letters, digits, `_` and `-`. All three options must occur exactly once
+(order is immaterial); other options, required secrets, multiple mounts and
+malformed flags are rejected. The command retains ordinary shell/JSON/heredoc,
+SHELL and USER semantics. Weld reports the absence explicitly and includes the
+profile and ID in cache identity.
+
+Before the RUN and before its instruction-cache lookup, Weld requires
+`/run/secrets/<id>` to be absent in the current image rootfs. Confined Linux
+traversal rejects existing paths, any symlink (including dangling links), mount
+crossings and unresolved errors. It never reads secret contents, removes
+inherited paths or follows a host escape. Whole-stage cache shortcuts are bypassed
+for these stages so the checks run at the correct intermediate filesystem state;
+instruction caches and their cumulative budgets still apply. This is not general
+BuildKit secret-mount emulation: images with inherited secret paths deliberately
+fail, regardless of how Docker handles an omitted optional mount. See the
+[pinned Dockerfile regression and profile tests](tests/fixtures/optional-secret/README.md).
+
 The automatic global args `BUILDPLATFORM`/`TARGETPLATFORM` default to `linux/amd64`,
 `BUILDOS`/`TARGETOS` to `linux`, `BUILDARCH`/`TARGETARCH` to `amd64`, and
 `BUILDVARIANT`/`TARGETVARIANT` to empty strings. These describe the supported Pod
@@ -147,7 +172,7 @@ rpweld scan Dockerfile
 rpweld scan path/to/Dockerfile --json
 ```
 
-The scanner accepts supported static `USER` syntax and reports invalid identities. USER with ARG/ENV expansion requires build-time validation; the scanner does not inspect image account files. It reports physical line numbers and detects features needing review, such as instruction flags, external frontends, remote ADD and multistage syntax. Supported single-body heredocs are consumed without interpreting their contents as Dockerfile instructions; scanning resumes at the next physical instruction. Unsupported or unterminated heredocs stop scanning and mark the remainder uninspected. It does not rewrite Dockerfiles.
+The scanner accepts supported static `USER` syntax and reports invalid identities. USER with ARG/ENV expansion requires build-time validation; the scanner does not inspect image account files. It reports physical line numbers and detects features needing review, such as unsupported instruction flags, external frontends and remote ADD. Static stage declarations and backward stage COPY warnings are cleared only when the complete source passes the supported-subset parser; dynamic, forward, self and external COPY references retain review diagnostics. Supported single-body heredocs are consumed without interpreting their contents as Dockerfile instructions; scanning resumes at the next physical instruction. Unsupported or unterminated heredocs stop scanning and mark the remainder uninspected. It does not rewrite Dockerfiles.
 
 Exit 0 means no known issues were found by these partial static checks. Exit 2 means errors, required review, incomplete scanning, or an input error. Neither outcome establishes build support: the builder is still under development, and base-image configuration and package-manager behavior are not inspected. Inputs must be regular UTF-8 files no larger than 1 MiB.
 
