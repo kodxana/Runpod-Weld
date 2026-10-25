@@ -1,6 +1,6 @@
 //! Bounded local COPY subset. Both roots must be stable, disjoint trees without
 //! concurrent writers; the disposable image must have no external hardlinks.
-//! On ANY error discard the image: copying is not transactional. Linux openat2
+//! On ANY execution error discard the image: copying is not transactional. Linux openat2
 //! is required; nested mounts and magic links are refused. Roots themselves are
 //! trusted caller paths. No host-path destination resolution is performed.
 //!
@@ -64,7 +64,7 @@ pub(crate) fn validate_sources(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::fingerprint;
+pub(crate) use linux::{fingerprint, fingerprint_copy};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -155,6 +155,9 @@ pub(crate) fn validate_copy_budget(
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
+    /// Image symlink traversal cannot be fingerprinted without changing atime.
+    /// No image metadata changed; execute COPY uncached instead.
+    FingerprintUnavailable(&'static str),
     Invalid(&'static str),
     Unsupported(&'static str),
     Limit(&'static str),
@@ -167,6 +170,12 @@ impl From<io::Error> for Error {
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::FingerprintUnavailable(reason) = self {
+            return write!(
+                f,
+                "COPY fingerprint unavailable ({reason}); execute uncached"
+            );
+        }
         write!(f, "local COPY failed ({self:?}); discard partial image")
     }
 }
@@ -344,6 +353,7 @@ mod linux {
     fn resolve_owner(
         image: &File,
         value: &str,
+        fingerprinting: bool,
         c: &impl Fn() -> bool,
     ) -> Result<(u32, u32), Error> {
         validate_chown(value)?;
@@ -351,10 +361,26 @@ mod linux {
             image: &File,
             name: &str,
             group: bool,
+            fingerprinting: bool,
             c: &impl Fn() -> bool,
         ) -> Result<Option<(u32, u32)>, Error> {
             let path: &[u8] = if group { b"etc/group" } else { b"etc/passwd" };
-            let pin = match open(image, path, libc::O_PATH | libc::O_NOFOLLOW, false) {
+            let resolved;
+            let path = if fingerprinting {
+                resolved = match destination_path(image, path, true, c) {
+                    Ok(path) => path,
+                    Err(Error::Io(e))
+                        if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                };
+                resolved.as_slice()
+            } else {
+                path
+            };
+            let pin = match open(image, path, libc::O_PATH | libc::O_NOFOLLOW, fingerprinting) {
                 Ok(pin) => pin,
                 Err(Error::Io(e))
                     if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) =>
@@ -371,7 +397,15 @@ mod linux {
             if !pin.metadata()?.is_file() {
                 return Err(Error::Invalid("COPY account database must be regular"));
             }
-            let mut f = open(image, path, libc::O_RDONLY | libc::O_NONBLOCK, false)?;
+            let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOATIME;
+            // EPERM means we cannot promise restoration of explicit timestamps
+            // either. Fingerprinting fails before reading instead of falling back.
+            let mut f = match open(image, path, flags, false) {
+                Err(Error::Io(e)) if !fingerprinting && e.raw_os_error() == Some(libc::EPERM) => {
+                    open(image, path, flags & !libc::O_NOATIME, false)?
+                }
+                result => result?,
+            };
             let mut data = Vec::new();
             let mut buf = [0; 8192];
             loop {
@@ -409,14 +443,16 @@ mod linux {
         let group = if group == "root" { "0" } else { group };
         let (uid, primary) = match user.parse::<u32>() {
             Ok(id) => (id, id),
-            Err(_) => lookup(image, user, false, c)?.unwrap_or((0, 0)),
+            Err(_) => lookup(image, user, false, fingerprinting, c)?.unwrap_or((0, 0)),
         };
         let gid = if group.is_empty() {
             primary
         } else {
             match group.parse::<u32>() {
                 Ok(id) => id,
-                Err(_) => lookup(image, group, true, c)?.map_or(primary, |ids| ids.0),
+                Err(_) => {
+                    lookup(image, group, true, fingerprinting, c)?.map_or(primary, |ids| ids.0)
+                }
             }
         };
         Ok((uid, gid))
@@ -714,7 +750,7 @@ mod linux {
         if fd < 0 {
             let error = io::Error::last_os_error();
             // O_NOATIME needs ownership or CAP_FOWNER; readable sources must not.
-            if flags & libc::O_NOATIME != 0 && error.raw_os_error() == Some(libc::EPERM) {
+            if source && flags & libc::O_NOATIME != 0 && error.raw_os_error() == Some(libc::EPERM) {
                 return open(root, p.as_bytes(), flags & !libc::O_NOATIME, source);
             }
             return Err(error.into());
@@ -898,6 +934,172 @@ mod linux {
             }
         }
         Ok(hash.finalize().to_vec())
+    }
+
+    /// Fingerprint the source effects of one COPY against its pre-instruction image.
+    /// `Some(policy)` means local COPY (default root ownership); `None` means a
+    /// stage COPY (source ownership). The caller keys the parent image/config and
+    /// options, enforces cumulative receipts, and still checks execution permissions.
+    /// Both trees must remain stable and obey the same confinement contract as COPY.
+    /// Account reads require O_NOATIME permission. Image symlink traversal returns
+    /// FingerprintUnavailable before reading: execute COPY uncached instead.
+    /// Restoring atime would change RUN-observable ctime, so no restoration is used.
+    /// Source atime changes remain legitimate strict-metadata cache misses.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fingerprint_copy(
+        ctx: &Path,
+        image: &Path,
+        sources: &[&str],
+        destination: &str,
+        limits: Limits,
+        policy: Option<&Policy>,
+        options: CopyOptions<'_>,
+        c: &impl Fn() -> bool,
+    ) -> Result<(Vec<u8>, Summary), Error> {
+        use sha2::{Digest, Sha256};
+        fn field(h: &mut Sha256, bytes: &[u8]) {
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        }
+        check(c)?;
+        let ctx = root(ctx)?;
+        let image = root(image)?;
+        let (mut plan, owner) = prepare_copy(
+            &ctx,
+            &image,
+            sources,
+            destination,
+            limits,
+            policy,
+            options,
+            true,
+            c,
+        )?;
+        let mut hash = Sha256::new();
+        field(&mut hash, b"selected-copy-v2");
+        // mkdirs creates ancestors before entries in source order. Any ancestor
+        // never visited as a directory receives these defaults at COPY completion.
+        let mut implicit = std::collections::BTreeSet::new();
+        for e in &plan.entries {
+            let mut parent = split(&e.dst).0;
+            while !parent.is_empty() {
+                check(c)?;
+                match open(&image, parent, libc::O_PATH | libc::O_DIRECTORY, true) {
+                    Ok(_) => break,
+                    Err(err) if missing(&err) => {
+                        implicit.insert(parent.to_vec());
+                    }
+                    Err(err) => return Err(err),
+                }
+                parent = split(parent).0;
+            }
+        }
+        for e in &plan.entries {
+            if e.kind == libc::S_IFDIR {
+                implicit.remove(&e.dst);
+            }
+        }
+        field(&mut hash, &(implicit.len() as u64).to_le_bytes());
+        let (uid, gid) = owner.unwrap_or((0, 0));
+        for parent in implicit {
+            field(&mut hash, &parent);
+            field(&mut hash, &uid.to_le_bytes());
+            field(&mut hash, &gid.to_le_bytes());
+            field(&mut hash, &options.chmod.unwrap_or(0o755).to_le_bytes());
+        }
+        field(&mut hash, destination.as_bytes());
+        field(&mut hash, &(sources.len() as u64).to_le_bytes());
+        for source in sources {
+            field(&mut hash, source.as_bytes());
+        }
+        field(&mut hash, &(plan.entries.len() as u64).to_le_bytes());
+        let mut directories = std::collections::BTreeSet::<Vec<u8>>::new();
+        for e in &mut plan.entries {
+            check(c)?;
+            field(&mut hash, &e.src);
+            field(&mut hash, &e.dst);
+            field(&mut hash, &e.kind.to_le_bytes());
+            // Existing selected roots retain destination metadata. Account for
+            // roots introduced by earlier sources and implicit parent creation too.
+            let mut prefix = e.dst.clone();
+            prefix.push(b'/');
+            let introduced = directories.contains(&e.dst)
+                || directories
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|p| p.starts_with(&prefix));
+            let retained = e.explicit
+                && e.kind == libc::S_IFDIR
+                && (introduced
+                    || match open(&image, &e.dst, libc::O_PATH | libc::O_DIRECTORY, false) {
+                        Ok(_) => true,
+                        Err(err) if missing(&err) => false,
+                        Err(err) => return Err(err),
+                    });
+            // Store only immediate parents; prefix lookup also finds ancestors,
+            // without allocating every ancestor path for each manifest entry.
+            directories.insert(if e.kind == libc::S_IFDIR {
+                e.dst.clone()
+            } else {
+                split(&e.dst).0.to_vec()
+            });
+            field(&mut hash, &[u8::from(retained)]);
+            if retained {
+                // COPY retains mode/owner/xattrs, but always applies the last
+                // selected directory's source timestamps after its children.
+                let m = open(&ctx, &e.src, libc::O_PATH | libc::O_NOFOLLOW, true)?.metadata()?;
+                for time in times(&m) {
+                    field(&mut hash, &time.tv_sec.to_le_bytes());
+                    field(&mut hash, &time.tv_nsec.to_le_bytes());
+                }
+                continue;
+            }
+            // Symlink permission bits are not applied by COPY.
+            if e.kind != libc::S_IFLNK {
+                field(&mut hash, &e.mode.to_le_bytes());
+            }
+            field(&mut hash, &e.uid.to_le_bytes());
+            field(&mut hash, &e.gid.to_le_bytes());
+            field(&mut hash, &e.size.to_le_bytes());
+            field(&mut hash, &e.link);
+            e.attrs.sort_by(|a, b| a.0.cmp(&b.0));
+            field(&mut hash, &(e.attrs.len() as u64).to_le_bytes());
+            for (name, value) in &e.attrs {
+                field(&mut hash, name.as_bytes());
+                field(&mut hash, value);
+            }
+            if e.kind == libc::S_IFREG {
+                let mut f = open(
+                    &ctx,
+                    &e.src,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOATIME,
+                    true,
+                )?;
+                if !f.metadata()?.is_file() {
+                    return Err(Error::Invalid("source changed"));
+                }
+                let mut remaining = e.size;
+                let mut buf = [0; 65536];
+                while remaining > 0 {
+                    check(c)?;
+                    let n = remaining.min(buf.len() as u64) as usize;
+                    f.read_exact(&mut buf[..n])?;
+                    hash.update(&buf[..n]);
+                    remaining -= n as u64;
+                }
+                if f.read(&mut buf[..1])? != 0 {
+                    return Err(Error::Invalid("source grew"));
+                }
+            }
+            // readlink and O_NOATIME's EPERM fallback can update atime. Hash the
+            // metadata the subsequent COPY will observe, never discard timestamps.
+            let m = open(&ctx, &e.src, libc::O_PATH | libc::O_NOFOLLOW, true)?.metadata()?;
+            for time in times(&m) {
+                field(&mut hash, &time.tv_sec.to_le_bytes());
+                field(&mut hash, &time.tv_nsec.to_le_bytes());
+            }
+        }
+        Ok((hash.finalize().to_vec(), plan.used))
     }
 
     pub(super) fn validate_copy_budget(
@@ -1292,7 +1494,12 @@ mod linux {
     }
     // Resolve only the requested destination, including its leaf. Recursive
     // source entries use no-follow leaf replacement instead.
-    fn destination_path(image: &File, p: &[u8], c: &impl Fn() -> bool) -> Result<Vec<u8>, Error> {
+    fn destination_path(
+        image: &File,
+        p: &[u8],
+        fingerprinting: bool,
+        c: &impl Fn() -> bool,
+    ) -> Result<Vec<u8>, Error> {
         let mut pending = p.to_vec();
         let mut resolved = Vec::new();
         let mut links = 0;
@@ -1317,6 +1524,9 @@ mod linux {
             }
             match open(image, &next, libc::O_PATH | libc::O_NOFOLLOW, false) {
                 Ok(f) if f.metadata()?.file_type().is_symlink() => {
+                    if fingerprinting {
+                        return Err(Error::FingerprintUnavailable("image symlink traversal"));
+                    }
                     links += 1;
                     if links > 40 {
                         return Err(Error::Limit("destination symlinks"));
@@ -1388,16 +1598,17 @@ mod linux {
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn copy(
-        ctx: &Path,
-        image: &Path,
+    fn prepare_copy<'a>(
+        ctx: &File,
+        image: &File,
         sources: &[&str],
         destination: &str,
         limits: Limits,
-        policy: Option<&Policy>,
+        policy: Option<&'a Policy>,
         options: CopyOptions<'_>,
+        fingerprinting: bool,
         c: &impl Fn() -> bool,
-    ) -> Result<Summary, Error> {
+    ) -> Result<(Plan<'a>, Option<(u32, u32)>), Error> {
         check(c)?;
         if sources.is_empty() {
             return Err(Error::Invalid("empty sources"));
@@ -1409,17 +1620,15 @@ mod linux {
         if sources.len() > 1 && !destination.ends_with('/') {
             return Err(Error::Invalid("multiple sources require trailing slash"));
         }
-        let ctx = root(ctx)?;
-        let image = root(image)?;
         if options.chmod.is_some_and(|m| m > 0o7777) {
             return Err(Error::Invalid("COPY chmod exceeds 7777"));
         }
         let owner = options
             .chown
-            .map(|v| resolve_owner(&image, v, c))
+            .map(|v| resolve_owner(image, v, fingerprinting, c))
             .transpose()?;
-        let dst = destination_path(&image, &dst, c)?;
-        let dest_dir = match open(&image, &dst, libc::O_PATH, false) {
+        let dst = destination_path(image, &dst, fingerprinting, c)?;
+        let dest_dir = match open(image, &dst, libc::O_PATH, false) {
             Ok(f) => f.metadata()?.is_dir(),
             Err(e) if missing(&e) => false,
             Err(e) => return Err(e),
@@ -1432,17 +1641,20 @@ mod linux {
             used: Summary::default(),
             limits,
         };
-        let selected = select(&ctx, sources, &mut plan, c)?;
+        let selected = select(ctx, sources, &mut plan, c)?;
         for src in selected {
             check(c)?;
-            let m = open(&ctx, &src, libc::O_PATH | libc::O_NOFOLLOW, true)?.metadata()?;
+            let m = open(ctx, &src, libc::O_PATH | libc::O_NOFOLLOW, true)?.metadata()?;
             let target = if !m.is_dir() && (dest_dir || destination.ends_with('/')) {
                 join(&dst, split(&src).1)?
             } else {
                 dst.clone()
             };
             plan.used.targets.push(target.clone());
-            plan.visit(&ctx, src, target, true, 0, c)?;
+            let start = plan.entries.len();
+            plan.visit(ctx, src, target, true, 0, c)?;
+            // Canonical native-byte order within each source, preserving source overwrites.
+            plan.entries[start..].sort_by(|a, b| a.src.cmp(&b.src));
         }
         for e in &mut plan.entries {
             if let Some(mode) = options.chmod {
@@ -1464,9 +1676,14 @@ mod linux {
             check(c)?;
             let mut ancestor = split(&e.dst).0;
             loop {
-                match open(&image, ancestor, libc::O_PATH | libc::O_DIRECTORY, false) {
+                match open(
+                    image,
+                    ancestor,
+                    libc::O_PATH | libc::O_DIRECTORY,
+                    fingerprinting,
+                ) {
                     Ok(_) => {
-                        attrs(&image, ancestor, false, c)?;
+                        attrs(image, ancestor, false, c)?;
                     }
                     Err(e) if missing(&e) => (),
                     Err(e) => return Err(e),
@@ -1476,9 +1693,9 @@ mod linux {
                 }
                 ancestor = split(ancestor).0;
             }
-            match open(&image, &e.dst, libc::O_PATH | libc::O_NOFOLLOW, false) {
+            match open(image, &e.dst, libc::O_PATH | libc::O_NOFOLLOW, false) {
                 Ok(f) => {
-                    attrs(&image, &e.dst, false, c)?;
+                    attrs(image, &e.dst, false, c)?;
                     if e.kind == libc::S_IFDIR && !f.metadata()?.is_dir() {
                         return Err(Error::Invalid("directory destination collision"));
                     }
@@ -1487,6 +1704,33 @@ mod linux {
                 Err(e) => return Err(e),
             }
         }
+        Ok((plan, owner))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn copy(
+        ctx: &Path,
+        image: &Path,
+        sources: &[&str],
+        destination: &str,
+        limits: Limits,
+        policy: Option<&Policy>,
+        options: CopyOptions<'_>,
+        c: &impl Fn() -> bool,
+    ) -> Result<Summary, Error> {
+        let ctx = root(ctx)?;
+        let image = root(image)?;
+        let (plan, owner) = prepare_copy(
+            &ctx,
+            &image,
+            sources,
+            destination,
+            limits,
+            policy,
+            options,
+            false,
+            c,
+        )?;
         // Preflight completes before creating any destination. File payloads are
         // reread only under the caller's stable-context contract.
         let mut created = std::collections::BTreeSet::new();
@@ -1659,6 +1903,801 @@ mod tests {
     }
     fn run(ctx: &Path, image: &Path, src: &[&str], dst: &str) -> Result<Summary, Error> {
         copy_local(ctx, image, src, dst, limits(), || false)
+    }
+
+    fn selected_hash(
+        ctx: &Path,
+        image: &Path,
+        sources: &[&str],
+        policy: Option<&Policy>,
+    ) -> Vec<u8> {
+        fingerprint_copy(
+            ctx,
+            image,
+            sources,
+            "/out/",
+            limits(),
+            policy,
+            CopyOptions::default(),
+            &|| false,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn fixed_times(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // Future atime avoids relatime changes, without suppressing hashed timestamps.
+        let times = [
+            libc::timespec {
+                tv_sec: 2_000_000_000,
+                tv_nsec: 123,
+            },
+            libc::timespec {
+                tv_sec: 1_000_000_000,
+                tv_nsec: 456,
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn selected_fingerprint_stage_implicit_owner_matches_copy() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        let file = ctx.path().join("file");
+        fs::write(&file, "file").unwrap();
+        std::os::unix::fs::chown(&file, Some(123), Some(456)).unwrap();
+        fixed_times(&file);
+        let default = CopyOptions::default();
+        let owned = CopyOptions {
+            chown: Some("123:456"),
+            ..default
+        };
+        let hash = |options, sources: &[&str]| {
+            fingerprint_copy(
+                ctx.path(),
+                image.path(),
+                sources,
+                "/new/",
+                limits(),
+                None,
+                options,
+                &|| false,
+            )
+            .unwrap()
+            .0
+        };
+        assert_ne!(hash(default, &["file"]), hash(owned, &["file"]));
+        // Equal file modes still differ in the newly created parent's mode.
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(
+            hash(default, &["file"]),
+            hash(
+                CopyOptions {
+                    chmod: Some(0o600),
+                    ..default
+                },
+                &["file"]
+            )
+        );
+        for (options, expected) in [(default, (0, 0)), (owned, (123, 456))] {
+            let target = tempfile::tempdir().unwrap();
+            copy_stage_with_options(
+                ctx.path(),
+                target.path(),
+                &["file"],
+                "/new/",
+                limits(),
+                options,
+                || false,
+            )
+            .unwrap();
+            let parent = fs::metadata(target.path().join("new")).unwrap();
+            let copied = fs::metadata(target.path().join("new/file")).unwrap();
+            assert_eq!(
+                (parent.uid(), parent.gid(), parent.mode() & 0o7777),
+                (expected.0, expected.1, 0o755)
+            );
+            assert_eq!((copied.uid(), copied.gid()), (123, 456));
+        }
+        fs::create_dir(ctx.path().join("tree")).unwrap();
+        std::os::unix::fs::chown(ctx.path().join("tree"), Some(123), Some(456)).unwrap();
+        fixed_times(&ctx.path().join("tree"));
+        // A directory selected first supplies metadata; selected after a file,
+        // it retains the implicit directory's defaults instead.
+        assert_eq!(
+            hash(default, &["tree", "file"]),
+            hash(owned, &["tree", "file"])
+        );
+        assert_eq!(
+            hash(default, &["file", "tree"]),
+            hash(owned, &["file", "tree"])
+        );
+        assert_ne!(
+            hash(default, &["tree", "file"]),
+            hash(default, &["file", "tree"])
+        );
+    }
+
+    fn old_times(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 123,
+        }; 2];
+        assert_eq!(
+            unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            0
+        );
+    }
+
+    fn observed_times(path: &Path) -> (i64, i64, i64, i64, i64, i64) {
+        let m = fs::symlink_metadata(path).unwrap();
+        (
+            m.atime(),
+            m.atime_nsec(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    }
+
+    #[test]
+    fn selected_fingerprint_missing_account_parent_matches_copy() {
+        let ctx = tempfile::tempdir().unwrap();
+        fs::write(ctx.path().join("file"), "file").unwrap();
+        fixed_times(&ctx.path().join("file"));
+        for regular_etc in [false, true] {
+            let image = tempfile::tempdir().unwrap();
+            if regular_etc {
+                fs::write(image.path().join("etc"), "not a directory").unwrap();
+                old_times(&image.path().join("etc"));
+            }
+            let before = regular_etc.then(|| observed_times(&image.path().join("etc")));
+            for owner in ["builder", "0:builders", "builder:builders"] {
+                let options = CopyOptions {
+                    chown: Some(owner),
+                    ..CopyOptions::default()
+                };
+                let hash = |options| {
+                    fingerprint_copy(
+                        ctx.path(),
+                        image.path(),
+                        &["file"],
+                        "/out",
+                        limits(),
+                        None,
+                        options,
+                        &|| false,
+                    )
+                    .unwrap()
+                };
+                let selected = hash(options);
+                assert_eq!(
+                    selected,
+                    hash(CopyOptions {
+                        chown: Some("0:0"),
+                        ..options
+                    })
+                );
+                if unsafe { libc::geteuid() } == 0 {
+                    let copied = copy_stage_with_options(
+                        ctx.path(),
+                        image.path(),
+                        &["file"],
+                        "/out",
+                        limits(),
+                        options,
+                        || false,
+                    )
+                    .unwrap();
+                    assert_eq!(selected.1, copied);
+                    let output = fs::metadata(image.path().join("out")).unwrap();
+                    assert_eq!((output.uid(), output.gid()), (0, 0));
+                    assert_eq!(fs::read(image.path().join("out")).unwrap(), b"file");
+                }
+            }
+            assert_eq!(
+                before,
+                regular_etc.then(|| observed_times(&image.path().join("etc")))
+            );
+        }
+    }
+
+    #[test]
+    fn selected_fingerprint_named_owner_preserves_image_times() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::write(ctx.path().join("file"), "file").unwrap();
+        fixed_times(&ctx.path().join("file"));
+        fs::create_dir(image.path().join("etc")).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        fs::write(
+            image.path().join("etc/passwd"),
+            format!("builder:x:{uid}:{gid}::/:/bin/sh\n"),
+        )
+        .unwrap();
+        fs::write(
+            image.path().join("etc/group"),
+            format!("builders:x:{gid}:\n"),
+        )
+        .unwrap();
+        let paths = [
+            image.path().join("etc/passwd"),
+            image.path().join("etc/group"),
+        ];
+        for p in &paths {
+            old_times(p);
+        }
+        let before = paths.each_ref().map(|p| observed_times(p));
+        let options = CopyOptions {
+            chown: Some("builder:builders"),
+            chmod: Some(0o640),
+        };
+        let hash = || {
+            fingerprint_copy(
+                ctx.path(),
+                image.path(),
+                &["file"],
+                "/new/file",
+                limits(),
+                None,
+                options,
+                &|| false,
+            )
+            .unwrap()
+        };
+        let first = hash();
+        assert_eq!(first, hash());
+        assert_eq!(before, paths.each_ref().map(|p| observed_times(p)));
+        let summary = copy_stage_with_options(
+            ctx.path(),
+            image.path(),
+            &["file"],
+            "/new/file",
+            limits(),
+            options,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(first.1, summary);
+        assert_eq!(before, paths.each_ref().map(|p| observed_times(p)));
+        let output = fs::metadata(image.path().join("new/file")).unwrap();
+        assert_eq!(
+            (output.uid(), output.gid(), output.mode() & 0o7777),
+            (uid, gid, 0o640)
+        );
+        let baseline = tempfile::tempdir().unwrap();
+        fs::create_dir(baseline.path().join("etc")).unwrap();
+        for name in ["passwd", "group"] {
+            fs::copy(
+                image.path().join("etc").join(name),
+                baseline.path().join("etc").join(name),
+            )
+            .unwrap();
+        }
+        copy_stage_with_options(
+            ctx.path(),
+            baseline.path(),
+            &["file"],
+            "/new/file",
+            limits(),
+            options,
+            || false,
+        )
+        .unwrap();
+        let direct = fs::metadata(baseline.path().join("new/file")).unwrap();
+        assert_eq!(
+            (
+                output.mode(),
+                output.uid(),
+                output.gid(),
+                output.atime(),
+                output.atime_nsec(),
+                output.mtime(),
+                output.mtime_nsec()
+            ),
+            (
+                direct.mode(),
+                direct.uid(),
+                direct.gid(),
+                direct.atime(),
+                direct.atime_nsec(),
+                direct.mtime(),
+                direct.mtime_nsec()
+            )
+        );
+        assert_eq!(fs::read(image.path().join("new/file")).unwrap(), b"file");
+    }
+
+    #[test]
+    fn selected_fingerprint_preserves_image_link_atime() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::write(ctx.path().join("file"), "file").unwrap();
+        fs::create_dir(image.path().join("real")).unwrap();
+        symlink("real", image.path().join("link")).unwrap();
+        old_times(&image.path().join("link"));
+        let before = observed_times(&image.path().join("link"));
+        for destination in ["/link/file", "/link/"] {
+            assert!(matches!(
+                fingerprint_copy(
+                    ctx.path(),
+                    image.path(),
+                    &["file"],
+                    destination,
+                    limits(),
+                    None,
+                    CopyOptions::default(),
+                    &|| false,
+                ),
+                Err(Error::FingerprintUnavailable(_))
+            ));
+            let after = observed_times(&image.path().join("link"));
+            assert_eq!(before, after);
+        }
+        fs::create_dir(image.path().join("etc")).unwrap();
+        symlink("../real/passwd", image.path().join("etc/passwd")).unwrap();
+        old_times(&image.path().join("etc/passwd"));
+        let before = observed_times(&image.path().join("etc/passwd"));
+        assert!(matches!(
+            fingerprint_copy(
+                ctx.path(),
+                image.path(),
+                &["file"],
+                "/file",
+                limits(),
+                None,
+                CopyOptions {
+                    chown: Some("builder"),
+                    ..CopyOptions::default()
+                },
+                &|| false,
+            ),
+            Err(Error::FingerprintUnavailable(_))
+        ));
+        let after = observed_times(&image.path().join("etc/passwd"));
+        assert_eq!(before, after);
+        // Ordinary COPY still resolves destination links.
+        copy_stage_with_options(
+            ctx.path(),
+            image.path(),
+            &["file"],
+            "/link/file",
+            limits(),
+            CopyOptions {
+                chown: Some(&format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                    libc::getegid()
+                })),
+                ..CopyOptions::default()
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(fs::read(image.path().join("real/file")).unwrap(), b"file");
+    }
+
+    #[test]
+    fn selected_fingerprint_unprivileged_account_and_link_reads() {
+        const CHILD: &str = "WELD_FINGERPRINT_IMAGE_CHILD";
+        if let Some(image) = std::env::var_os(CHILD) {
+            let image = std::path::PathBuf::from(image);
+            let ctx = tempfile::tempdir().unwrap();
+            fs::write(ctx.path().join("file"), "file").unwrap();
+            let options = CopyOptions {
+                chown: Some("builder:builders"),
+                ..CopyOptions::default()
+            };
+            let account = image.join("etc/passwd");
+            let before = observed_times(&account);
+            assert!(
+                matches!(fingerprint_copy(ctx.path(), &image, &["file"], "/file", limits(), None, options, &|| false), Err(Error::Io(e)) if e.raw_os_error() == Some(libc::EPERM))
+            );
+            assert_eq!(before, observed_times(&account));
+            assert!(!image.join("file").exists());
+            // Execution may read accounts without O_NOATIME; fingerprint may not.
+            copy_stage_with_options(
+                ctx.path(),
+                &image,
+                &["file"],
+                "/file",
+                limits(),
+                options,
+                || false,
+            )
+            .unwrap();
+            assert_eq!(fs::read(image.join("file")).unwrap(), b"file");
+            // No link read or restoration, even without ownership privileges.
+            let before = observed_times(&image.join("link"));
+            assert!(matches!(
+                fingerprint_copy(
+                    ctx.path(),
+                    &image,
+                    &["file"],
+                    "/link/file",
+                    limits(),
+                    None,
+                    CopyOptions::default(),
+                    &|| false
+                ),
+                Err(Error::FingerprintUnavailable(_))
+            ));
+            assert_eq!(before, observed_times(&image.join("link")));
+            assert!(!image.join("real/file").exists());
+            return;
+        }
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let image = tempfile::tempdir().unwrap();
+        fs::set_permissions(image.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        fs::create_dir(image.path().join("etc")).unwrap();
+        fs::create_dir(image.path().join("real")).unwrap();
+        fs::write(
+            image.path().join("etc/passwd"),
+            "builder:x:65534:65534::/:/bin/sh\n",
+        )
+        .unwrap();
+        fs::write(image.path().join("etc/group"), "builders:x:65534:\n").unwrap();
+        old_times(&image.path().join("etc/passwd"));
+        old_times(&image.path().join("etc/group"));
+        symlink("real", image.path().join("link")).unwrap();
+        old_times(&image.path().join("link"));
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "context::tests::selected_fingerprint_unprivileged_account_and_link_reads",
+                    "--nocapture"
+                ])
+                .env(CHILD, image.path())
+                .gid(65534)
+                .uid(65534)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn selected_fingerprint_manifest_ignores_unrelated_files() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::write(ctx.path().join("requirements.txt"), "dependency==1").unwrap();
+        fs::write(ctx.path().join("app.py"), "old application").unwrap();
+        let policy = Policy::default();
+        let before = selected_hash(
+            ctx.path(),
+            image.path(),
+            &["requirements.txt"],
+            Some(&policy),
+        );
+        fs::write(ctx.path().join("app.py"), "new application").unwrap();
+        fs::write(ctx.path().join("unrelated"), "new file").unwrap();
+        assert_eq!(
+            before,
+            selected_hash(
+                ctx.path(),
+                image.path(),
+                &["requirements.txt"],
+                Some(&policy)
+            )
+        );
+        fs::write(ctx.path().join("requirements.txt"), "dependency==2").unwrap();
+        assert_ne!(
+            before,
+            selected_hash(
+                ctx.path(),
+                image.path(),
+                &["requirements.txt"],
+                Some(&policy)
+            )
+        );
+    }
+
+    #[test]
+    fn selected_fingerprint_content_metadata_and_ownership() {
+        use std::os::unix::ffi::OsStrExt;
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        let file = ctx.path().join("file");
+        fs::write(&file, "aaa").unwrap();
+        fixed_times(&file);
+        let policy = Policy::default();
+        let hash = || selected_hash(ctx.path(), image.path(), &["file"], Some(&policy));
+        let first = hash();
+        fs::write(&file, "bbb").unwrap();
+        fixed_times(&file);
+        let content = hash();
+        assert_ne!(first, content);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let mode = hash();
+        assert_ne!(content, mode);
+        let path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"user.fingerprint".as_ptr(),
+                    b"one".as_ptr().cast(),
+                    3,
+                    0,
+                )
+            },
+            0
+        );
+        let attr = hash();
+        assert_ne!(mode, attr);
+        assert_eq!(
+            unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"user.fingerprint".as_ptr(),
+                    b"two".as_ptr().cast(),
+                    3,
+                    0,
+                )
+            },
+            0
+        );
+        assert_ne!(attr, hash());
+        let before_time = hash();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1234))
+            .unwrap();
+        assert_ne!(before_time, hash());
+        if unsafe { libc::geteuid() } == 0 {
+            let local = hash();
+            let stage = selected_hash(ctx.path(), image.path(), &["file"], None);
+            assert_eq!(unsafe { libc::chown(path.as_ptr(), 1234, 2345) }, 0);
+            assert_eq!(local, hash());
+            assert_ne!(
+                stage,
+                selected_hash(ctx.path(), image.path(), &["file"], None)
+            );
+        }
+    }
+
+    #[test]
+    fn selected_fingerprint_options_and_implicit_parent_metadata() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::write(ctx.path().join("file"), "file").unwrap();
+        fs::create_dir(ctx.path().join("tree")).unwrap();
+        let policy = Policy::default();
+        let opts = CopyOptions {
+            chmod: Some(0o640),
+            chown: Some("0:0"),
+        };
+        let hash = |options| {
+            fingerprint_copy(
+                ctx.path(),
+                image.path(),
+                &["file"],
+                "/out/",
+                limits(),
+                Some(&policy),
+                options,
+                &|| false,
+            )
+            .unwrap()
+            .0
+        };
+        let overridden = hash(opts);
+        fs::set_permissions(ctx.path().join("file"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(overridden, hash(opts));
+        assert_ne!(
+            overridden,
+            hash(CopyOptions {
+                chmod: Some(0o600),
+                ..opts
+            })
+        );
+        assert_ne!(
+            overridden,
+            hash(CopyOptions {
+                chown: Some("1:2"),
+                ..opts
+            })
+        );
+        // A preceding file creates /out; a later selected directory retains its
+        // mode/owner/xattrs, but still applies source timestamps.
+        fixed_times(&ctx.path().join("tree"));
+        let before = selected_hash(ctx.path(), image.path(), &["file", "tree"], Some(&policy));
+        fixed_times(&ctx.path().join("tree"));
+        set_attr(&ctx.path().join("tree"), "user.ignored-root", b"changed");
+        assert_eq!(
+            before,
+            selected_hash(ctx.path(), image.path(), &["file", "tree"], Some(&policy))
+        );
+    }
+
+    #[test]
+    fn selected_fingerprint_wildcard_noop_and_budgets() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        let policy = Policy::default();
+        fs::write(ctx.path().join("app.py"), "app").unwrap();
+        let before = selected_hash(ctx.path(), image.path(), &["*.txt"], Some(&policy));
+        fs::write(ctx.path().join("another.py"), "other").unwrap();
+        assert_eq!(
+            before,
+            selected_hash(ctx.path(), image.path(), &["*.txt"], Some(&policy))
+        );
+        let small = Limits {
+            max_entries: 1,
+            ..limits()
+        };
+        assert!(matches!(
+            fingerprint_copy(
+                ctx.path(),
+                image.path(),
+                &["*.txt"],
+                "/out/",
+                small,
+                Some(&policy),
+                CopyOptions::default(),
+                &|| false
+            ),
+            Err(Error::Limit(_))
+        ));
+        fs::write(ctx.path().join("new.txt"), "selected").unwrap();
+        assert_ne!(
+            before,
+            selected_hash(ctx.path(), image.path(), &["*.txt"], Some(&policy))
+        );
+        let (_, budget) = fingerprint_copy(
+            ctx.path(),
+            image.path(),
+            &["*.txt"],
+            "/out/",
+            limits(),
+            Some(&policy),
+            CopyOptions::default(),
+            &|| false,
+        )
+        .unwrap();
+        let copied = copy_local(
+            ctx.path(),
+            image.path(),
+            &["*.txt"],
+            "/out/",
+            limits(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(budget, copied);
+        assert!(matches!(
+            fingerprint_copy(
+                ctx.path(),
+                image.path(),
+                &["*.txt"],
+                "/out/",
+                limits(),
+                Some(&policy),
+                CopyOptions::default(),
+                &|| true
+            ),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn selected_fingerprint_ignored_and_retained_root_metadata() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::create_dir(ctx.path().join("tree")).unwrap();
+        fs::create_dir(image.path().join("out")).unwrap();
+        fs::write(ctx.path().join(".dockerignore"), "tree/ignored*\n").unwrap();
+        fs::write(ctx.path().join("tree/keep"), "keep").unwrap();
+        fs::write(ctx.path().join("tree/ignored"), "ignore").unwrap();
+        let policy = load_policy(ctx.path(), None, &|| false).unwrap();
+        let hash = || selected_hash(ctx.path(), image.path(), &["tree"], Some(&policy));
+        fixed_times(&ctx.path().join("tree"));
+        let before = hash();
+        fs::write(ctx.path().join("tree/ignored"), "changed").unwrap();
+        fs::write(ctx.path().join("tree/ignored-new"), "new").unwrap();
+        fs::set_permissions(ctx.path().join("tree"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_ne!(before, hash()); // Creating an ignored child changed copied parent mtime.
+        fixed_times(&ctx.path().join("tree"));
+        assert_eq!(before, hash());
+        // The source root xattrs matter when COPY creates it too.
+        fs::remove_dir(image.path().join("out")).unwrap();
+        let new_root = hash();
+        set_attr(&ctx.path().join("tree"), "user.root", b"new");
+        assert_ne!(new_root, hash());
+        let small = Limits {
+            max_entries: 3,
+            ..limits()
+        };
+        assert!(matches!(
+            fingerprint_copy(
+                ctx.path(),
+                image.path(),
+                &["tree"],
+                "/out/",
+                small,
+                Some(&policy),
+                CopyOptions::default(),
+                &|| false
+            ),
+            Err(Error::Limit(_))
+        ));
+    }
+
+    #[test]
+    fn selected_fingerprint_raw_names_links_and_overwrite_order() {
+        use std::os::unix::ffi::OsStrExt;
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::create_dir(ctx.path().join("tree")).unwrap();
+        fs::create_dir(image.path().join("out")).unwrap();
+        let raw = ctx
+            .path()
+            .join("tree")
+            .join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+        fs::write(&raw, "raw").unwrap();
+        symlink(
+            std::ffi::OsStr::from_bytes(b"target-\xfe"),
+            ctx.path().join("tree/link"),
+        )
+        .unwrap();
+        fixed_times(&raw);
+        fixed_times(&ctx.path().join("tree/link"));
+        let policy = Policy::default();
+        let hash = || {
+            fixed_times(&ctx.path().join("tree"));
+            selected_hash(ctx.path(), image.path(), &["tree"], Some(&policy))
+        };
+        let first = hash();
+        assert_eq!(first, hash());
+        fs::write(&raw, "new").unwrap();
+        fixed_times(&raw);
+        assert_ne!(first, hash());
+        let before_link = hash();
+        fs::remove_file(ctx.path().join("tree/link")).unwrap();
+        symlink(
+            std::ffi::OsStr::from_bytes(b"target-\xff"),
+            ctx.path().join("tree/link"),
+        )
+        .unwrap();
+        fixed_times(&ctx.path().join("tree/link"));
+        assert_ne!(before_link, hash());
+        fs::create_dir(ctx.path().join("second")).unwrap();
+        fs::write(ctx.path().join("second/link"), "overwrites").unwrap();
+        assert_ne!(
+            selected_hash(ctx.path(), image.path(), &["tree", "second"], Some(&policy)),
+            selected_hash(ctx.path(), image.path(), &["second", "tree"], Some(&policy))
+        );
     }
 
     #[test]
@@ -2175,6 +3214,23 @@ mod tests {
         }
         let readable =
             std::path::PathBuf::from(std::env::var_os("WELD_COPY_READABLE_SOURCE").unwrap());
+        let policy = Policy::default();
+        let fingerprint = || {
+            fingerprint_copy(
+                &readable,
+                image.path(),
+                &["file"],
+                "/readable",
+                limits(),
+                Some(&policy),
+                options,
+                &|| false,
+            )
+            .unwrap()
+            .0
+        };
+        let before = fingerprint();
+        assert_eq!(before, fingerprint());
         copy_local_with_options(
             &readable,
             image.path(),
@@ -2543,7 +3599,7 @@ mod tests {
             ctx.path(),
             image.path(),
             &["dir/file"],
-            "/readonly",
+            "/fingerprinting",
             limits(),
             CopyOptions {
                 chmod: Some(0o444),
@@ -2552,14 +3608,14 @@ mod tests {
             || false,
         )
         .unwrap();
-        let m = fs::metadata(image.path().join("readonly")).unwrap();
+        let m = fs::metadata(image.path().join("fingerprinting")).unwrap();
         assert_eq!((m.uid(), m.gid(), m.mode() & 0o7777), (0, 0, 0o444));
         assert_eq!(
-            get_attr(&image.path().join("readonly"), "security.capability"),
+            get_attr(&image.path().join("fingerprinting"), "security.capability"),
             Some(cap.to_vec())
         );
         assert_eq!(
-            get_attr(&image.path().join("readonly"), "user.file"),
+            get_attr(&image.path().join("fingerprinting"), "user.file"),
             Some(b"payload".to_vec())
         );
     }

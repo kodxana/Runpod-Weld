@@ -6,7 +6,7 @@ use crate::build::{Error, Limits};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 type Result<T> = std::result::Result<T, Error>;
@@ -24,7 +24,7 @@ pub(crate) fn key(
     cancelled: &impl Fn() -> bool,
 ) -> Result<String> {
     let mut hash = Sha256::new();
-    field(&mut hash, b"weld-stage-cache-v4-copy-options-wildcards");
+    field(&mut hash, b"weld-stage-cache-v6-replayed-checkpoints");
     field(&mut hash, inputs);
     // Development builds share a version string: bind cache entries to executable bytes.
     let mut executable = fs::File::open(std::env::current_exe()?)?;
@@ -68,6 +68,15 @@ pub(crate) fn key(
         }
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+// The caller includes the executable identity once, plus the previous verified
+// manifest and this instruction's evaluated inputs. No later context belongs here.
+pub(crate) fn instruction_key(inputs: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    field(&mut hash, b"weld-instruction-cache-v2-replayed-checkpoints");
+    field(&mut hash, inputs);
+    format!("{:x}", hash.finalize())
 }
 
 pub(crate) fn lookup(path: &Path, lease: Option<&crate::store_lease::StoreLease>) -> Result<bool> {
@@ -122,7 +131,19 @@ pub(crate) fn publish_created(
                 fs::create_dir(&target)?;
                 pending.push(child);
             } else if kind.is_file() {
-                fs::copy(e.path(), target)?;
+                let mut source = fs::File::open(e.path())?;
+                let mut output = fs::File::create(target)?;
+                let mut buffer = [0u8; 65536];
+                loop {
+                    if cancelled() {
+                        return Err("cache publication cancelled".into());
+                    }
+                    let size = source.read(&mut buffer)?;
+                    if size == 0 {
+                        break;
+                    }
+                    output.write_all(&buffer[..size])?;
+                }
             } else {
                 return Err("cache publication requires a regular OCI layout".into());
             }
@@ -136,6 +157,9 @@ pub(crate) fn publish_created(
         }
         validate_receipt(&bytes, metadata_limit, targets.len())?;
         fs::write(temporary.path().join(COPY_TARGETS), bytes)?;
+    }
+    if cancelled() {
+        return Err("cache publication cancelled".into());
     }
     match fs::rename(temporary.path(), destination) {
         Ok(()) => {
@@ -263,6 +287,36 @@ pub(crate) fn copy_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_blob_publication_never_installs_an_entry() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("blob"), vec![42; 1024 * 1024]).unwrap();
+        let destination = t.path().join("entry");
+        let checks = std::cell::Cell::new(0);
+        let created = std::cell::Cell::new(false);
+        let error = publish_created(
+            &source,
+            None,
+            &destination,
+            None,
+            &|| {
+                checks.set(checks.get() + 1);
+                checks.get() >= 5
+            },
+            || {
+                created.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!destination.exists());
+        assert!(!created.get());
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn receipt_limits_are_checked_and_include_empty_instructions() {

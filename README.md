@@ -233,9 +233,29 @@ atime, mtime and xattrs. It still covers included paths unused by that stage.
 Ignored content changes do not invalidate the cache when emitted metadata is
 unchanged. Adding/removing an ignored entry can change its copied parent
 directory timestamp and validly invalidate the cache; directory timestamps are
-preserved, not normalized. Stage caching
-is not per-instruction caching: put expensive setup in a separate stage.
-`--no-cache` bypasses stage-cache reads and writes only. Cache hits verify OCI digests and
+preserved, not normalized.
+
+When a whole stage cannot be reused, instruction checkpoints can reuse its
+unchanged prefix. Put dependency files and their installation before application
+COPY instructions to reuse that work after an application edit. Instruction hits
+print `CACHED instruction N OP`, with FROM numbered 1. Checkpoints cover FROM,
+COPY, RUN and WORKDIR; configuration instructions are evaluated normally and
+included in subsequent checkpoint identities. COPY keys hash selected sources
+and their preserved metadata, along with evaluated options and the preceding
+filesystem/configuration state. Traversal budgets still apply on cache hits.
+COPY operations requiring image symlink traversal execute without an instruction
+cache lookup, then establish a verified checkpoint for subsequent instructions.
+Re-executing such a COPY can change directory or symlink timestamps. Downstream
+instructions reuse cache only when the resulting verified filesystem identity
+matches; identical file contents alone do not guarantee a hit.
+
+Checkpoints are flattened OCI images. Both freshly created checkpoints and hits
+are replayed before subsequent execution so preserved metadata agrees. This adds
+disk I/O and retained roots; it does not preserve ctime, matching the existing
+export/replay limitation. Strict-atime source filesystems can cause cache misses
+when reads cannot use O_NOATIME.
+
+`--no-cache` bypasses stage and instruction cache reads and writes. Cache hits verify OCI digests and
 replay layers under the requested limits before reuse. Corrupt entries fail
 closed; use `--no-cache` to bypass them. Credentials are not cache inputs and
 are not copied into cache entries by the registry transport.

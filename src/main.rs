@@ -56,7 +56,7 @@ COPY --chmod accepts octal modes; --chown resolves image users/groups. Both supp
 Global ARG expands FROM; stage ARG redeclares globals. SHELL JSON overrides subsequent
 shell RUN/CMD/ENTRYPOINT. LABEL and shell/JSON CMD/ENTRYPOINT inherit from bases.
 --target selects a named stage and its dependencies. Managed builds cache completed
-stages locally; --no-cache bypasses stage reads/writes only. No container run command yet. COPY bytes/entries/metadata accumulate across steps
+instructions and stages locally; --no-cache bypasses their reads/writes only (not base caching). No container run command yet. COPY bytes/entries/metadata accumulate across steps
 under the rootfs/layer limits; rootfs is also checked after each step.
 Syntax/ignore checks precede mutation; later filesystem failures may follow RUN.
 Legacy defaults: rootfs 268435456 bytes; layer/replay 268435456 bytes;
@@ -817,6 +817,9 @@ fn finish_build(
     lease: Option<&rpweld::store_lease::StoreLease>,
     out: &mut impl Write,
 ) -> Result<(), String> {
+    if CANCELLED.load(Ordering::Relaxed) {
+        return Err("build cancelled before tagging".into());
+    }
     if let Some(tag) = &cli.tag {
         let store = rpweld::registry::store_dir()?;
         let lease = lease.ok_or("tagging requires store lease")?;

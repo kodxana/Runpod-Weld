@@ -107,6 +107,7 @@ pub struct BuildResult {
     pub work: PathBuf,
 }
 
+#[derive(Debug)]
 enum Step {
     Directory(String),
     Copy {
@@ -121,6 +122,14 @@ enum Step {
         workdir: String,
         env: Vec<String>,
     },
+}
+
+struct Checkpoint {
+    end: usize,
+    ordinal: usize,
+    operation: &'static str,
+    config: Value,
+    args: BTreeMap<String, String>,
 }
 
 fn check(cancelled: &impl Fn() -> bool) -> Result<()> {
@@ -403,8 +412,19 @@ fn preflight_stage(
     plan: &build_plan::BuildPlan,
     index: usize,
     options: &BuildOptions,
+    config: Value,
+    inherited_args: BTreeMap<String, String>,
+) -> Result<(Value, Vec<Step>, BTreeMap<String, String>)> {
+    preflight_checkpoints(plan, index, options, config, inherited_args, None)
+}
+
+fn preflight_checkpoints(
+    plan: &build_plan::BuildPlan,
+    index: usize,
+    options: &BuildOptions,
     mut config: Value,
     inherited_args: BTreeMap<String, String>,
+    mut checkpoints: Option<&mut Vec<Checkpoint>>,
 ) -> Result<(Value, Vec<Step>, BTreeMap<String, String>)> {
     let cap = options.limits.max_plan_bytes;
     if config.get("config").is_none_or(Value::is_null) {
@@ -482,7 +502,8 @@ fn preflight_stage(
     let mut steps = vec![Step::Directory(wd.clone())];
     let mut charge = supplied_bytes + wd.len() + map_bytes(&globals, cap)?;
     let mut cmd_set = false;
-    for i in &plan.stages[index].instructions {
+    let mut checkpoint_bytes = 0usize;
+    for (ordinal, i) in plan.stages[index].instructions.iter().enumerate() {
         let mut vars = args.clone();
         vars.extend(env.clone()); // ENV shadows ARG, including empty values.
         match &i.kind {
@@ -643,6 +664,36 @@ fn preflight_stage(
         if charge > cap {
             return Err("evaluated plan budget exceeded".into());
         }
+        // Metadata instructions are evaluated cheaply; capture their state at the
+        // next filesystem boundary, never the final preflight configuration.
+        let operation = match i.kind {
+            I::From { .. } => Some("FROM"),
+            I::Copy { .. } => Some("COPY"),
+            I::Run(_) => Some("RUN"),
+            I::Workdir(_) => Some("WORKDIR"),
+            _ => None,
+        };
+        if let (Some(checkpoints), Some(operation)) = (checkpoints.as_deref_mut(), operation) {
+            let mut snapshot = cfg.clone();
+            snapshot["Env"] = json!(
+                env.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+            );
+            snapshot["WorkingDir"] = json!(wd);
+            checkpoint_bytes = checkpoint_bytes
+                .checked_add(serde_json::to_vec(&snapshot)?.len())
+                .and_then(|n| n.checked_add(map_bytes(&args, cap).ok()?))
+                .filter(|n| *n <= cap)
+                .ok_or("checkpoint metadata budget exceeded")?;
+            checkpoints.push(Checkpoint {
+                end: steps.len(),
+                ordinal: ordinal + 1,
+                operation,
+                config: snapshot,
+                args: args.clone(),
+            });
+        }
     }
     cfg["Env"] = json!(
         env.iter()
@@ -747,6 +798,67 @@ struct StageResult {
     args: BTreeMap<String, String>,
 }
 
+fn verify_checkpoint(
+    layout: &Path,
+    config: &Value,
+    root: Option<&Path>,
+    spool: &Path,
+    limits: Limits,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Descriptor> {
+    for suffix in ["", "blobs", "blobs/sha256"] {
+        let m = fs::symlink_metadata(layout.join(suffix))?;
+        if !m.is_dir() || m.file_type().is_symlink() {
+            return Err("invalid checkpoint blob directory".into());
+        }
+    }
+    let metadata = image::load_layout(layout, None, limits.image, cancelled)?;
+    if metadata.config["config"] != *config {
+        return Err("checkpoint config does not match evaluated instruction".into());
+    }
+    let store = BlobStore::open(layout)?;
+    let mut bytes = 0u64;
+    let mut entries = 0usize;
+    for (descriptor, diff) in metadata.layers.iter().zip(&metadata.diff_ids) {
+        check(cancelled)?;
+        let mut budget = limits.layer;
+        budget.max_uncompressed_bytes = budget
+            .max_uncompressed_bytes
+            .min(limits.max_replay_bytes.saturating_sub(bytes));
+        budget.max_entries = budget
+            .max_entries
+            .min(limits.max_replay_entries.saturating_sub(entries));
+        let mut verified = layer::verify(&store, descriptor, diff, spool, budget, cancelled)?;
+        bytes += verified.size();
+        entries += verified.entries().len();
+        if let Some(root) = root {
+            rootfs::apply_layer(root, &mut verified, cancelled)?;
+            root_budget(root, limits, cancelled)?;
+        }
+    }
+    Ok(metadata.selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_checkpoint(
+    layout: &Path,
+    config: &Value,
+    work: &Path,
+    retained: &str,
+    spool: &Path,
+    limits: Limits,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Descriptor> {
+    let replacement = work.join(format!("checkpoint-{retained}"));
+    fs::create_dir(&replacement)?;
+    let manifest = verify_checkpoint(layout, config, Some(&replacement), spool, limits, cancelled)?;
+    check(cancelled)?;
+    let root = work.join("rootfs");
+    fs::rename(&root, work.join(retained))?;
+    fs::rename(&replacement, &root)?;
+    Ok(manifest)
+}
+
 /// Select the target and only its transitive FROM/COPY dependencies.
 /// Plans containing FROM templates must pass through resolve_plan first.
 pub fn selected_stages(plan: &build_plan::BuildPlan, target: Option<&str>) -> Result<Vec<usize>> {
@@ -843,7 +955,7 @@ fn build_inner(
     for path in [&options.work, &options.output, &options.context]
         .into_iter()
         .chain(options.bases.values().map(|b| &b.layout))
-        .chain(options.cache.iter())
+        .chain(options.cache.iter().filter(|_| !options.no_cache))
         .chain(options.dockerfile.iter())
     {
         crate::store_access::validate_path(path, lease)?;
@@ -864,7 +976,7 @@ fn build_inner(
     paths.sort();
     paths.dedup();
     disjoint(&paths)?;
-    if let Some(cache) = &options.cache {
+    if let Some(cache) = options.cache.as_ref().filter(|_| !options.no_cache) {
         let cache = fs::canonicalize(cache)?;
         for path in &paths {
             disjoint(&[cache.clone(), path.clone()])?;
@@ -1056,8 +1168,15 @@ fn build_stage(
         Base::Stage(n) => previous[&n].args.clone(),
         _ => BTreeMap::new(),
     };
-    let (config, mut steps, args) =
-        preflight_stage(plan, index, options, config, inherited.clone())?;
+    let mut checkpoints = Vec::new();
+    let (config, mut steps, args) = preflight_checkpoints(
+        plan,
+        index,
+        options,
+        config,
+        inherited.clone(),
+        Some(&mut checkpoints),
+    )?;
     check_copy_sources(&steps, options, policy, &cancelled)?;
     let cache_entry = if let Some(cache) = options.cache.as_ref().filter(|_| !options.no_cache) {
         let dependencies: Vec<_> = plan.stages[index]
@@ -1142,6 +1261,7 @@ fn build_stage(
         metadata = Some(cached);
         base_path = Some(entry.clone());
         steps.clear();
+        checkpoints.clear();
         cache_hit = true;
         eprintln!("  CACHED (verified local stage)");
     }
@@ -1190,75 +1310,229 @@ fn build_stage(
     let mut copied = context::Summary::default();
     let mut copy_targets = Vec::new();
     let mut materialized = metadata.is_some();
-    for (index, step) in steps.iter().enumerate() {
-        check(&cancelled)?;
-        match step {
-            Step::Copy {
-                from,
-                sources,
-                destination,
-                chown,
-                chmod,
-            } => {
-                // Untouched scratch has no filesystem reference for named lookup.
-                if !materialized
-                    && chown.as_deref().is_some_and(|value| {
-                        value.split(':').any(|part| {
-                            !part.is_empty() && part != "root" && part.parse::<u32>().is_err()
-                        })
-                    })
-                {
-                    return Err(
-                        "COPY named ownership requires a materialized image filesystem".into(),
-                    );
-                }
-                let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
-                let summary = context::copy_filtered_with_options(
-                    stage_root.as_deref().unwrap_or(&options.context),
-                    &root,
-                    &sources.iter().map(String::as_str).collect::<Vec<_>>(),
+    let builder_identity = if cache_entry.is_some() && !cache_hit {
+        Some(crate::build_cache::key(
+            b"instruction-builder",
+            None,
+            options.limits,
+            policy,
+            &cancelled,
+        )?)
+    } else {
+        None
+    };
+    let mut prior_identity = metadata.as_ref().map(|m| m.selected.digest.to_string());
+    let mut last_checkpoint: Option<(PathBuf, Descriptor, Value)> = None;
+    let mut start = 0usize;
+    for boundary in &checkpoints {
+        let instruction_steps = &steps[start..boundary.end];
+        let mut fingerprint_summary: Option<context::Summary> = None;
+        let entry = if let Some(builder) = &builder_identity {
+            let mut selected: Vec<u8> = Vec::new();
+            let mut dependency = None;
+            let mut available = true;
+            for step in instruction_steps {
+                if let Step::Copy {
+                    from,
+                    sources,
                     destination,
-                    copy_limits(options.limits, &copied),
-                    if from.is_some() { None } else { Some(policy) },
-                    context::CopyOptions {
-                        chown: chown.as_deref(),
-                        chmod: *chmod,
-                    },
-                    &cancelled,
-                )?;
+                    chown,
+                    chmod,
+                } = step
+                {
+                    let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
+                    dependency = from.map(|n| previous[&n].result.manifest.digest.to_string());
+                    #[cfg(target_os = "linux")]
+                    {
+                        match context::fingerprint_copy(
+                            stage_root.as_deref().unwrap_or(&options.context),
+                            &root,
+                            &sources.iter().map(String::as_str).collect::<Vec<_>>(),
+                            destination,
+                            copy_limits(options.limits, &copied),
+                            if from.is_some() { None } else { Some(policy) },
+                            context::CopyOptions {
+                                chown: chown.as_deref(),
+                                chmod: *chmod,
+                            },
+                            &cancelled,
+                        ) {
+                            Ok((fingerprint, summary)) => {
+                                selected = fingerprint;
+                                fingerprint_summary = Some(summary);
+                            }
+                            Err(context::Error::FingerprintUnavailable(_)) => available = false,
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+            }
+            let inputs = format!(
+                "{builder}\n{prior_identity:?}\n{:?}\n{}\n{materialized}\n{:?}\n{:?}\n{instruction_steps:?}\n{dependency:?}",
+                options.limits, options.host_dns, boundary.config, boundary.args
+            );
+            let inputs = serde_json::to_vec(&(inputs, selected))?;
+            available.then(|| {
+                options
+                    .cache
+                    .as_ref()
+                    .unwrap()
+                    .join(crate::build_cache::instruction_key(&inputs))
+            })
+        } else {
+            None
+        };
+        if let Some(entry) = &entry
+            && crate::build_cache::lookup(entry, lease)?
+        {
+            let targets = crate::build_cache::copy_targets(
+                entry,
+                lease,
+                options.limits.layer.max_metadata_bytes,
+                usize::from(fingerprint_summary.is_some()),
+            )?;
+            if let Some(summary) = fingerprint_summary {
+                if targets != vec![summary.targets.clone()] {
+                    return Err("checkpoint COPY receipt does not match current selection".into());
+                }
                 copied.bytes_written += summary.bytes_written;
                 copied.entries += summary.entries;
                 copied.metadata_bytes += summary.metadata_bytes;
                 copy_targets.push(summary.targets);
             }
-            Step::Directory(p) => {
-                directory(&root, p)?;
-            }
-            Step::Run {
-                command,
-                workdir,
-                env,
-            } => {
-                let run_state = state.join(index.to_string());
-                fs::create_dir(&run_state)?;
-                let dns = if options.host_dns {
-                    install_dns(&root, &run_state)?
-                } else {
-                    None
-                };
-                let result = worker(
-                    &root, &run_state, command, workdir, env, options, lease, &cancelled,
-                );
-                // Restore even on failed/cancelled RUN; restoration errors are fatal.
-                if let Some(dns) = dns {
-                    dns.restore()?;
-                }
-                result?;
-            }
+            let manifest = restore_checkpoint(
+                entry,
+                &boundary.config,
+                &work,
+                &format!("rootfs-before-{}", boundary.ordinal),
+                &spool,
+                options.limits,
+                &cancelled,
+            )?;
+            materialized |= instruction_steps
+                .iter()
+                .any(|step| !matches!(step, Step::Directory(p) if p == "/"));
+            prior_identity = Some(manifest.digest.to_string());
+            last_checkpoint = Some((entry.clone(), manifest, boundary.config.clone()));
+            eprintln!(
+                "  CACHED instruction {} {}",
+                boundary.ordinal, boundary.operation
+            );
+            start = boundary.end;
+            continue;
         }
-        // Preflight inserts an initial root WORKDIR step even for untouched scratch.
-        materialized |= !matches!(step, Step::Directory(p) if p == "/");
-        root_budget(&root, options.limits, &cancelled)?;
+        let receipt_start = copy_targets.len();
+        for (index, step) in steps.iter().enumerate().take(boundary.end).skip(start) {
+            check(&cancelled)?;
+            match step {
+                Step::Copy {
+                    from,
+                    sources,
+                    destination,
+                    chown,
+                    chmod,
+                } => {
+                    // Untouched scratch has no filesystem reference for named lookup.
+                    if !materialized
+                        && chown.as_deref().is_some_and(|value| {
+                            value.split(':').any(|part| {
+                                !part.is_empty() && part != "root" && part.parse::<u32>().is_err()
+                            })
+                        })
+                    {
+                        return Err(
+                            "COPY named ownership requires a materialized image filesystem".into(),
+                        );
+                    }
+                    let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
+                    let summary = context::copy_filtered_with_options(
+                        stage_root.as_deref().unwrap_or(&options.context),
+                        &root,
+                        &sources.iter().map(String::as_str).collect::<Vec<_>>(),
+                        destination,
+                        copy_limits(options.limits, &copied),
+                        if from.is_some() { None } else { Some(policy) },
+                        context::CopyOptions {
+                            chown: chown.as_deref(),
+                            chmod: *chmod,
+                        },
+                        &cancelled,
+                    )?;
+                    copied.bytes_written += summary.bytes_written;
+                    copied.entries += summary.entries;
+                    copied.metadata_bytes += summary.metadata_bytes;
+                    copy_targets.push(summary.targets);
+                }
+                Step::Directory(p) => {
+                    directory(&root, p)?;
+                }
+                Step::Run {
+                    command,
+                    workdir,
+                    env,
+                } => {
+                    let run_state = state.join(index.to_string());
+                    fs::create_dir(&run_state)?;
+                    let dns = if options.host_dns {
+                        install_dns(&root, &run_state)?
+                    } else {
+                        None
+                    };
+                    let result = worker(
+                        &root, &run_state, command, workdir, env, options, lease, &cancelled,
+                    );
+                    // Restore even on failed/cancelled RUN; restoration errors are fatal.
+                    if let Some(dns) = dns {
+                        dns.restore()?;
+                    }
+                    result?;
+                }
+            }
+            // Preflight inserts an initial root WORKDIR step even for untouched scratch.
+            materialized |= !matches!(step, Step::Directory(p) if p == "/");
+            root_budget(&root, options.limits, &cancelled)?;
+        }
+        if builder_identity.is_some() {
+            check(&cancelled)?;
+            let snapshot = work.join(format!("checkpoint-image-{}", boundary.ordinal));
+            let mut checkpoint_config = config.clone();
+            checkpoint_config["config"] = boundary.config.clone();
+            export::export_layout(
+                &root,
+                &snapshot,
+                &checkpoint_config,
+                options.limits.export,
+                &cancelled,
+            )?;
+            // Export traverses directories. Continue from the archived state on
+            // cold builds too, so later RUNs observe the same atimes as cache hits.
+            let manifest = restore_checkpoint(
+                &snapshot,
+                &boundary.config,
+                &work,
+                &format!("rootfs-exported-{}", boundary.ordinal),
+                &spool,
+                options.limits,
+                &cancelled,
+            )?;
+            check(&cancelled)?;
+            if let Some(entry) = entry {
+                crate::build_cache::publish(
+                    &snapshot,
+                    lease,
+                    &entry,
+                    Some((
+                        &copy_targets[receipt_start..],
+                        options.limits.layer.max_metadata_bytes,
+                    )),
+                    &cancelled,
+                )?;
+            }
+            // Even an unkeyable COPY must replace the prior filesystem identity.
+            prior_identity = Some(manifest.digest.to_string());
+            last_checkpoint = Some((snapshot, manifest, boundary.config.clone()));
+        }
+        start = boundary.end;
     }
     check(&cancelled)?;
     let manifest = if cache_hit {
@@ -1279,6 +1553,17 @@ fn build_stage(
             },
         )?;
         metadata.as_ref().unwrap().selected.clone()
+    } else if let Some((snapshot, manifest, checkpoint_config)) = &last_checkpoint
+        && *checkpoint_config == config["config"]
+    {
+        crate::build_cache::publish_created(snapshot, lease, &output, None, &cancelled, || {
+            #[cfg(target_os = "linux")]
+            if let Some(r) = record.as_deref_mut() {
+                r.created(&output, lease.unwrap())?;
+            }
+            Ok(())
+        })?;
+        manifest.clone()
     } else {
         export::export_layout_created(
             &root,
@@ -1295,6 +1580,22 @@ fn build_stage(
             },
         )?
     };
+    if !cache_hit && (cache_entry.is_some() || !final_stage) {
+        // Export traverses directories: COPY --from must consume the exported
+        // metadata even with caching disabled or a metadata-only stage suffix.
+        let verified = restore_checkpoint(
+            &output,
+            &config["config"],
+            &work,
+            "rootfs-final-export",
+            &spool,
+            options.limits,
+            &cancelled,
+        )?;
+        if verified != manifest {
+            return Err("exported stage identity changed during verification".into());
+        }
+    }
     #[cfg(target_os = "linux")]
     if final_stage && let Some(r) = record {
         // A cache-publication failure must not erase evidence of a valid image.
@@ -1603,14 +1904,23 @@ mod tests {
             o.cache = Some(t.path().join("cache"));
             fs::create_dir(o.cache.as_ref().unwrap()).unwrap();
             let source = format!("FROM scratch\n{}", "COPY missing* /out/\n".repeat(count));
+            if budget == 1024 {
+                // Checkpoints must verify replay before publication, including cold builds.
+                assert_eq!(
+                    build(&source, &o, || false).unwrap_err().to_string(),
+                    "layer limit exceeded: metadata bytes"
+                );
+                assert!(!o.output.exists());
+                assert_eq!(fs::read_dir(o.cache.as_ref().unwrap()).unwrap().count(), 0);
+                continue;
+            }
             let first = build(&source, &o, || false).unwrap();
             assert!(!o.work.join("rootfs/out").exists());
             let entry = fs::read_dir(o.cache.as_ref().unwrap())
                 .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path();
+                .map(|e| e.unwrap().path())
+                .find(|p| crate::build_cache::copy_targets(p, None, budget, count).is_ok())
+                .unwrap();
             let receipt_size = fs::metadata(entry.join("weld-copy-targets.json"))
                 .unwrap()
                 .len();
@@ -1622,19 +1932,9 @@ mod tests {
             o.work = t.path().join("work-warm");
             o.output = t.path().join("output-warm");
             let warm = build(&source, &o, || false);
-            if budget == 1024 {
-                // Root metadata PAX replay independently exceeds this layer budget.
-                assert_eq!(
-                    warm.unwrap_err().to_string(),
-                    "layer limit exceeded: metadata bytes"
-                );
-                assert!(o.work.join("rootfs").is_dir());
-                assert!(!o.output.exists());
-            } else {
-                assert_eq!(first.manifest, warm.unwrap().manifest);
-            }
+            assert_eq!(first.manifest, warm.unwrap().manifest);
             assert!(!o.work.join("rootfs/out").exists());
-            assert_eq!(fs::read_dir(o.cache.as_ref().unwrap()).unwrap().count(), 1);
+            assert!(fs::read_dir(o.cache.as_ref().unwrap()).unwrap().count() > 1);
         }
     }
 
@@ -1676,10 +1976,12 @@ mod tests {
         assert!(!o.work.join("rootfs/ignored").exists());
         let entry = fs::read_dir(o.cache.as_ref().unwrap())
             .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                crate::build_cache::copy_targets(p, None, o.limits.layer.max_metadata_bytes, 3)
+                    .is_ok()
+            })
+            .unwrap();
         let targets =
             crate::build_cache::copy_targets(&entry, None, o.limits.layer.max_metadata_bytes, 3)
                 .unwrap();
@@ -1703,7 +2005,7 @@ mod tests {
             fs::read(o.work.join("rootfs/absent/missing-now")).unwrap(),
             b"new"
         );
-        assert_eq!(fs::read_dir(o.cache.as_ref().unwrap()).unwrap().count(), 2);
+        assert!(fs::read_dir(o.cache.as_ref().unwrap()).unwrap().count() > 2);
     }
 
     #[test]

@@ -142,19 +142,25 @@ fn cache_corruption_fails_closed_and_stage_copy_cannot_escape() {
     let mut f = Fixture::new("FROM scratch\nCOPY payload /payload\n");
     let (r, _, _) = f.build(&[]);
     success(&r);
-    let cache = fs::read_dir(f.home.join("store/cache-v1"))
+    let mut caches: Vec<_> = fs::read_dir(f.home.join("store/cache-v1"))
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let blob = fs::read_dir(cache.join("blobs/sha256"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    fs::write(blob, "corrupt").unwrap();
+        .map(|entry| entry.unwrap().path())
+        .filter(|entry| entry.join("index.json").is_file())
+        .collect();
+    caches.sort();
+    assert!(!caches.is_empty(), "build did not publish a cache layout");
+    // Both instruction and whole-stage entries exist. Corrupt each selected
+    // manifest so iteration order cannot choose an unused checkpoint.
+    for cache in caches {
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(cache.join("index.json")).unwrap()).unwrap();
+        let digest = index["manifests"][0]["digest"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        fs::write(cache.join("blobs/sha256").join(digest), "corrupt").unwrap();
+    }
     let (r, out, _) = f.build(&[]);
     assert!(!r.status.success());
     assert!(!out.exists());
