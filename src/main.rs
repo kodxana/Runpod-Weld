@@ -19,6 +19,10 @@ Usage:
   rpweld cache du [--json]
   rpweld builds ls [--json]
   rpweld builds inspect BUILD_ID [--json]
+  rpweld cache prune --dry-run [--json]
+  rpweld builds prune --dry-run [--json]
+  rpweld builds rm BUILD_ID --dry-run [--json]
+  rpweld image rm TAG --dry-run [--json]
 
   rpweld login REGISTRY [--username USER] [--password-stdin] [--authfile FILE] [--cert-dir DIR]
   rpweld logout REGISTRY [--authfile FILE]
@@ -64,7 +68,7 @@ Doctor is read-only. Observed resource limits are not per-build enforcement.
 Storage commands are read-only, Linux-only, bounded best-effort observations.
 Missing stores are empty. Inspect uses an exact normalized tag or full build ID.
 Complete means structurally complete, not digest-verified. Unknown stays unknown.
-Usage is not reclaimable space; no deletion or prune commands are implemented.
+Usage is not reclaimable space. Cleanup plans require --dry-run; mutation is not implemented.
 ";
 
 fn execute(args: &[String], out: &mut impl Write) -> Result<(), String> {
@@ -92,6 +96,9 @@ fn execute(args: &[String], out: &mut impl Write) -> Result<(), String> {
 }
 
 fn storage_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(), String> {
+    if args.first().is_some_and(|s| s == "prune" || s == "rm") {
+        return cleanup_command(cmd, args, out);
+    }
     use rpweld::store_inventory::{Limits, inspect_existing};
     let json_output = args.last().is_some_and(|v| v == "--json");
     let args = if json_output {
@@ -188,6 +195,70 @@ fn storage_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(
         writeln!(out, "issue: {}", safe(issue)).map_err(|e| e.to_string())?;
     }
     writeln!(out, "Complete = structural only, not digest-verified; ownership/targets may be unknown.\nAll entries protected; usage is not reclaimable space.").map_err(|e| e.to_string())
+}
+
+fn cleanup_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(), String> {
+    use rpweld::cleanup_plan::{BuildId, Request, TagId};
+    if !args.iter().any(|s| s == "--dry-run") {
+        return Err("cleanup mutation is not implemented; --dry-run is required; nothing was selected or changed".into());
+    }
+    let mut dry_run = false;
+    let mut machine = false;
+    let mut words = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--dry-run" if !dry_run => dry_run = true,
+            "--json" if !machine => machine = true,
+            word if !word.starts_with('-') => words.push(word),
+            _ => return Err("invalid cleanup option; use 'rpweld --help'".into()),
+        }
+    }
+    let request = match (cmd, words.as_slice()) {
+        ("cache", ["prune"]) => Request::CachePrune,
+        ("builds", ["prune"]) => Request::BuildsPrune,
+        ("builds", ["rm", id]) => Request::BuildRemove(BuildId::parse(id)?),
+        ("image", ["rm", tag]) => Request::ImageRemove(TagId::parse(tag)?),
+        _ => return Err("invalid cleanup command; use 'rpweld --help'".into()),
+    };
+    let store = rpweld::store_inventory::resolve_store().map_err(|e| e.to_string())?;
+    let plan = rpweld::cleanup_plan::inspect(
+        &store,
+        request,
+        rpweld::store_inventory::Limits::default(),
+        || CANCELLED.load(Ordering::Relaxed),
+    )
+    .map_err(|e| format!("cannot plan cleanup: {e}"))?;
+    if machine {
+        serde_json::to_writer_pretty(&mut *out, &plan).map_err(|e| e.to_string())?;
+        writeln!(out).map_err(|e| e.to_string())?;
+    } else {
+        writeln!(
+            out,
+            "Dry run: {}. {} candidates; {} protected. Nothing changed.",
+            plan.status,
+            plan.candidates.len(),
+            plan.protected.len()
+        )
+        .map_err(|e| e.to_string())?;
+        for (kind, items) in [
+            ("candidate", &plan.candidates),
+            ("protected", &plan.protected),
+        ] {
+            for item in items {
+                let safe: String = serde_json::to_string(item)
+                    .map_err(|e| e.to_string())?
+                    .chars()
+                    .flat_map(char::escape_default)
+                    .collect();
+                writeln!(out, "{kind}: {safe}").map_err(|e| e.to_string())?;
+            }
+        }
+        writeln!(out, "Selected unique logical bytes: {}; estimated reclaim: {}..{} bytes (not a promise).\nPoint-in-time plan, not authorization; future deletion requires a fresh scan.", plan.estimate.unique_logical_bytes, plan.estimate.reclaim_lower_bytes, plan.estimate.reclaim_upper_bytes.map_or_else(|| "unknown".into(), |n| n.to_string())).map_err(|e| e.to_string())?;
+    }
+    if plan.status == "store_busy" {
+        return Err("store busy; nothing selected; no force option".into());
+    }
+    Ok(())
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

@@ -268,7 +268,50 @@ Each accepts `--json`. These Linux-only commands provide bounded, read-only
 observations: missing stores remain absent, and external image paths are not
 traversed. `Complete` means structurally complete, not digest-verified. Reported
 usage is not reclaimable space; legacy builds remain protected and ownership is
-not inferred from a tag. Removal and pruning are not implemented.
+not inferred from a tag. Cleanup mutation is not implemented.
+
+Dry-run cleanup plans are available on Linux:
+
+```sh
+rpweld cache prune --dry-run --json
+rpweld builds prune --dry-run --json
+rpweld builds rm BUILD_ID --dry-run --json
+rpweld image rm TAG --dry-run --json
+```
+
+`--json` is optional. Omitting `--dry-run` returns an explicit not-implemented
+error. No command deletes, renames, or unlinks stored artifacts. A plan acquires
+the existing exclusive store lease without waiting; a busy store selects nothing
+and returns an error. There is no force option. Missing stores remain absent;
+legacy stores without a lock get a protected best-effort inventory, without
+creating a lock. Credentials and certificates are never modified.
+
+Plans list candidates and protected scopes with reasons. Validated ownership
+records authorize consideration of their listed components, never an entire run.
+Currently only empty owned components are candidates: populated directories need
+finer child provenance, and their contents, run records, and unlisted children
+stay protected. Any tag conservatively protects every build because the current
+API cannot prove the absence of target aliases without resolving untrusted paths.
+Recorded explicit/external paths conservatively protect all builds for the same reason.
+Malformed or incomplete inventories select nothing. Explicit and external paths
+are never owned. `image rm` selects only the validated tag record; its target stays
+unchanged, including after a retag. Cache generations, temporary entries, and
+structurally complete layouts lack ownership proof and stay protected. Thus cache
+prune currently has zero eligible entries; current base references also remain
+protected. Lockfiles, authentication files, certificates, and unknown entries are
+always protected.
+
+Inventory logical bytes include repeated hardlinks; unique logical and allocated
+bytes deduplicate inodes. They are observations, not reclamation estimates. The
+separate estimate covers selected items only, with a zero lower bound (open files
+and reflinks may retain storage). A tag record's allocation is an upper bound;
+empty directory metadata has an unknown upper bound. No cache/build totals are
+summed into reclaimable space. `shared_inode_count` counts selected shared inodes,
+currently zero because selected tag records must be singly linked.
+
+A dry run is a point-in-time report, not authorization for deletion. Saved JSON
+cannot be applied. Any future deletion implementation must acquire a new exclusive
+lease, rescan, and revalidate ownership and references.
 
 JSON schema v1 preserves UTF-8 paths as strings. Non-UTF-8 Unix paths use
 `{"unix_bytes":[...]}`; Windows equivalents use `{"windows_wide":[...]}`.
