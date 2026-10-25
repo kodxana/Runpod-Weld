@@ -2,7 +2,6 @@
 """Opt-in Linux CLI acceptance. Run only after the parent supplies a frozen binary."""
 import argparse
 import gzip
-from decimal import Decimal
 import hashlib
 import io
 import json
@@ -18,6 +17,7 @@ import time
 
 from oracle import load, replay, snapshot, verified
 from fixture_tar import FixtureInfo
+from live_metadata import assert_metadata, compile_probe, docker_metadata
 
 
 def delta_members(output, base_count):
@@ -474,12 +474,25 @@ def main():
         assert inspected["RootFS"]["Layers"] == load(edited)[1]["rootfs"]["diff_ids"]
         for key in ["Env", "Cmd", "WorkingDir", "Labels"]:
             assert inspected["Config"][key] == load(edited)[1]["config"][key]
+        saved_image = a.evidence / "docker-save.tar"
+        subprocess.run(["docker", "image", "save", "-o", str(saved_image), reference], check=True)
+        with tarfile.open(saved_image) as saved:
+            saved_manifest = json.load(saved.extractfile("manifest.json"))
+            assert len(saved_manifest) == 1
+            saved_config = json.load(saved.extractfile(saved_manifest[0]["Config"]))
+            assert saved_config["history"] == load(edited)[1]["history"]
+        expected_root = a.evidence / "edited-replay"
+        replay(edited, expected_root)
+        expected = snapshot(expected_root)
+        intended = {"/" + k: v for k, v in expected.items() if k == "probe" or k.startswith("probe/")}
+        helper = compile_probe(a.evidence / "live-metadata")
+        live = docker_metadata(reference, helper, intended, a.evidence / "docker-live-metadata.jsonl")
+        # Docker export truncates fractional mtime. The live filesystem is the
+        # exact mtime/xattr surface; atime is recorded, not claimed as OCI fidelity.
+        assert_metadata(live, intended)
         container = subprocess.check_output(["docker", "create", "--network=none", reference]).decode().strip()
         try:
             subprocess.run(["docker", "export", "-o", str(a.evidence / "docker-export.tar"), container], check=True)
-            expected_root = a.evidence / "edited-replay"
-            replay(edited, expected_root)
-            expected = snapshot(expected_root)
             with tarfile.open(a.evidence / "docker-export.tar") as archive:
                 members = {m.name.removeprefix("./").rstrip("/"): m for m in archive.getmembers()}
                 assert "probe/deleted" not in members and "probe/to-file/child" not in members
@@ -489,7 +502,6 @@ def main():
                     member = members[name]
                     assert member.uid == item["uid"] and member.gid == item["gid"], name
                     assert member.mode == stat.S_IMODE(item["mode"]), name
-                    assert int(Decimal(str(member.pax_headers.get("mtime", member.mtime))) * 1_000_000_000) == item["mtime_ns"], name
                     if stat.S_ISREG(item["mode"]):
                         assert member.isfile() or member.islnk(), name
                         assert hashlib.sha256(archive.extractfile(member).read()).hexdigest() == item["sha256"], name

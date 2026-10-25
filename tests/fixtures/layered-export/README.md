@@ -1,7 +1,8 @@
 # Layered export acceptance
 
 These fixtures use native Linux paths, root, Python's standard library, GNU tar,
-and an existing local Alpine OCI layout. No pull or package installation occurs.
+and an existing local Alpine OCI layout. Docker checks also require a local C
+compiler with static libc available (`cc -static`). No pull or package installation occurs.
 RUN is trusted test code, not a sandbox. Invoke candidate tests only after the
 parent supplies a frozen binary/source handoff.
 
@@ -130,10 +131,35 @@ differ across separate builds; a future fixture relying on them must identify
 that exact origin rather than erase root timestamps from every comparison.
 
 Docker acceptance loads the OCI archive locally, compares ordered diff IDs and
-config, creates/exports a container, compares probe content/type, permissions,
-ownership, mtime, symlinks, hardlinks and deletions, and executes the configured
-command to verify edited app content. Export evidence is retained. Docker export alone is not used to
-claim atime/xattr fidelity; those are checked by independent replay.
+config plus history from Docker's saved image, creates/exports a container,
+compares probe content/type, permissions, ownership, symlinks, hardlinks and
+deletions, and executes the configured command to verify edited app content.
+Export evidence is retained. Docker export truncates fractional mtimes on the
+tested engine; it is not the exact timestamp measurement surface. Expected times
+are never rounded, and the independent OCI oracle still checks full-precision
+atime/mtime with no tolerance.
+
+`live_metadata.c` is a trusted static helper bind-mounted read-only into a
+separate network-disabled container from the same image. It starts directly as
+root at `/`, before export or app execution, without invoking the image's shell
+or loader. Every intended `probe` path (including raw byte names, directories,
+symlinks and hardlink aliases) is sent as NUL-delimited bytes; all lstat metadata
+is captured before no-follow xattr reads. It does not enumerate directories,
+read file contents or readlink, and never restores timestamps. JSON lines use
+hex for arbitrary path/xattr bytes and integer seconds/nanoseconds for times.
+Live mtimes, ownership, modes and all xattrs (including security capabilities)
+must exactly equal the independent replay snapshot for every intended path.
+Missing export xattrs are not evidence of missing live xattrs.
+
+Live atime is retained in `docker-live-metadata.jsonl` for diagnosis, but Docker
+atime fidelity is not asserted: image unpacking can initialize it from mtime and
+directory accesses can advance it before the probe starts. There was no Docker
+atime assertion to replace. Native replay's exact atime assertions remain intact.
+`python3 -B -m unittest -v test_live_metadata` checks the actual static helper on
+Linux: fractions, raw names, symlinks, hardlink aliases, xattrs/capabilities,
+repeated observations without atime/ctime mutation, and rejection of an actual
+one-nanosecond mtime corruption. No host clock is used to derive expected times.
+
 It uses the reference returned by `docker load`, rather than assuming a config
 digest is a Docker image ID. Container execution disables networking.
 
