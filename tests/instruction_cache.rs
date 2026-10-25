@@ -42,9 +42,9 @@ impl Build {
 
     fn cached(&self, ordinal: usize, op: &str) {
         assert!(
-            self.log
-                .lines()
-                .any(|line| line.trim() == format!("CACHED instruction {ordinal} {op}")),
+            self.log.lines().any(|line| line
+                .trim()
+                .starts_with(&format!("CACHED instruction {ordinal} {op} [stage "))),
             "missing instruction hit {ordinal} {op}: {}",
             self.log
         );

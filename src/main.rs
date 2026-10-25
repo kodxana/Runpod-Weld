@@ -5,6 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
+fn cancelled() -> bool {
+    CANCELLED.load(Ordering::Relaxed)
+}
+
 const HELP: &str = "Runpod Weld (rpweld) — development preview
 
 Usage:
@@ -27,11 +31,11 @@ Usage:
   rpweld login REGISTRY [--username USER] [--password-stdin] [--authfile FILE] [--cert-dir DIR]
   rpweld logout REGISTRY [--authfile FILE]
   rpweld push TAG [--authfile FILE] [--cert-dir DIR]
-  rpweld build [-f DOCKERFILE] [-t TAG] [--push] [--authfile FILE] [--cert-dir DIR] CONTEXT
+  rpweld build [-f DOCKERFILE] [-t TAG]... [--push] [--authfile FILE] [--cert-dir DIR] CONTEXT
 
   rpweld build -f DOCKERFILE [--base NAME=LAYOUT] [--base-ref NAME=REFERENCE]
     --output NEWDIR --work-dir NEWDIR [--build-arg KEY=VALUE] [--host-dns] [--verbose]
-    [--target STAGE] [--no-cache] [--pull] [--platform linux/amd64]
+    [--progress auto|plain|quiet] [--target STAGE] [--no-cache] [--pull] [--platform linux/amd64]
     [--max-rootfs-bytes N] [--max-layer-bytes N] [--metadata-budget N]
     [--run-timeout-seconds N] CONTEXT
 
@@ -40,7 +44,15 @@ Default Dockerfile: CONTEXT/Dockerfile. Verified cached bases are reused offline
 --pull refreshes base tags using verified TLS; digest references remain reusable.
 Failed refreshes fail the build and preserve the previous base cache.
 Managed builds create private state under RPWELD_HOME (default ~/.local/share/rpweld).
-One -t tag per build; push retries use 'rpweld push TAG'. Images/work are retained.
+Repeat -t/--tag (maximum 64 occurrences); normalized duplicates are ignored.
+Tag writes are individually atomic, not a multi-tag transaction; failed builds keep old tags.
+--push attempts all tags from this build output; push retries use 'rpweld push TAG'. Images/work are retained.
+--progress auto (default) equals plain: append-only stage/step/cache/elapsed output.
+Steps use stage-local Dockerfile instruction numbers for FROM/COPY/RUN/WORKDIR;
+metadata instructions are evaluated with their next boundary or final export.
+quiet hides engine step progress only; RUN stdout/stderr, diagnostics, registry
+transfers and final results remain visible. Instruction arguments are not printed.
+--tag=TAG and --progress=MODE are accepted.
 Managed builds/push hold a persistent store lease; cross-store inputs are rejected.
 Cancellation waits for all descendants; uninterruptible tasks can delay it indefinitely.
 Managed defaults: 2 GiB rootfs/layer, 64 MiB metadata; temporary host DNS enabled
@@ -138,7 +150,7 @@ fn storage_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(
             "storage inventory is unsupported on this platform; requires Linux openat2".into(),
         );
     }
-    let inventory = inspect_existing(Limits::default(), || CANCELLED.load(Ordering::Relaxed))
+    let inventory = inspect_existing(Limits::default(), cancelled)
         .map_err(|e| format!("cannot inspect store: {e}"))?;
     // Convert fallibly before json!: its Serialize errors would otherwise panic.
     let serialized = serde_json::to_value(&inventory).map_err(|e| e.to_string())?;
@@ -232,7 +244,7 @@ fn cleanup_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(
             &store,
             request,
             rpweld::store_inventory::Limits::default(),
-            || CANCELLED.load(Ordering::Relaxed),
+            cancelled,
         )
         .map_err(|e| format!("cannot apply cleanup: {e}"))?;
         if machine {
@@ -262,7 +274,7 @@ fn cleanup_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(
         &store,
         request,
         rpweld::store_inventory::Limits::default(),
-        || CANCELLED.load(Ordering::Relaxed),
+        cancelled,
     )
     .map_err(|e| format!("cannot plan cleanup: {e}"))?;
     if machine {
@@ -303,13 +315,16 @@ struct BuildCli {
     record: Option<rpweld::build_record::BuildRecord>,
     dockerfile: String,
     options: rpweld::build::BuildOptions,
-    tag: Option<String>,
+    tags: Vec<String>,
     push: bool,
     pull: bool,
     registry: rpweld::registry::Options,
 }
 
 fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
+    let mut tags = Vec::new();
+    let mut tag_count = 0;
+    let mut progress = None;
     let mut values = BTreeMap::new();
     let mut bases = BTreeMap::new();
     let mut references = BTreeMap::new();
@@ -331,7 +346,34 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             positional = true;
             continue;
         }
-        if !positional && arg == "--push" {
+        let (option, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+        if !positional && ["-t", "--tag", "--progress"].contains(&option) {
+            let value = inline
+                .or_else(|| iter.next().map(String::as_str))
+                .filter(|v| !v.is_empty() && !v.starts_with('-') && !v.contains('\0'))
+                .ok_or_else(|| format!("missing value for {option}"))?;
+            if option == "--progress" {
+                if progress.is_some() {
+                    return Err("duplicate --progress".into());
+                }
+                progress = Some(match value {
+                    "auto" | "plain" => true,
+                    "quiet" => false,
+                    _ => return Err("--progress requires auto, plain or quiet".into()),
+                });
+            } else {
+                tag_count += 1;
+                if tag_count > 64 {
+                    return Err("at most 64 tag occurrences are allowed".into());
+                }
+                let tag = rpweld::registry::reference(value, false)?;
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        } else if !positional && arg == "--push" {
             if push {
                 return Err("duplicate --push".into());
             }
@@ -367,8 +409,6 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
                 "--max-layer-bytes",
                 "--metadata-budget",
                 "--run-timeout-seconds",
-                "-t",
-                "--tag",
                 "--authfile",
                 "--cert-dir",
                 "--target",
@@ -407,13 +447,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
                 if map.insert(key.to_owned(), val.to_owned()).is_some() {
                     return Err(format!("duplicate {arg} name: {key}"));
                 }
-            } else if values
-                .insert(
-                    if arg == "--tag" { "-t" } else { arg.as_str() },
-                    value.as_str(),
-                )
-                .is_some()
-            {
+            } else if values.insert(arg.as_str(), value.as_str()).is_some() {
                 return Err(format!("duplicate {arg}"));
             }
         } else if arg.is_empty() || context.replace(arg.clone()).is_some() {
@@ -436,18 +470,14 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
         .unwrap_or_else(|| context.join("Dockerfile").to_string_lossy().into_owned());
     let output = values.get("--output").copied().unwrap_or("").into();
     let work = values.get("--work-dir").copied().unwrap_or("").into();
-    let tag = values
-        .get("-t")
-        .map(|s| rpweld::registry::reference(s, false))
-        .transpose()?;
-    if push && tag.is_none() {
+    if push && tags.is_empty() {
         return Err("--push requires -t TAG".into());
     }
     if no_host_dns && host_dns {
         return Err("--host-dns conflicts with --no-host-dns".into());
     }
     let managed =
-        tag.is_some() || !values.contains_key("--output") || !values.contains_key("--work-dir");
+        !tags.is_empty() || !values.contains_key("--output") || !values.contains_key("--work-dir");
     host_dns = host_dns || (managed && !no_host_dns);
     let budget = |key, default: u64| -> Result<u64, String> {
         match values.get(key) {
@@ -492,7 +522,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
     Ok(BuildCli {
         record: None,
         dockerfile: dockerfile.clone(),
-        tag,
+        tags,
         push,
         pull,
         registry: rpweld::registry::Options {
@@ -506,6 +536,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             context,
             host_dns,
             verbose,
+            progress: progress.unwrap_or(true),
             target: values.get("--target").map(|s| s.to_string()),
             cache: None,
             no_cache,
@@ -592,22 +623,16 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
         Some(lease) => {
             #[cfg(target_os = "linux")]
             if let Some(r) = cli.record.as_mut() {
-                rpweld::build::build_recorded(&source, &cli.options, lease, r, || {
-                    CANCELLED.load(Ordering::Relaxed)
-                })
+                rpweld::build::build_recorded(&source, &cli.options, lease, r, cancelled)
             } else {
-                rpweld::build::build_with_lease(&source, &cli.options, lease, || {
-                    CANCELLED.load(Ordering::Relaxed)
-                })
+                rpweld::build::build_with_lease(&source, &cli.options, lease, cancelled)
             }
             #[cfg(not(target_os = "linux"))]
             {
-                rpweld::build::build_with_lease(&source, &cli.options, lease, || {
-                    CANCELLED.load(Ordering::Relaxed)
-                })
+                rpweld::build::build_with_lease(&source, &cli.options, lease, cancelled)
             }
         }
-        None => rpweld::build::build(&source, &cli.options, || CANCELLED.load(Ordering::Relaxed)),
+        None => rpweld::build::build(&source, &cli.options, cancelled),
     }
     .map_err(|e| e.to_string());
     let result = result?;
@@ -639,8 +664,7 @@ fn source_lease(path: &std::path::Path) -> Result<Option<rpweld::store_lease::St
     }
     let store = rpweld::registry::store_dir()?;
     let lease =
-        rpweld::store_lease::StoreLease::shared(&store, &|| CANCELLED.load(Ordering::Relaxed))
-            .map_err(|e| e.to_string())?;
+        rpweld::store_lease::StoreLease::shared(&store, &cancelled).map_err(|e| e.to_string())?;
     rpweld::store_access::validate_path(path, Some(&lease)).map_err(|e| e.to_string())?;
     Ok(Some(lease))
 }
@@ -699,7 +723,7 @@ fn prepare_build(
     let managed = early_lease.is_some()
         || cli.options.output.as_os_str().is_empty()
         || cli.options.work.as_os_str().is_empty()
-        || cli.tag.is_some()
+        || !cli.tags.is_empty()
         || cli.registry.authfile.is_some()
         || pull
         || [&cli.options.work, &cli.options.output, &cli.options.context]
@@ -715,10 +739,8 @@ fn prepare_build(
     let store = registry::store_dir()?;
     let lease = match early_lease {
         Some(lease) => lease,
-        None => {
-            rpweld::store_lease::StoreLease::shared(&store, &|| CANCELLED.load(Ordering::Relaxed))
-                .map_err(|e| e.to_string())?
-        }
+        None => rpweld::store_lease::StoreLease::shared(&store, &cancelled)
+            .map_err(|e| e.to_string())?,
     };
     rpweld::store_access::validate_root(&store, &lease).map_err(|e| e.to_string())?;
     for path in [&cli.options.work, &cli.options.output, &cli.options.context]
@@ -749,7 +771,7 @@ fn prepare_build(
             &lease,
             (!cli.options.work.as_os_str().is_empty()).then_some(cli.options.work.as_path()),
             (!cli.options.output.as_os_str().is_empty()).then_some(cli.options.output.as_path()),
-            cli.tag.iter().cloned().collect(),
+            cli.tags.clone(),
             cli.push,
         )
         .map_err(|e| e.to_string())?,
@@ -775,17 +797,13 @@ fn prepare_build(
                     &reference,
                     cli.pull,
                     cli.options.limits.image,
-                    || CANCELLED.load(Ordering::Relaxed),
+                    cancelled,
                     |reference, layout| {
                         writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
                             .map_err(|e| e.to_string())?;
                         out.flush().map_err(|e| e.to_string())?;
-                        registry::Transport::new(&cli.registry)?.pull(
-                            &lease,
-                            reference,
-                            layout,
-                            &|| CANCELLED.load(Ordering::Relaxed),
-                        )
+                        registry::Transport::new(&cli.registry)?
+                            .pull(&lease, reference, layout, &cancelled)
                     },
                 )?;
                 resolved.insert(reference, layout.clone());
@@ -821,24 +839,43 @@ fn finish_build(
     if CANCELLED.load(Ordering::Relaxed) {
         return Err("build cancelled before tagging".into());
     }
-    if let Some(tag) = &cli.tag {
-        let store = rpweld::registry::store_dir()?;
-        let lease = lease.ok_or("tagging requires store lease")?;
+    if cli.tags.is_empty() {
+        return Ok(());
+    }
+    let store = rpweld::registry::store_dir()?;
+    let lease = lease.ok_or("tagging requires store lease")?;
+    for tag in &cli.tags {
+        if cancelled() {
+            return Err("build cancelled during tagging; local image retained".into());
+        }
         rpweld::registry::save_tag(&store, lease, tag, &cli.options.output)?;
         writeln!(out, "Tagged {tag}").map_err(|e| e.to_string())?;
-        if cli.push {
-            let pushed = push_image_path(lease, tag, &cli.options.output, &cli.registry, out);
-            if let Some(r) = cli.record.as_mut() {
-                r.update(lease, |r| {
-                    r.push = if pushed.is_ok() {
-                        rpweld::build_record::PushResult::Succeeded
-                    } else {
-                        rpweld::build_record::PushResult::Failed
-                    }
-                })
-                .map_err(|e| e.to_string())?;
+    }
+    if cli.push {
+        let mut failed = 0;
+        for tag in &cli.tags {
+            // Never resolve the mutable tag record: push this build's verified output.
+            if let Err(error) = push_image_path(lease, tag, &cli.options.output, &cli.registry, out)
+            {
+                failed += 1;
+                writeln!(out, "Push failed for {tag}: {error}. Local image retained at {}; retry with 'rpweld push {tag}' (uses the current local tag).", cli.options.output.display())
+                    .map_err(|e| e.to_string())?;
             }
-            pushed?;
+        }
+        if let Some(r) = cli.record.as_mut() {
+            r.update(lease, |r| {
+                r.push = if failed == 0 {
+                    rpweld::build_record::PushResult::Succeeded
+                } else {
+                    rpweld::build_record::PushResult::Failed
+                };
+            })
+            .map_err(|e| e.to_string())?;
+        }
+        if failed != 0 {
+            return Err(format!(
+                "{failed} tag push(es) failed; local image retained"
+            ));
         }
     }
     Ok(())
@@ -852,8 +889,7 @@ fn push_image(
 ) -> Result<(), String> {
     let store = rpweld::registry::store_dir()?;
     let lease =
-        rpweld::store_lease::StoreLease::shared(&store, &|| CANCELLED.load(Ordering::Relaxed))
-            .map_err(|e| e.to_string())?;
+        rpweld::store_lease::StoreLease::shared(&store, &cancelled).map_err(|e| e.to_string())?;
     let image = rpweld::registry::tagged_image(&store, &lease, tag)?;
     push_image_path(&lease, tag, &image, options, out)
 }
@@ -877,13 +913,12 @@ fn push_image_path(
             max_layer_bytes: u64::MAX,
             max_total_layer_bytes: u64::MAX,
         },
-        || CANCELLED.load(Ordering::Relaxed),
+        cancelled,
     )
     .map_err(|e| e.to_string())?;
     writeln!(out, "Pushing {tag} (verified TLS)...").map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())?;
-    rpweld::registry::Transport::new(options)?
-        .push(lease, tag, image, &|| CANCELLED.load(Ordering::Relaxed))?;
+    rpweld::registry::Transport::new(options)?.push(lease, tag, image, &cancelled)?;
     writeln!(out, "Pushed {tag}").map_err(|e| e.to_string())
 }
 
@@ -922,13 +957,11 @@ fn registry_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<
     {
         match cmd {
             "login" => {
-                rpweld::registry::login(&target, username, password_stdin, &options, &|| {
-                    CANCELLED.load(Ordering::Relaxed)
-                })?;
+                rpweld::registry::login(&target, username, password_stdin, &options, &cancelled)?;
                 writeln!(out,"Logged in to {target}. File credentials are encoded, not encrypted; configure credHelpers for external storage.").map_err(|e|e.to_string())
             }
             "logout" => {
-                rpweld::registry::logout(&target, &options, &|| CANCELLED.load(Ordering::Relaxed))?;
+                rpweld::registry::logout(&target, &options, &cancelled)?;
                 writeln!(out, "Logged out of {target}").map_err(|e| e.to_string())
             }
             "push" => push_image(&target, &options, out),
@@ -1243,6 +1276,47 @@ mod tests {
         .chain(extra.iter().copied())
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    fn repeated_tags_are_bounded_normalized_and_progress_validated() {
+        let cli = parse_build_args(&build_args(&[
+            "-t",
+            "alpine",
+            "--tag=docker.io/library/alpine:latest",
+            "--tag",
+            "localhost:5000/test:v2",
+            "--progress=quiet",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cli.tags,
+            ["docker.io/library/alpine:latest", "localhost:5000/test:v2"]
+        );
+        assert!(!cli.options.progress);
+        for mode in ["auto", "plain"] {
+            assert!(
+                parse_build_args(&build_args(&["--progress", mode]))
+                    .unwrap()
+                    .options
+                    .progress
+            );
+        }
+        for extra in [
+            vec!["--tag="],
+            vec!["-t", "fine", "--tag=BAD"],
+            vec!["--progress=tty"],
+            vec!["--progress=quiet", "--progress=plain"],
+            vec!["--progress"],
+            vec!["--tag", "name@sha256:bad"],
+        ] {
+            assert!(parse_build_args(&build_args(&extra)).is_err(), "{extra:?}");
+        }
+        let mut args = build_args(&[]);
+        args.extend(std::iter::repeat_n("--tag=demo".to_owned(), 64));
+        assert_eq!(parse_build_args(&args).unwrap().tags.len(), 1);
+        args.push("--tag=demo".into());
+        assert!(parse_build_args(&args).err().unwrap().contains("64"));
     }
 
     #[test]

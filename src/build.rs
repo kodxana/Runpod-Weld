@@ -94,6 +94,8 @@ pub struct BuildOptions {
     pub host_dns: bool,
     /// Show low-level runner compatibility diagnostics.
     pub verbose: bool,
+    /// Append-only engine progress; RUN streams and diagnostics remain visible when false.
+    pub progress: bool,
     pub target: Option<String>,
     pub cache: Option<PathBuf>,
     pub no_cache: bool,
@@ -1420,11 +1422,10 @@ fn build_inner(
             stage_options.work = parent.join(format!("stage-{n}-work"));
             stage_options.output = parent.join(format!("stage-{n}-image"));
         }
-        eprintln!(
-            "Stage {}: {}",
-            n + 1,
-            plan.stages[n].name.as_deref().unwrap_or("unnamed")
-        );
+        let stage_started = std::time::Instant::now();
+        if options.progress {
+            eprintln!("Stage {}/{}: START", n + 1, plan.stages.len());
+        }
         let result = build_stage(
             &plan,
             n,
@@ -1437,8 +1438,17 @@ fn build_inner(
             n == target,
             lease,
             &cancelled,
-        )?;
-        previous.insert(n, result);
+        );
+        if options.progress {
+            eprintln!(
+                "Stage {}/{}: {} {:.3}s",
+                n + 1,
+                plan.stages.len(),
+                if result.is_ok() { "DONE" } else { "FAILED" },
+                stage_started.elapsed().as_secs_f64()
+            );
+        }
+        previous.insert(n, result?);
     }
     Ok(previous.remove(&target).unwrap().result)
 }
@@ -1670,7 +1680,9 @@ fn build_stage(
         steps.clear();
         checkpoints.clear();
         cache_hit = true;
-        eprintln!("  CACHED (verified local stage)");
+        if options.progress {
+            eprintln!("  CACHED (verified local stage); all instructions");
+        }
     }
     #[cfg(target_os = "linux")]
     if steps.iter().any(|s| matches!(s, Step::Run { .. })) && unsafe { libc::geteuid() } != 0 {
@@ -1720,6 +1732,15 @@ fn build_stage(
     let mut last_checkpoint: Option<(PathBuf, Descriptor, Value)> = None;
     let mut start = 0usize;
     for boundary in &checkpoints {
+        let started = std::time::Instant::now();
+        if options.progress {
+            eprintln!(
+                "  [stage {} instruction {}] {} START",
+                index + 1,
+                boundary.ordinal,
+                boundary.operation
+            );
+        }
         let instruction_steps = &steps[start..boundary.end];
         let mut fingerprint_summary: Option<context::Summary> = None;
         let entry = if let Some(builder) = &builder_identity {
@@ -1818,10 +1839,15 @@ fn build_stage(
                 .any(|step| !matches!(step, Step::Directory { path, .. } if path == "/"));
             prior_identity = Some(manifest.digest.to_string());
             last_checkpoint = Some((entry.clone(), manifest, boundary.config.clone()));
-            eprintln!(
-                "  CACHED instruction {} {}",
-                boundary.ordinal, boundary.operation
-            );
+            if options.progress {
+                eprintln!(
+                    "  CACHED instruction {} {} [stage {}] {:.3}s",
+                    boundary.ordinal,
+                    boundary.operation,
+                    index + 1,
+                    started.elapsed().as_secs_f64()
+                );
+            }
             start = boundary.end;
             continue;
         }
@@ -1945,6 +1971,15 @@ fn build_stage(
             // Even an unkeyable COPY must replace the prior filesystem identity.
             prior_identity = Some(manifest.digest.to_string());
             last_checkpoint = Some((snapshot, manifest, boundary.config.clone()));
+        }
+        if options.progress {
+            eprintln!(
+                "  [stage {} instruction {}] {} DONE {:.3}s",
+                index + 1,
+                boundary.ordinal,
+                boundary.operation,
+                started.elapsed().as_secs_f64()
+            );
         }
         start = boundary.end;
     }
@@ -2291,6 +2326,7 @@ mod tests {
             args: BTreeMap::new(),
             host_dns: false,
             verbose: false,
+            progress: true,
             target: None,
             cache: None,
             no_cache: false,

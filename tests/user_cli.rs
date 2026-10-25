@@ -498,7 +498,8 @@ fn cache_user_and_account_changes_preserve_real_identity() {
                 log.contains("CACHED (verified local stage)")
                     || log
                         .lines()
-                        .any(|line| line.contains("CACHED instruction") && line.ends_with("RUN")),
+                        .any(|line| line.contains("CACHED instruction")
+                            && line.contains(" RUN [stage ")),
                 "unchanged account repeat must replay RUN or its completed stage: {log}"
             );
         }

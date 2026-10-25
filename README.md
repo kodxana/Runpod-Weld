@@ -11,11 +11,32 @@ rpweld build -t myuser/my-app:latest .
 rpweld login docker.io
 rpweld push myuser/my-app:latest
 # Or build and publish together:
-rpweld build -t ghcr.io/myuser/my-app:latest --push .
+rpweld build -t ghcr.io/myuser/my-app:latest --tag=ghcr.io/myuser/my-app:v1 --push .
 rpweld logout docker.io
 ```
 
-The default Dockerfile is `CONTEXT/Dockerfile`. Short image names resolve explicitly to Docker Hub (`ubuntu:24.04` becomes `docker.io/library/ubuntu:24.04`). FROM images reuse fully verified local bases for Linux amd64 and pull on a miss; `--base NAME=LAYOUT` overrides that lookup. Equivalent references are resolved once per invocation. One output tag is supported per build. Tags are published atomically only after a successful export. Failed pushes retain the local tag so `rpweld push TAG` can retry without rebuilding.
+Repeat `-t` / `--tag` to name the same build output (up to 64 occurrences).
+`--tag=NAME` also works. Tags are normalized and validated before reading the
+Dockerfile or pulling; normalized duplicates are ignored in first-seen order.
+A failed build leaves old tags intact. Successful local tag writes are atomic
+individually, **not** a transaction across all tags. `--push` attempts every tag
+from this build's retained, verified output, reports each success/failure, and
+returns failure if any push fails. Retry with `rpweld push TAG`; that command
+uses the current local tag, which another build may have replaced.
+
+`--progress=auto|plain|quiet` (or `--progress MODE`) controls engine progress.
+`auto` is the default and currently equals `plain`: append-only stderr lines,
+without terminal redraw. Stage numbers follow Dockerfile order; step numbers
+are stage-local instruction ordinals for FROM/COPY/RUN/WORKDIR, so gaps denote
+metadata instructions evaluated with the next boundary or final export.
+Lines show operation names, start/completion, verified cache hits and elapsed
+seconds; instruction arguments are omitted. A whole-stage hit summarizes all
+instructions. `quiet` hides these engine lines only: RUN stdout/stderr stream
+unchanged, and diagnostics, registry transfer output and final results remain
+visible. These modes do not change cache identity. RUN can itself print secrets;
+progress does not echo Dockerfile arguments or environment values.
+
+The default Dockerfile is `CONTEXT/Dockerfile`. Short image names resolve explicitly to Docker Hub (`ubuntu:24.04` becomes `docker.io/library/ubuntu:24.04`). FROM images reuse fully verified local bases for Linux amd64 and pull on a miss; `--base NAME=LAYOUT` overrides that lookup. Equivalent references are resolved once per invocation. Tags are published only after a successful export; failed pushes retain local images and tags.
 
 Weld creates unique build directories under `${RPWELD_HOME:-$HOME/.local/share/rpweld}`. This directory must be private (0700), owned by the current user, and outside the context. Work, output images and published base generations are retained for inspection; failed registry staging is removed. There is no automatic garbage collection yet. The managed workflow defaults to 2 GiB rootfs/layer budgets, 64 MiB metadata and temporary host DNS (`--no-host-dns` disables it). Explicit `--output` and `--work-dir` without a tag preserve the legacy limits and DNS opt-in. These limits are checked by the builder after transfer, not enforced download/disk quotas; provision sufficient storage. Registry transfers have a 15-minute timeout.
 

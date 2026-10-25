@@ -30,6 +30,7 @@ fn options(root: &Path) -> BuildOptions {
         args: BTreeMap::new(),
         host_dns: false,
         verbose: false,
+        progress: true,
         target: None,
         no_cache: false,
         limits: Limits {
