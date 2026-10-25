@@ -10,19 +10,56 @@
 //! Directory contents merge into destination. Multiple sources require a
 //! trailing slash. A single file uses its basename when destination is a
 //! directory (including an image-root symlink to one). Type collisions fail.
-//! Nonempty or non-regular .dockerignore fails closed before any image mutation.
+//! Ordered .dockerignore rules filter local sources before payload/xattr reads.
 //!
 //! Preserves permission bits, assigns uid/gid 0, and copies hardlinks as separate
 //! files. Nanosecond atime/mtime and user.* / security.capability xattrs are
 //! preserved. Other xattrs (including ACLs) fail preflight. Existing selected
 //! directory roots retain ownership/mode/xattrs; nested directories take source
-//! metadata. Sparse layout, COPY flags/stages and ignore rules are unsupported.
+//! metadata. Sparse layout and COPY flags are unsupported.
 //! Cancellation is cooperative, not an I/O timeout. Metadata accounting includes
 //! xattr payloads and per-attribute overhead, not allocator bookkeeping/capacity.
 //! Temporary overhead: 128 traversal frames/FDs, 64 KiB xattr names, up to 64 KiB
 //! captured values before budget charging plus one 64 KiB value buffer, a 64 KiB
 //! streaming buffer, and O(entries) manifest/index allocation slack.
+use crate::dockerignore::Policy;
 use std::{fmt, io, path::Path};
+
+pub(crate) fn load_policy(
+    context: &Path,
+    dockerfile: Option<&Path>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Policy, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::load_policy(context, dockerfile, cancelled)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (context, dockerfile, cancelled);
+        Err(Error::Unsupported("context requires Linux"))
+    }
+}
+
+pub(crate) fn validate_sources(
+    context: &Path,
+    sources: &[&str],
+    policy: &Policy,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), Error> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::validate_sources(context, sources, policy, cancelled)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (context, sources, policy, cancelled);
+        Err(Error::Unsupported("context requires Linux"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::fingerprint;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -41,6 +78,28 @@ pub struct Summary {
     pub entries: usize,
     pub bytes_written: u64,
     pub metadata_bytes: u64,
+    pub(crate) targets: Vec<Vec<u8>>,
+}
+
+// Reuse execution's resolved destination roots, which may depend on earlier RUNs
+// or image symlinks. Rewalk sources so ignored entries still consume budgets.
+pub(crate) fn validate_copy_budget(
+    context: &Path,
+    sources: &[&str],
+    targets: &[Vec<u8>],
+    limits: Limits,
+    policy: Option<&Policy>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Summary, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::validate_copy_budget(context, sources, targets, limits, policy, cancelled)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (context, sources, targets, limits, policy, cancelled);
+        Err(Error::Unsupported("context requires Linux"))
+    }
 }
 
 #[derive(Debug)]
@@ -73,13 +132,14 @@ pub fn copy_local(
     limits: Limits,
     cancelled: impl Fn() -> bool,
 ) -> Result<Summary, Error> {
-    copy_source(
+    let policy = load_policy(context_root, None, &cancelled)?;
+    copy_filtered(
         context_root,
         image_root,
         sources,
         destination,
         limits,
-        false,
+        Some(&policy),
         cancelled,
     )
 }
@@ -93,24 +153,24 @@ pub fn copy_stage(
     limits: Limits,
     cancelled: impl Fn() -> bool,
 ) -> Result<Summary, Error> {
-    copy_source(
+    copy_filtered(
         context_root,
         image_root,
         sources,
         destination,
         limits,
-        true,
+        None,
         cancelled,
     )
 }
 
-fn copy_source(
+pub(crate) fn copy_filtered(
     context_root: &Path,
     image_root: &Path,
     sources: &[&str],
     destination: &str,
     limits: Limits,
-    stage: bool,
+    policy: Option<&Policy>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Summary, Error> {
     #[cfg(target_os = "linux")]
@@ -121,7 +181,7 @@ fn copy_source(
             sources,
             destination,
             limits,
-            stage,
+            policy,
             &cancelled,
         )
     }
@@ -133,7 +193,7 @@ fn copy_source(
             sources,
             destination,
             limits,
-            stage,
+            policy,
             cancelled,
         );
         Err(Error::Unsupported("local COPY requires Linux"))
@@ -209,6 +269,194 @@ mod linux {
         })?;
         Ok(unsafe { File::from_raw_fd(fd) })
     }
+
+    pub(super) fn load_policy(
+        ctx: &Path,
+        dockerfile: Option<&Path>,
+        c: &impl Fn() -> bool,
+    ) -> Result<Policy, Error> {
+        fn read(
+            parent: &File,
+            name: &[u8],
+            c: &impl Fn() -> bool,
+        ) -> Result<Option<Policy>, Error> {
+            check(c)?;
+            let pin = match open(parent, name, libc::O_PATH | libc::O_NOFOLLOW, true) {
+                Ok(pin) => pin,
+                Err(e) if missing(&e) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let m = pin.metadata()?;
+            if !m.is_file() {
+                return Err(Error::Invalid(
+                    "dockerignore must be a regular non-symlink file",
+                ));
+            }
+            if m.len() > crate::dockerignore::MAX_BYTES as u64 {
+                return Err(Error::Limit("dockerignore bytes"));
+            }
+            let mut f = open(
+                parent,
+                name,
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOATIME,
+                true,
+            )?;
+            let mut bytes = Vec::new();
+            let mut buf = [0; 65536];
+            loop {
+                check(c)?;
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                if bytes.len() + n > crate::dockerignore::MAX_BYTES {
+                    return Err(Error::Limit("dockerignore bytes"));
+                }
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            Ok(Some(Policy::parse(&bytes)?))
+        }
+        check(c)?;
+        if let Some(file) = dockerfile {
+            let parent = file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let mut name = file
+                .file_name()
+                .ok_or(Error::Invalid("Dockerfile path"))?
+                .as_bytes()
+                .to_vec();
+            name.extend_from_slice(b".dockerignore");
+            if let Some(policy) = read(&root(parent)?, &name, c)? {
+                return Ok(policy);
+            }
+        }
+        Ok(read(&root(ctx)?, b".dockerignore", c)?.unwrap_or_default())
+    }
+
+    pub(super) fn validate_sources(
+        ctx: &Path,
+        sources: &[&str],
+        policy: &Policy,
+        c: &impl Fn() -> bool,
+    ) -> Result<(), Error> {
+        let ctx = root(ctx)?;
+        let mut work = crate::dockerignore::WORK;
+        for source in sources {
+            check(c)?;
+            let src = path(source, false)?;
+            let m = open(&ctx, &src, libc::O_PATH | libc::O_NOFOLLOW, true)?.metadata()?;
+            if policy.excluded_cancellable(&src, &mut work, c)? {
+                return Err(Error::Invalid(
+                    "explicit COPY source excluded by dockerignore",
+                ));
+            }
+            if !(m.is_file() || m.is_dir()) {
+                return Err(Error::Unsupported("explicit source type"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fingerprint(
+        ctx: &Path,
+        policy: &Policy,
+        limits: Limits,
+        c: &impl Fn() -> bool,
+    ) -> Result<Vec<u8>, Error> {
+        use sha2::{Digest, Sha256};
+        fn field(h: &mut Sha256, bytes: &[u8]) {
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        }
+        let ctx = root(ctx)?;
+        let mut plan = Plan {
+            policy: Some(policy),
+            work: crate::dockerignore::WORK,
+            visited: 0,
+            entries: Vec::new(),
+            used: Summary::default(),
+            limits,
+        };
+        plan.visit(&ctx, Vec::new(), Vec::new(), true, 0, c)?;
+        plan.entries.sort_by(|a, b| a.src.cmp(&b.src));
+        let mut hash = Sha256::new();
+        field(&mut hash, &policy.identity());
+        for e in &mut plan.entries {
+            check(c)?;
+            field(&mut hash, &e.src);
+            field(&mut hash, &e.kind.to_le_bytes());
+            field(&mut hash, &e.mode.to_le_bytes());
+            field(&mut hash, &e.size.to_le_bytes());
+            field(&mut hash, &e.link);
+            e.attrs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, value) in &e.attrs {
+                field(&mut hash, name.as_bytes());
+                field(&mut hash, value);
+            }
+            field(&mut hash, b"end-xattrs");
+            if e.kind == libc::S_IFREG {
+                let mut f = open(
+                    &ctx,
+                    &e.src,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOATIME,
+                    true,
+                )?;
+                if !f.metadata()?.is_file() {
+                    return Err(Error::Invalid("source changed"));
+                }
+                let mut remaining = e.size;
+                let mut buf = [0; 65536];
+                while remaining > 0 {
+                    check(c)?;
+                    let n = remaining.min(buf.len() as u64) as usize;
+                    f.read_exact(&mut buf[..n])?;
+                    hash.update(&buf[..n]);
+                    remaining -= n as u64;
+                }
+                if f.read(&mut buf[..1])? != 0 {
+                    return Err(Error::Invalid("source grew"));
+                }
+            }
+            // readlink can change atime; include what subsequent COPY observes.
+            let m = open(&ctx, &e.src, libc::O_PATH | libc::O_NOFOLLOW, true)?.metadata()?;
+            for time in times(&m) {
+                field(&mut hash, &time.tv_sec.to_le_bytes());
+                field(&mut hash, &time.tv_nsec.to_le_bytes());
+            }
+        }
+        Ok(hash.finalize().to_vec())
+    }
+
+    pub(super) fn validate_copy_budget(
+        ctx: &Path,
+        sources: &[&str],
+        targets: &[Vec<u8>],
+        limits: Limits,
+        policy: Option<&Policy>,
+        c: &impl Fn() -> bool,
+    ) -> Result<Summary, Error> {
+        if sources.len() != targets.len() || sources.is_empty() {
+            return Err(Error::Invalid("cached COPY targets"));
+        }
+        let ctx = root(ctx)?;
+        let mut plan = Plan {
+            policy,
+            work: crate::dockerignore::WORK,
+            visited: 0,
+            entries: Vec::new(),
+            used: Summary::default(),
+            limits,
+        };
+        for (source, target) in sources.iter().zip(targets) {
+            if target.len() > 4096 || target.contains(&0) {
+                return Err(Error::Invalid("cached COPY target"));
+            }
+            plan.visit(&ctx, path(source, false)?, target.clone(), true, 0, c)?;
+        }
+        Ok(plan.used)
+    }
     fn path(p: &str, absolute: bool) -> Result<Vec<u8>, Error> {
         if p.is_empty()
             || p.len() > 4096
@@ -253,12 +501,15 @@ mod linux {
         attrs: Vec<(CString, Vec<u8>)>,
         explicit: bool,
     }
-    struct Plan {
+    struct Plan<'a> {
+        policy: Option<&'a Policy>,
+        work: u64,
+        visited: usize,
         entries: Vec<Entry>,
         used: Summary,
         limits: Limits,
     }
-    impl Plan {
+    impl Plan<'_> {
         fn visit(
             &mut self,
             ctx: &File,
@@ -272,73 +523,60 @@ mod linux {
             if depth > 128 {
                 return Err(Error::Limit("directory depth"));
             }
-            if self.used.entries >= self.limits.max_entries {
+            if self.visited >= self.limits.max_entries {
                 return Err(Error::Limit("entries"));
+            }
+            self.visited += 1;
+            self.used.entries += 1;
+            self.used.metadata_bytes = self
+                .used
+                .metadata_bytes
+                .checked_add(512 + src.len() as u64 + dst.len() as u64)
+                .filter(|n| *n <= self.limits.max_metadata_bytes)
+                .ok_or(Error::Limit("metadata"))?;
+            let excluded = match self.policy {
+                Some(p) => p.excluded_cancellable(&src, &mut self.work, c)?,
+                None => false,
+            };
+            if excluded && explicit {
+                return Err(Error::Invalid(
+                    "explicit COPY source excluded by dockerignore",
+                ));
             }
             let pin = open(ctx, &src, libc::O_PATH | libc::O_NOFOLLOW, true)?;
             let m = pin.metadata()?;
             let kind = m.mode() & libc::S_IFMT;
+            if excluded && kind != libc::S_IFDIR {
+                if explicit {
+                    return Err(Error::Invalid(
+                        "explicit COPY source excluded by dockerignore",
+                    ));
+                }
+                return Ok(());
+            }
+            if excluded && !self.policy.is_some_and(|p| p.negations) {
+                if explicit {
+                    return Err(Error::Invalid(
+                        "explicit COPY source excluded by dockerignore",
+                    ));
+                }
+                return Ok(());
+            }
+            let insertion = self.entries.len();
             if ![libc::S_IFREG, libc::S_IFDIR, libc::S_IFLNK].contains(&kind) {
                 return Err(Error::Unsupported("special source file"));
             }
             if explicit && kind == libc::S_IFLNK {
                 return Err(Error::Unsupported("explicit source symlink dereference"));
             }
-            let mut link = Vec::new();
-            if kind == libc::S_IFLNK {
-                let mut b = [0u8; 4096];
-                let n = unsafe {
-                    libc::readlinkat(
-                        pin.as_raw_fd(),
-                        c"".as_ptr(),
-                        b.as_mut_ptr().cast(),
-                        b.len(),
-                    )
-                };
-                if n < 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
-                if n as usize == b.len() {
-                    return Err(Error::Limit("symlink target"));
-                }
-                link.extend_from_slice(&b[..n as usize]);
-            }
-            let attrs = attrs(ctx, &src, true, c)?;
-            let metadata = 512
-                + src.len() as u64
-                + dst.len() as u64
-                + link.len() as u64
-                + attrs
-                    .iter()
-                    .map(|(n, v)| 64 + n.as_bytes_with_nul().len() as u64 + v.len() as u64)
-                    .sum::<u64>();
-            self.used.metadata_bytes = self
-                .used
-                .metadata_bytes
-                .checked_add(metadata)
-                .filter(|v| *v <= self.limits.max_metadata_bytes)
-                .ok_or(Error::Limit("metadata"))?;
-            let size = if kind == libc::S_IFREG { m.len() } else { 0 };
-            self.used.bytes_written = self
-                .used
-                .bytes_written
-                .checked_add(size)
-                .filter(|v| *v <= self.limits.max_bytes)
-                .ok_or(Error::Limit("bytes"))?;
-            self.used.entries += 1;
-            self.entries.push(Entry {
-                src: src.clone(),
-                dst: dst.clone(),
-                mode: m.mode() & 0o7777,
-                size,
-                kind,
-                link,
-                times: times(&m),
-                attrs,
-                explicit,
-            });
             if kind == libc::S_IFDIR {
-                let fd = open(ctx, &src, libc::O_RDONLY | libc::O_DIRECTORY, true)?.into_raw_fd();
+                let fd = open(
+                    ctx,
+                    &src,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOATIME,
+                    true,
+                )?
+                .into_raw_fd();
                 let dp = unsafe { libc::fdopendir(fd) };
                 if dp.is_null() {
                     let e = io::Error::last_os_error();
@@ -376,6 +614,66 @@ mod linux {
                     self.visit(ctx, join(&src, n)?, join(&dst, n)?, false, depth + 1, c)?;
                 }
             }
+            if excluded && self.entries.len() == insertion {
+                if explicit {
+                    return Err(Error::Invalid(
+                        "explicit COPY source excluded by dockerignore",
+                    ));
+                }
+                return Ok(());
+            }
+            let mut link = Vec::new();
+            if kind == libc::S_IFLNK {
+                let mut b = [0u8; 4096];
+                let n = unsafe {
+                    libc::readlinkat(
+                        pin.as_raw_fd(),
+                        c"".as_ptr(),
+                        b.as_mut_ptr().cast(),
+                        b.len(),
+                    )
+                };
+                if n < 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                if n as usize == b.len() {
+                    return Err(Error::Limit("symlink target"));
+                }
+                link.extend_from_slice(&b[..n as usize]);
+            }
+            let attrs = attrs(ctx, &src, true, c)?;
+            let metadata = link.len() as u64
+                + attrs
+                    .iter()
+                    .map(|(n, v)| 64 + n.as_bytes_with_nul().len() as u64 + v.len() as u64)
+                    .sum::<u64>();
+            self.used.metadata_bytes = self
+                .used
+                .metadata_bytes
+                .checked_add(metadata)
+                .filter(|v| *v <= self.limits.max_metadata_bytes)
+                .ok_or(Error::Limit("metadata"))?;
+            let size = if kind == libc::S_IFREG { m.len() } else { 0 };
+            self.used.bytes_written = self
+                .used
+                .bytes_written
+                .checked_add(size)
+                .filter(|v| *v <= self.limits.max_bytes)
+                .ok_or(Error::Limit("bytes"))?;
+            self.entries.insert(
+                insertion,
+                Entry {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                    mode: m.mode() & 0o7777,
+                    size,
+                    kind,
+                    link,
+                    times: times(&m),
+                    attrs,
+                    explicit,
+                },
+            );
             Ok(())
         }
     }
@@ -591,7 +889,7 @@ mod linux {
         sources: &[&str],
         destination: &str,
         limits: Limits,
-        stage: bool,
+        policy: Option<&Policy>,
         c: &impl Fn() -> bool,
     ) -> Result<Summary, Error> {
         check(c)?;
@@ -608,29 +906,15 @@ mod linux {
         let ctx = root(ctx)?;
         let image = root(image)?;
         let dst = destination_path(&image, &dst, c)?;
-        if !stage {
-            match open(
-                &ctx,
-                b".dockerignore",
-                libc::O_PATH | libc::O_NOFOLLOW,
-                true,
-            ) {
-                Ok(f) => {
-                    let m = f.metadata()?;
-                    if !m.is_file() || m.len() != 0 {
-                        return Err(Error::Unsupported("nonempty or nonregular .dockerignore"));
-                    }
-                }
-                Err(e) if missing(&e) => (),
-                Err(e) => return Err(e),
-            }
-        }
         let dest_dir = match open(&image, &dst, libc::O_PATH, false) {
             Ok(f) => f.metadata()?.is_dir(),
             Err(e) if missing(&e) => false,
             Err(e) => return Err(e),
         };
         let mut plan = Plan {
+            policy,
+            work: crate::dockerignore::WORK,
+            visited: 0,
             entries: Vec::new(),
             used: Summary::default(),
             limits,
@@ -644,6 +928,7 @@ mod linux {
             } else {
                 dst.clone()
             };
+            plan.used.targets.push(target.clone());
             plan.visit(&ctx, src, target, true, 0, c)?;
         }
         // Inspect destination metadata too, before any mutation. Do not silently
@@ -735,7 +1020,12 @@ mod linux {
                     )
                 })?;
             } else {
-                let mut input = open(&ctx, &e.src, libc::O_RDONLY | libc::O_NONBLOCK, true)?;
+                let mut input = open(
+                    &ctx,
+                    &e.src,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOATIME,
+                    true,
+                )?;
                 if !input.metadata()?.is_file() {
                     return Err(Error::Invalid("source changed"));
                 }
@@ -822,6 +1112,124 @@ mod tests {
     }
     fn run(ctx: &Path, image: &Path, src: &[&str], dst: &str) -> Result<Summary, Error> {
         copy_local(ctx, image, src, dst, limits(), || false)
+    }
+
+    #[test]
+    fn cached_budget_uses_resolved_targets_and_execution_planner() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::create_dir(ctx.path().join("tree")).unwrap();
+        fs::write(ctx.path().join("tree/keep"), b"keep").unwrap();
+        fs::write(ctx.path().join("tree/ignored"), b"ignored").unwrap();
+        fs::write(ctx.path().join(".dockerignore"), b"tree/ignored\n").unwrap();
+        fs::create_dir(image.path().join("long-destination")).unwrap();
+        symlink("/long-destination", image.path().join("link")).unwrap();
+        let policy = load_policy(ctx.path(), None, &|| false).unwrap();
+        for sources in [&["tree"][..], &["tree/keep", "tree"][..]] {
+            let copied = run(ctx.path(), image.path(), sources, "/link/").unwrap();
+            assert!(
+                copied
+                    .targets
+                    .iter()
+                    .all(|p| p.starts_with(b"long-destination"))
+            );
+            let exact = Limits {
+                max_bytes: copied.bytes_written,
+                max_entries: copied.entries,
+                max_metadata_bytes: copied.metadata_bytes,
+            };
+            let checked = validate_copy_budget(
+                ctx.path(),
+                sources,
+                &copied.targets,
+                exact,
+                Some(&policy),
+                &|| false,
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    checked.entries,
+                    checked.bytes_written,
+                    checked.metadata_bytes
+                ),
+                (copied.entries, copied.bytes_written, copied.metadata_bytes)
+            );
+            for lower in [
+                Limits {
+                    max_bytes: exact.max_bytes - 1,
+                    ..exact
+                },
+                Limits {
+                    max_entries: exact.max_entries - 1,
+                    ..exact
+                },
+                Limits {
+                    max_metadata_bytes: exact.max_metadata_bytes - 1,
+                    ..exact
+                },
+            ] {
+                assert!(matches!(
+                    validate_copy_budget(
+                        ctx.path(),
+                        sources,
+                        &copied.targets,
+                        lower,
+                        Some(&policy),
+                        &|| false
+                    ),
+                    Err(Error::Limit(_))
+                ));
+            }
+            assert!(matches!(
+                validate_copy_budget(
+                    ctx.path(),
+                    sources,
+                    &copied.targets,
+                    exact,
+                    Some(&policy),
+                    &|| true
+                ),
+                Err(Error::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn excluded_directories_require_descendants_and_count_as_visited() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::create_dir_all(ctx.path().join("excluded/needed")).unwrap();
+        fs::create_dir_all(ctx.path().join("excluded/empty")).unwrap();
+        fs::write(ctx.path().join("excluded/needed/keep"), b"keep").unwrap();
+        fs::write(
+            ctx.path().join(".dockerignore"),
+            b"excluded\n!excluded/needed/keep\n",
+        )
+        .unwrap();
+        let policy = load_policy(ctx.path(), None, &|| false).unwrap();
+        assert!(validate_sources(ctx.path(), &["excluded"], &policy, &|| false).is_err());
+        assert!(run(ctx.path(), image.path(), &["excluded"], "/out").is_err());
+        let result = run(ctx.path(), image.path(), &["."], "/out").unwrap();
+        assert_eq!(result.entries, 6);
+        assert!(image.path().join("out/excluded/needed/keep").is_file());
+        assert!(!image.path().join("out/excluded/empty").exists());
+        let image = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            copy_local(
+                ctx.path(),
+                image.path(),
+                &["."],
+                "/out",
+                Limits {
+                    max_entries: 5,
+                    ..limits()
+                },
+                || false
+            ),
+            Err(Error::Limit(_))
+        ));
+        assert_eq!(fs::read_dir(image.path()).unwrap().count(), 0);
     }
     fn set_attr(p: &Path, name: &str, value: &[u8]) {
         use std::os::unix::ffi::OsStrExt;
@@ -1221,10 +1629,10 @@ mod tests {
             ),
             Err(Error::Cancelled)
         ));
-        fs::write(ctx.path().join(".dockerignore"), b"secret\n").unwrap();
+        fs::write(ctx.path().join(".dockerignore"), b"file\n").unwrap();
         assert!(matches!(
             run(ctx.path(), image.path(), &["file"], "/out"),
-            Err(Error::Unsupported(_))
+            Err(Error::Invalid(_))
         ));
         fs::remove_file(ctx.path().join(".dockerignore")).unwrap();
         symlink("file", ctx.path().join(".dockerignore")).unwrap();

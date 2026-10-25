@@ -20,10 +20,11 @@ pub(crate) fn key(
     inputs: &[u8],
     context: Option<&Path>,
     limits: Limits,
+    policy: &crate::dockerignore::Policy,
     cancelled: &impl Fn() -> bool,
 ) -> Result<String> {
     let mut hash = Sha256::new();
-    field(&mut hash, b"weld-stage-cache-v1");
+    field(&mut hash, b"weld-stage-cache-v3-copy-budgets");
     field(&mut hash, inputs);
     // Development builds share a version string: bind cache entries to executable bytes.
     let mut executable = fs::File::open(std::env::current_exe()?)?;
@@ -43,160 +44,28 @@ pub(crate) fn key(
     }
     if let Some(root) = context {
         #[cfg(target_os = "linux")]
-        fingerprint(root, &mut hash, limits, cancelled)?;
+        field(
+            &mut hash,
+            &crate::context::fingerprint(
+                root,
+                policy,
+                crate::context::Limits {
+                    max_bytes: limits
+                        .max_rootfs_bytes
+                        .min(limits.layer.max_uncompressed_bytes),
+                    max_entries: limits.max_rootfs_entries.min(limits.layer.max_entries),
+                    max_metadata_bytes: limits.layer.max_metadata_bytes,
+                },
+                cancelled,
+            )?,
+        );
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (root, limits);
+            let _ = (root, limits, policy);
             return Err("cache requires Linux".into());
         }
     }
     Ok(format!("{:x}", hash.finalize()))
-}
-
-#[cfg(target_os = "linux")]
-fn fingerprint(
-    root: &Path,
-    hash: &mut Sha256,
-    limits: Limits,
-    cancelled: &impl Fn() -> bool,
-) -> Result<()> {
-    use std::{
-        ffi::CString,
-        os::unix::{
-            ffi::OsStrExt,
-            fs::{MetadataExt, OpenOptionsExt},
-        },
-    };
-    let mut pending = vec![PathBuf::new()];
-    let (mut entries, mut bytes, mut metadata) = (0usize, 0u64, 0u64);
-    while let Some(relative) = pending.pop() {
-        if cancelled() {
-            return Err("cache hashing cancelled".into());
-        }
-        let path = root.join(&relative);
-        let m = fs::symlink_metadata(&path)?;
-        entries += 1;
-        metadata = metadata
-            .checked_add(relative.as_os_str().len() as u64 + 128)
-            .ok_or("cache metadata overflow")?;
-        if entries > limits.max_rootfs_entries || metadata > limits.layer.max_metadata_bytes {
-            return Err("cache context metadata budget exceeded".into());
-        }
-        field(hash, relative.as_os_str().as_bytes());
-        field(
-            hash,
-            format!(
-                "{}:{}:{}:{}:{}",
-                m.mode(),
-                m.uid(),
-                m.gid(),
-                m.mtime(),
-                m.mtime_nsec()
-            )
-            .as_bytes(),
-        );
-        // Include all xattrs without following symlinks, including ACL/capability bytes.
-        let cpath = CString::new(path.as_os_str().as_bytes())?;
-        let size = unsafe { libc::llistxattr(cpath.as_ptr(), std::ptr::null_mut(), 0) };
-        if size < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        if size as u64 > limits.layer.max_metadata_bytes.saturating_sub(metadata) {
-            return Err("cache xattr budget exceeded".into());
-        }
-        let mut names = vec![0u8; size as usize];
-        let got =
-            unsafe { libc::llistxattr(cpath.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
-        if got != size {
-            return Err("context xattrs changed while hashing".into());
-        }
-        let mut names: Vec<_> = names.split(|b| *b == 0).filter(|n| !n.is_empty()).collect();
-        names.sort();
-        for name in names {
-            let cname = CString::new(name)?;
-            let size =
-                unsafe { libc::lgetxattr(cpath.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
-            if size < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            metadata = metadata
-                .checked_add(size as u64 + name.len() as u64)
-                .ok_or("cache xattr budget overflow")?;
-            if metadata > limits.layer.max_metadata_bytes {
-                return Err("cache xattr budget exceeded".into());
-            }
-            let mut value = vec![0u8; size as usize];
-            let got = unsafe {
-                libc::lgetxattr(
-                    cpath.as_ptr(),
-                    cname.as_ptr(),
-                    value.as_mut_ptr().cast(),
-                    value.len(),
-                )
-            };
-            if got != size {
-                return Err("context xattrs changed while hashing".into());
-            }
-            field(hash, name);
-            field(hash, &value);
-        }
-        field(hash, b"end-xattrs");
-        if m.is_dir() {
-            let mut children = Vec::new();
-            for child in fs::read_dir(&path)? {
-                if entries + pending.len() + children.len() >= limits.max_rootfs_entries {
-                    return Err("cache context entry budget exceeded".into());
-                }
-                children.push(relative.join(child?.file_name()));
-            }
-            children.sort();
-            pending.extend(children.into_iter().rev());
-        } else if m.is_file() {
-            bytes = bytes
-                .checked_add(m.len())
-                .ok_or("cache context byte overflow")?;
-            if bytes > limits.max_rootfs_bytes {
-                return Err("cache context byte budget exceeded".into());
-            }
-            field(hash, &m.len().to_le_bytes());
-            let mut f = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&path)?;
-            if !f.metadata()?.is_file() {
-                return Err("context file changed while hashing".into());
-            }
-            let mut read = 0u64;
-            let mut buf = [0u8; 65536];
-            loop {
-                if cancelled() {
-                    return Err("cache hashing cancelled".into());
-                }
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                read += n as u64;
-                if read > m.len() {
-                    return Err("context file changed while hashing".into());
-                }
-                hash.update(&buf[..n]);
-            }
-            if read != m.len() {
-                return Err("context file changed while hashing".into());
-            }
-        } else if m.file_type().is_symlink() {
-            field(hash, fs::read_link(&path)?.as_os_str().as_bytes());
-        } else {
-            return Err("cache context contains unsupported special file".into());
-        }
-        // read/read_dir/read_link can all change atime. Hash the value COPY will
-        // see, rather than the stale timestamp captured before fingerprinting.
-        let after = fs::symlink_metadata(&path)?;
-        field(hash, &after.atime().to_le_bytes());
-        field(hash, &after.atime_nsec().to_le_bytes());
-    }
-    Ok(())
 }
 
 pub(crate) fn lookup(path: &Path) -> Result<bool> {
@@ -211,6 +80,7 @@ pub(crate) fn lookup(path: &Path) -> Result<bool> {
 pub(crate) fn publish(
     source: &Path,
     destination: &Path,
+    targets: Option<&[Vec<Vec<u8>>]>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
     if lookup(destination)? {
@@ -226,6 +96,9 @@ pub(crate) fn publish(
         }
         for e in fs::read_dir(source.join(&relative))? {
             let e = e?;
+            if relative.as_os_str().is_empty() && e.file_name() == COPY_TARGETS {
+                continue;
+            }
             let child = relative.join(e.file_name());
             let target = temporary.path().join(&child);
             let kind = e.file_type()?;
@@ -239,6 +112,12 @@ pub(crate) fn publish(
             }
         }
     }
+    if let Some(targets) = targets {
+        fs::write(
+            temporary.path().join(COPY_TARGETS),
+            serde_json::to_vec(targets)?,
+        )?;
+    }
     match fs::rename(temporary.path(), destination) {
         Ok(()) => {
             let _ = temporary.keep();
@@ -247,4 +126,24 @@ pub(crate) fn publish(
         Err(_) if lookup(destination)? => Ok(()), // A concurrent successful build won publication.
         Err(e) => Err(e.into()),
     }
+}
+
+const COPY_TARGETS: &str = "weld-copy-targets.json";
+
+pub(crate) fn copy_targets(path: &Path, metadata_limit: u64) -> Result<Vec<Vec<Vec<u8>>>> {
+    // JSON byte arrays take at most four bytes per destination byte.
+    let limit = metadata_limit.saturating_mul(6).max(2);
+    if !fs::symlink_metadata(path.join(COPY_TARGETS))?.is_file() {
+        return Err("cached COPY targets must be a regular file".into());
+    }
+    let file = fs::File::open(path.join(COPY_TARGETS))?;
+    if !file.metadata()?.is_file() || file.metadata()?.len() > limit {
+        return Err("cached COPY targets exceed metadata budget".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err("cached COPY targets exceed metadata budget".into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }

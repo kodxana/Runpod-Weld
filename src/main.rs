@@ -13,6 +13,13 @@ Usage:
   rpweld --version
   rpweld --help
 
+  rpweld images [--json]
+  rpweld image inspect TAG [--json]
+  rpweld cache ls [--json]
+  rpweld cache du [--json]
+  rpweld builds ls [--json]
+  rpweld builds inspect BUILD_ID [--json]
+
   rpweld login REGISTRY [--username USER] [--password-stdin] [--authfile FILE] [--cert-dir DIR]
   rpweld logout REGISTRY [--authfile FILE]
   rpweld push TAG [--authfile FILE] [--cert-dir DIR]
@@ -38,7 +45,7 @@ Local COPY supports plain/JSON paths, directory merges and multiple sources
 (destination must end in /), relative to WORKDIR. Basic $NAME/${NAME} expansion
 and Docker word quotes are supported; JSON embedded quotes/backslashes rejected.
 Sources must be context-relative: no globs, parent paths, explicit symlinks,
-unsupported COPY flags, or nonempty .dockerignore. COPY --from accepts prior stages.
+unsupported COPY flags. .dockerignore filters local COPY sources. COPY --from accepts prior stages.
 --target selects a named stage and its dependencies. Managed builds cache completed
 stages locally; --no-cache bypasses stage reads/writes only. No container run command yet. COPY bytes/entries/metadata accumulate across steps
 under the rootfs/layer limits; rootfs is also checked after each step.
@@ -52,6 +59,10 @@ Rootfs is checked between operations. No host RAM sizing or capacity guesses.
 Trusted images/commands and stable paths required; this is not a sandbox.
 Work/output must be new, disjoint paths outside context/base; failures retain them.
 Doctor is read-only. Observed resource limits are not per-build enforcement.
+Storage commands are read-only, Linux-only, bounded best-effort observations.
+Missing stores are empty. Inspect uses an exact normalized tag or full build ID.
+Complete means structurally complete, not digest-verified. Unknown stays unknown.
+Usage is not reclaimable space; no deletion or prune commands are implemented.
 ";
 
 fn execute(args: &[String], out: &mut impl Write) -> Result<(), String> {
@@ -65,6 +76,9 @@ fn execute(args: &[String], out: &mut impl Write) -> Result<(), String> {
         [cmd, flag] if cmd == "doctor" && flag == "--json" => doctor(out, true),
         [cmd, rest @ ..] if cmd == "scan" => scan(rest, out),
         [cmd, rest @ ..] if cmd == "build" => run_build(rest, out),
+        [cmd, rest @ ..] if ["images", "image", "cache", "builds"].contains(&cmd.as_str()) => {
+            storage_command(cmd, rest, out)
+        }
         [cmd, rest @ ..] if ["login", "logout", "push"].contains(&cmd.as_str()) => {
             registry_command(cmd, rest, out)
         }
@@ -73,6 +87,105 @@ fn execute(args: &[String], out: &mut impl Write) -> Result<(), String> {
         )),
         _ => Err("unrecognized command or option; use 'rpweld --help'".into()),
     }
+}
+
+fn storage_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(), String> {
+    use rpweld::store_inventory::{Limits, inspect_existing};
+    let json_output = args.last().is_some_and(|v| v == "--json");
+    let args = if json_output {
+        &args[..args.len() - 1]
+    } else {
+        args
+    };
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (operation, lookup) = match (cmd, words.as_slice()) {
+        ("images", []) => ("images", None),
+        ("image", ["inspect", tag]) if !tag.starts_with('-') => {
+            ("image", Some(rpweld::registry::reference(tag, false)?))
+        }
+        ("cache", ["ls"]) => ("cache", None),
+        ("cache", ["du"]) => ("usage", None),
+        ("builds", ["ls"]) => ("builds", None),
+        ("builds", ["inspect", id])
+            if id.starts_with("build-")
+                && !id.contains(['/', '\\'])
+                && !id.chars().any(char::is_control) =>
+        {
+            ("build", Some((*id).to_owned()))
+        }
+        _ => return Err("invalid storage command or option; use 'rpweld --help'".into()),
+    };
+    if !cfg!(target_os = "linux") {
+        return Err(
+            "storage inventory is unsupported on this platform; requires Linux openat2".into(),
+        );
+    }
+    let inventory = inspect_existing(Limits::default(), || CANCELLED.load(Ordering::Relaxed))
+        .map_err(|e| format!("cannot inspect store: {e}"))?;
+    // Convert fallibly before json!: its Serialize errors would otherwise panic.
+    let serialized = serde_json::to_value(&inventory).map_err(|e| e.to_string())?;
+    let data = match operation {
+        "images" => json!({"tags": serialized["tags"]}),
+        "image" => {
+            json!({"tag": serde_json::to_value(inventory.image_inspect(lookup.as_deref().unwrap())
+            .ok_or("image tag not found in observed store (lookup uses exact normalized tags)")?)
+            .map_err(|e| e.to_string())?})
+        }
+        "cache" => {
+            json!({"base_refs": serialized["base_refs"], "generations": serialized["generations"],
+            "stages": serialized["stages"]})
+        }
+        "usage" => json!({"usage": serialized["cache_usage"]}),
+        "builds" => json!({"builds": serialized["builds"]}),
+        "build" => {
+            json!({"build": serde_json::to_value(inventory.build_inspect(lookup.as_deref().unwrap())
+            .ok_or("build ID not found in observed store")?).map_err(|e| e.to_string())?})
+        }
+        _ => unreachable!(),
+    };
+    let report = json!({"schema_version": 1, "store": serialized["store"],
+        "status": serialized["status"], "best_effort": serialized["best_effort"],
+        "partial": serialized["partial"], "issues": serialized["issues"], "data": data});
+    if json_output {
+        serde_json::to_writer_pretty(&mut *out, &report).map_err(|e| e.to_string())?;
+        return writeln!(out).map_err(|e| e.to_string());
+    }
+    // JSON escapes U+0000..001F; also escape DEL and non-ASCII for terminals.
+    let safe = |value: &serde_json::Value| {
+        value
+            .to_string()
+            .chars()
+            .map(|c| {
+                if c.is_ascii() && !c.is_ascii_control() {
+                    c.to_string()
+                } else {
+                    c.escape_default().to_string()
+                }
+            })
+            .collect::<String>()
+    };
+    writeln!(
+        out,
+        "Store {}: {} (best effort; partial={})",
+        safe(&report["store"]),
+        safe(&report["status"]),
+        report["partial"]
+    )
+    .map_err(|e| e.to_string())?;
+    for (kind, value) in report["data"].as_object().unwrap() {
+        if let Some(rows) = value.as_array() {
+            writeln!(out, "{kind}: {}", rows.len()).map_err(|e| e.to_string())?;
+            for row in rows {
+                writeln!(out, "  {}", safe(row)).map_err(|e| e.to_string())?;
+            }
+        } else {
+            writeln!(out, "{kind}: {}", safe(value)).map_err(|e| e.to_string())?;
+        }
+    }
+    for issue in report["issues"].as_array().unwrap() {
+        writeln!(out, "issue: {}", safe(issue)).map_err(|e| e.to_string())?;
+    }
+    writeln!(out, "Complete = structural only, not digest-verified; ownership/targets may be unknown.\nAll entries protected; usage is not reclaimable space.").map_err(|e| e.to_string())
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -266,7 +379,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
         return Err("scratch cannot have a base binding".into());
     }
     Ok(BuildCli {
-        dockerfile,
+        dockerfile: dockerfile.clone(),
         tag,
         push,
         pull,
@@ -275,6 +388,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             cert_dir: values.get("--cert-dir").map(std::path::PathBuf::from),
         },
         options: rpweld::build::BuildOptions {
+            dockerfile: Some(dockerfile.into()),
             work,
             output,
             context,
@@ -334,7 +448,7 @@ fn read_build_source(path: &str) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOATIME);
     }
     let file = options.open(path).map_err(|e| format!("{path}: {e}"))?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
@@ -747,12 +861,14 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(target_os = "linux")]
-    if args
-        .first()
-        .is_some_and(|arg| ["build", "push", "login", "logout"].contains(&arg.as_str()))
-        && let Err(error) = install_build_signals()
+    if args.first().is_some_and(|arg| {
+        [
+            "build", "push", "login", "logout", "images", "image", "cache", "builds",
+        ]
+        .contains(&arg.as_str())
+    }) && let Err(error) = install_build_signals()
     {
-        eprintln!("rpweld: cannot install build cancellation handlers: {error}");
+        eprintln!("rpweld: cannot install cancellation handlers: {error}");
         std::process::exit(2);
     }
     if let Err(error) = execute(&args, &mut io::stdout().lock()) {

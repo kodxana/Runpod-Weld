@@ -33,6 +33,23 @@ use std::{
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
+fn copy_limits(limits: Limits, used: &context::Summary) -> context::Limits {
+    context::Limits {
+        max_bytes: limits
+            .max_rootfs_bytes
+            .min(limits.layer.max_uncompressed_bytes)
+            .saturating_sub(used.bytes_written),
+        max_entries: limits
+            .max_rootfs_entries
+            .min(limits.layer.max_entries)
+            .saturating_sub(used.entries),
+        max_metadata_bytes: limits
+            .layer
+            .max_metadata_bytes
+            .saturating_sub(used.metadata_bytes),
+    }
+}
+
 /// Exact literal FROM name -> local OCI layout and optional ref annotation.
 #[derive(Clone, Debug)]
 pub struct LocalBase {
@@ -62,6 +79,9 @@ pub struct BuildOptions {
     pub work: PathBuf,
     pub output: PathBuf,
     pub context: PathBuf,
+    /// Selected Dockerfile; its sibling .dockerignore takes precedence, even when empty.
+    /// None uses only the context-root policy.
+    pub dockerfile: Option<PathBuf>,
     pub bases: BTreeMap<String, LocalBase>,
     pub args: BTreeMap<String, String>,
     pub limits: Limits,
@@ -241,13 +261,28 @@ fn copy_path(value: &str, absolute: bool) -> Result<()> {
     Ok(())
 }
 
-fn copy_ignore(context: &Path) -> Result<()> {
-    match fs::symlink_metadata(context.join(".dockerignore")) {
-        Ok(m) if m.is_file() && m.len() == 0 => Ok(()),
-        Ok(_) => Err("COPY requires absent or empty regular .dockerignore".into()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
+fn check_copy_sources(
+    steps: &[Step],
+    options: &BuildOptions,
+    policy: &crate::dockerignore::Policy,
+    c: &impl Fn() -> bool,
+) -> Result<()> {
+    for step in steps {
+        if let Step::Copy {
+            from: None,
+            sources,
+            ..
+        } = step
+        {
+            context::validate_sources(
+                &options.context,
+                &sources.iter().map(String::as_str).collect::<Vec<_>>(),
+                policy,
+                c,
+            )?;
+        }
     }
+    Ok(())
 }
 
 fn array(config: &Value, key: &str) -> Result<Vec<String>> {
@@ -541,20 +576,27 @@ fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<()>
         if depth > 256 {
             return Err("rootfs depth budget exceeded".into());
         }
-        for entry in fs::read_dir(p)? {
-            check(c)?;
-            let p = entry?.path();
-            let m = fs::symlink_metadata(&p)?;
-            *entries = entries.checked_add(1).ok_or("rootfs entry overflow")?;
-            *bytes = bytes.checked_add(m.len()).ok_or("rootfs byte overflow")?;
-            if *entries > l.max_rootfs_entries || *bytes > l.max_rootfs_bytes {
-                return Err("rootfs budget exceeded".into());
+        // Budget inspection must not change the metadata that COPY will export.
+        let directory = fs::File::open(p)?;
+        let accessed = directory.metadata()?.accessed()?;
+        let result = (|| {
+            for entry in fs::read_dir(p)? {
+                check(c)?;
+                let p = entry?.path();
+                let m = fs::symlink_metadata(&p)?;
+                *entries = entries.checked_add(1).ok_or("rootfs entry overflow")?;
+                *bytes = bytes.checked_add(m.len()).ok_or("rootfs byte overflow")?;
+                if *entries > l.max_rootfs_entries || *bytes > l.max_rootfs_bytes {
+                    return Err("rootfs budget exceeded".into());
+                }
+                if m.is_dir() {
+                    walk(&p, bytes, entries, depth + 1, l, c)?;
+                }
             }
-            if m.is_dir() {
-                walk(&p, bytes, entries, depth + 1, l, c)?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })();
+        directory.set_times(fs::FileTimes::new().set_accessed(accessed))?;
+        result
     }
     walk(root, &mut 0, &mut 0, 0, limits, c)
 }
@@ -617,6 +659,7 @@ pub fn build(
     }
     check(&cancelled)?;
     let plan = build_plan::parse(source)?;
+    let policy = context::load_policy(&options.context, options.dockerfile.as_deref(), &cancelled)?;
     let selected = selected_stages(&plan, options.target.as_deref())?;
     let target = *selected.last().unwrap();
     let work = fresh(&options.work)?;
@@ -666,12 +709,7 @@ pub fn build(
             }
         };
         let (config, steps, args) = preflight_stage(&plan, n, options, config, args)?;
-        if steps
-            .iter()
-            .any(|s| matches!(s, Step::Copy { from: None, .. }))
-        {
-            copy_ignore(&options.context)?;
-        }
+        check_copy_sources(&steps, options, &policy, &cancelled)?;
         evaluated_bytes = evaluated_bytes
             .checked_add(serde_json::to_vec(&config)?.len())
             .and_then(|n| n.checked_add(args.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()))
@@ -705,7 +743,15 @@ pub fn build(
             n + 1,
             plan.stages[n].name.as_deref().unwrap_or("unnamed")
         );
-        let result = build_stage(&plan, n, &stage_options, &previous, &mut notice, &cancelled)?;
+        let result = build_stage(
+            &plan,
+            n,
+            &stage_options,
+            &previous,
+            &mut notice,
+            &policy,
+            &cancelled,
+        )?;
         previous.insert(n, result);
     }
     Ok(previous.remove(&target).unwrap().result)
@@ -717,6 +763,7 @@ fn build_stage(
     options: &BuildOptions,
     previous: &BTreeMap<usize, StageResult>,
     notice: &mut bool,
+    policy: &crate::dockerignore::Policy,
     cancelled: impl Fn() -> bool,
 ) -> Result<StageResult> {
     check(&cancelled)?;
@@ -801,12 +848,7 @@ fn build_stage(
     };
     let (config, mut steps, args) =
         preflight_stage(plan, index, options, config, inherited.clone())?;
-    if steps
-        .iter()
-        .any(|s| matches!(s, Step::Copy { from: None, .. }))
-    {
-        copy_ignore(&options.context)?;
-    }
+    check_copy_sources(&steps, options, policy, &cancelled)?;
     let cache_entry = if let Some(cache) = options.cache.as_ref().filter(|_| !options.no_cache) {
         let dependencies: Vec<_> = plan.stages[index]
             .instructions
@@ -837,6 +879,7 @@ fn build_stage(
             input.as_bytes(),
             uses_context.then_some(options.context.as_path()),
             options.limits,
+            policy,
             &cancelled,
         )?))
     } else {
@@ -846,6 +889,29 @@ fn build_stage(
     if let Some(entry) = &cache_entry
         && crate::build_cache::lookup(entry)?
     {
+        let targets =
+            crate::build_cache::copy_targets(entry, options.limits.layer.max_metadata_bytes)?;
+        let mut targets = targets.iter();
+        let mut copied = context::Summary::default();
+        for step in &steps {
+            if let Step::Copy { from, sources, .. } = step {
+                let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
+                let summary = context::validate_copy_budget(
+                    stage_root.as_deref().unwrap_or(&options.context),
+                    &sources.iter().map(String::as_str).collect::<Vec<_>>(),
+                    targets.next().ok_or("missing cached COPY targets")?,
+                    copy_limits(options.limits, &copied),
+                    if from.is_some() { None } else { Some(policy) },
+                    &cancelled,
+                )?;
+                copied.bytes_written += summary.bytes_written;
+                copied.entries += summary.entries;
+                copied.metadata_bytes += summary.metadata_bytes;
+            }
+        }
+        if targets.next().is_some() {
+            return Err("extra cached COPY targets".into());
+        }
         for suffix in ["blobs", "blobs/sha256"] {
             let m = fs::symlink_metadata(entry.join(suffix))?;
             if !m.is_dir() || m.file_type().is_symlink() {
@@ -901,6 +967,7 @@ fn build_stage(
         }
     }
     let mut copied = context::Summary::default();
+    let mut copy_targets = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         check(&cancelled)?;
         match step {
@@ -909,37 +976,20 @@ fn build_stage(
                 sources,
                 destination,
             } => {
-                let limits = options.limits;
                 let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
-                let copy = if from.is_some() {
-                    context::copy_stage
-                } else {
-                    context::copy_local
-                };
-                let summary = copy(
+                let summary = context::copy_filtered(
                     stage_root.as_deref().unwrap_or(&options.context),
                     &root,
                     &sources.iter().map(String::as_str).collect::<Vec<_>>(),
                     destination,
-                    context::Limits {
-                        max_bytes: limits
-                            .max_rootfs_bytes
-                            .min(limits.layer.max_uncompressed_bytes)
-                            .saturating_sub(copied.bytes_written),
-                        max_entries: limits
-                            .max_rootfs_entries
-                            .min(limits.layer.max_entries)
-                            .saturating_sub(copied.entries),
-                        max_metadata_bytes: limits
-                            .layer
-                            .max_metadata_bytes
-                            .saturating_sub(copied.metadata_bytes),
-                    },
+                    copy_limits(options.limits, &copied),
+                    if from.is_some() { None } else { Some(policy) },
                     &cancelled,
                 )?;
                 copied.bytes_written += summary.bytes_written;
                 copied.entries += summary.entries;
                 copied.metadata_bytes += summary.metadata_bytes;
+                copy_targets.push(summary.targets);
             }
             Step::Directory(p) => {
                 directory(&root, p)?;
@@ -972,13 +1022,13 @@ fn build_stage(
     let manifest = if cache_hit {
         // Preserve the cached OCI bytes: re-exporting a replayed tree changes
         // access timestamps and would invalidate every dependent stage.
-        crate::build_cache::publish(cache_entry.as_ref().unwrap(), &output, &cancelled)?;
+        crate::build_cache::publish(cache_entry.as_ref().unwrap(), &output, None, &cancelled)?;
         metadata.as_ref().unwrap().selected.clone()
     } else {
         export::export_layout(&root, &output, &config, options.limits.export, &cancelled)?
     };
     if !cache_hit && let Some(entry) = cache_entry {
-        crate::build_cache::publish(&output, &entry, &cancelled)?;
+        crate::build_cache::publish(&output, &entry, Some(&copy_targets), &cancelled)?;
     }
     Ok(StageResult {
         result: BuildResult {
@@ -1134,6 +1184,7 @@ mod tests {
         let context = temp.join("context");
         fs::create_dir(&context).unwrap();
         BuildOptions {
+            dockerfile: None,
             work: temp.join("work"),
             output: temp.join("output"),
             context,
@@ -1233,11 +1284,88 @@ mod tests {
     }
 
     #[test]
+    fn cached_copy_rechecks_ignored_traversal_budgets() {
+        for budget in ["entries", "metadata"] {
+            let t = tempfile::tempdir().unwrap();
+            let mut o = options(t.path());
+            let source = "FROM scratch\nCOPY . /a/\nCOPY . /b/\n";
+            fs::write(o.context.join("Dockerfile"), source).unwrap();
+            fs::write(
+                o.context.join(".dockerignore"),
+                "Dockerfile\n.dockerignore\nignored\n!never\n",
+            )
+            .unwrap();
+            fs::write(o.context.join("keep"), "keep").unwrap();
+            fs::create_dir(o.context.join("ignored")).unwrap();
+            // Keep emitted timestamps stable even on relatime mounts.
+            let future = std::time::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+            for name in ["", "Dockerfile", ".dockerignore", "keep"] {
+                fs::File::open(o.context.join(name))
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_accessed(future)
+                            .set_modified(future),
+                    )
+                    .unwrap();
+            }
+            o.cache = Some(t.path().join("cache"));
+            fs::create_dir(o.cache.as_ref().unwrap()).unwrap();
+            if budget == "entries" {
+                o.limits.layer.max_entries = 20;
+            } else {
+                o.limits.layer.max_metadata_bytes = 10_000;
+            }
+            let first = build(source, &o, || false).unwrap();
+            o.work = t.path().join("work-hit");
+            o.output = t.path().join("output-hit");
+            assert_eq!(
+                first.manifest,
+                build(source, &o, || false).unwrap().manifest
+            );
+            let policy = context::load_policy(&o.context, None, &|| false).unwrap();
+            let key =
+                crate::build_cache::key(b"test", Some(&o.context), o.limits, &policy, &|| false)
+                    .unwrap();
+            for n in 0..6 {
+                fs::write(o.context.join(format!("ignored/{n}")), "ignored").unwrap();
+            }
+            assert_eq!(
+                key,
+                crate::build_cache::key(b"test", Some(&o.context), o.limits, &policy, &|| false)
+                    .unwrap()
+            );
+            for no_cache in [false, true] {
+                o.no_cache = no_cache;
+                o.work = t.path().join(format!("work-{no_cache}"));
+                o.output = t.path().join(format!("output-{no_cache}"));
+                let error = build(source, &o, || false).unwrap_err().to_string();
+                assert!(error.contains(&format!("Limit(\"{budget}\")")), "{error}");
+                if !no_cache {
+                    assert!(!o.work.exists(), "cache validation must precede replay");
+                }
+            }
+            for n in 0..2 {
+                fs::remove_file(o.context.join(format!("ignored/{n}"))).unwrap();
+            }
+            o.no_cache = false;
+            o.work = t.path().join("work-within-budget");
+            o.output = t.path().join("output-within-budget");
+            assert_eq!(
+                first.manifest,
+                build(source, &o, || false).unwrap().manifest
+            );
+            assert!(!o.output.join("weld-copy-targets.json").exists());
+        }
+    }
+
+    #[test]
     fn later_copy_filesystem_failure_can_follow_earlier_mutation() {
         let t = tempfile::tempdir().unwrap();
         let o = options(t.path());
         fs::write(o.context.join("a"), "data").unwrap();
-        assert!(build("FROM scratch\nCOPY a /a\nCOPY missing /b\n", &o, || false).is_err());
+        fs::create_dir(o.context.join("dir")).unwrap();
+        assert!(build("FROM scratch\nCOPY a /a\nCOPY dir /a\n", &o, || false).is_err());
         assert_eq!(fs::read(o.work.join("rootfs/a")).unwrap(), b"data");
         assert!(!o.output.exists());
     }

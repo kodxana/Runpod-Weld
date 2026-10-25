@@ -77,7 +77,7 @@ rpweld build -f context/Dockerfile --base alpine=./base-layout \
 
 Output is an OCI layout with a flattened, uncompressed layer. Work/output paths must be new and disjoint from the context and bases. Failed builds retain partial directories; do not reuse them. Optional `--host-dns` supplies temporary resolver configuration and restores it before export. Run `rpweld build --help` for base reference selection and budget controls.
 
-Local COPY supports directory merges and WORKDIR-relative destinations with cumulative budgets. Stage copies, flags, glob patterns, source symlink traversal and nonempty/nonregular `.dockerignore` files are rejected. Supported timestamps and xattrs are preserved; unsupported attributes/ACLs fail preflight. Copying is nontransactional: a later filesystem failure can leave earlier instructions executed and a partial work directory.
+Local COPY supports directory merges, `COPY .`, and WORKDIR-relative destinations with cumulative budgets. COPY flags other than `--from`, source glob patterns, and source symlink traversal are rejected. Supported timestamps and xattrs are preserved; unsupported attributes/ACLs fail preflight. Copying is nontransactional: a later filesystem failure can leave earlier instructions executed and a partial work directory.
 
 Legacy builds with explicit output/work directories and no tag default to 256 MiB rootfs/layer sizes and 16 MiB metadata per subsystem. Managed builds default to 2 GiB rootfs/layer sizes and 64 MiB metadata. The default RUN timeout is 300 seconds. These limits do not enforce RUN memory or disk quotas. End-to-end builds have been checked in WSL and Ubuntu 24.04 builds on a Runpod CPU Pod; broader Dockerfile compatibility remains experimental.
 
@@ -189,14 +189,45 @@ Run `rpweld build -t yourname/app:latest --push .`, or select a named stage with
 names and zero-based indexes work for `COPY --from`; `FROM previous-stage`
 inherits image configuration and declared ARG values. Other COPY flags and
 external-image COPY sources remain unsupported. Use a separate FROM stage for
-external images. Nonempty `.dockerignore` files still fail closed.
+external images. Stage COPY bypasses the context ignore policy.
+
+Local COPY uses the context-root `.dockerignore`, unless a file named exactly
+`<selected Dockerfile>.dockerignore` exists beside the selected Dockerfile. That
+file takes precedence even when empty, including for a Dockerfile outside the
+context (its parent is a trusted control-file root). Policies must be regular,
+non-symlink UTF-8 files. Linux Moby rules support ordered `!` exceptions, ancestor
+matches, `*`, `?`, `**`, escapes and character classes. A first-line BOM and CRLF
+are accepted; column-one comments are recognized before whitespace trimming;
+paths are lexically cleaned and `.` is ignored. Bare `!` is invalid. Filenames
+are retained as bytes. As in Moby v0.6.0, exact/prefix/suffix matching compares
+bytes, while regexp matching decodes each invalid UTF-8 byte as U+FFFD.
+Unescaped `^` outside character classes asserts the start only in regexp mode;
+it remains literal in exact/prefix/suffix modes. Escaped `\^` and class negation
+remain supported. Regexp assertion escapes,
+quoting, Unicode classes and braced hex escapes are also explicitly unsupported.
+Unescaped `|`, `{` and `}` outside classes are rejected in regexp mode; their
+literal exact/prefix/suffix, escaped and character-class forms are supported.
+
+Excluded explicit COPY sources fail before cache lookup or earlier instructions.
+Excluded directories are traversed conservatively when exceptions exist, and
+structural parents are emitted only when an included descendant needs them.
+Policies are capped at 1 MiB, 4096 rules, 4096 bytes per pattern and 65536 compiled
+states. Iterative matching has a 268435456-unit work budget per traversal;
+traversal is capped at 128 levels and 4096-byte paths. Visited excluded entries
+count toward entry/metadata budgets. Reads, traversal and matching support
+cooperative cancellation. Trees must remain stable throughout a build.
 
 Managed builds automatically cache completed stages under
 `~/.local/share/rpweld/cache-v1` (or `RPWELD_HOME/cache-v1`). Hits print `CACHED`.
 The key includes the builder executable, stage definition, arguments, limits,
 resolved base/dependency digests, and content/metadata of the context when that
-stage uses local COPY. Context hashing includes the entire context, including
-mtime and xattrs, so it may invalidate more often than Docker. Stage caching
+stage uses local COPY. Context hashing shares COPY's filtered traversal and
+includes the parsed policy identity and emitted content/metadata, including
+atime, mtime and xattrs. It still covers included paths unused by that stage.
+Ignored content changes do not invalidate the cache when emitted metadata is
+unchanged. Adding/removing an ignored entry can change its copied parent
+directory timestamp and validly invalidate the cache; directory timestamps are
+preserved, not normalized. Stage caching
 is not per-instruction caching: put expensive setup in a separate stage.
 `--no-cache` bypasses stage-cache reads and writes only. Cache hits verify OCI digests and
 replay layers under the requested limits before reuse. Corrupt entries fail
@@ -228,3 +259,18 @@ storage. Keep build contexts and source images stable throughout a build.
 multi-platform lists are rejected. This is not a BuildKit backend; remote
 BuildKit caches, secret/SSH mounts and unchanged `docker buildx` commands are
 not supported.
+
+### Inspect local storage
+
+Use `rpweld images`, `rpweld image inspect TAG`, `rpweld cache ls`,
+`rpweld cache du`, `rpweld builds ls`, and `rpweld builds inspect BUILD_ID`.
+Each accepts `--json`. These Linux-only commands provide bounded, read-only
+observations: missing stores remain absent, and external image paths are not
+traversed. `Complete` means structurally complete, not digest-verified. Reported
+usage is not reclaimable space; legacy builds remain protected and ownership is
+not inferred from a tag. Removal and pruning are not implemented.
+
+JSON schema v1 preserves UTF-8 paths as strings. Non-UTF-8 Unix paths use
+`{"unix_bytes":[...]}`; Windows equivalents use `{"windows_wide":[...]}`.
+These arrays preserve exact native path units without replacement-character
+collisions. Human-readable output escapes control characters.

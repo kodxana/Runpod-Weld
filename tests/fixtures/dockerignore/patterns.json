@@ -1,0 +1,157 @@
+[
+    {
+        "policy":  "tree\n!tree/deep/keep\n!tree/deep/again\ntree/deep/again\n",
+        "paths":  [
+                      [
+                          "tree/deep/keep",
+                          false
+                      ],
+                      [
+                          "tree/deep/again",
+                          true
+                      ],
+                      [
+                          "tree/other",
+                          true
+                      ],
+                      [
+                          "visible",
+                          false
+                      ]
+                  ],
+        "directories":  [
+                            "tree",
+                            "tree/deep"
+                        ]
+    },
+    {
+        "policy":  "*.log\n",
+        "paths":  [
+                      [
+                          "root.log",
+                          true
+                      ],
+                      [
+                          "nested/root.log",
+                          false
+                      ],
+                      [
+                          "keep",
+                          false
+                      ]
+                  ],
+        "directories":  [
+                            "nested"
+                        ]
+    },
+    {
+        "policy":  "a?c\n",
+        "paths":  [
+                      [
+                          "abc",
+                          true
+                      ],
+                      [
+                          "ac",
+                          false
+                      ],
+                      [
+                          "abbc",
+                          false
+                      ]
+                  ],
+        "directories":  [
+
+                        ]
+    },
+    {
+        "policy":  "**/*.tmp\n",
+        "paths":  [
+                      [
+                          "a.tmp",
+                          true
+                      ],
+                      [
+                          "one/a.tmp",
+                          true
+                      ],
+                      [
+                          "one/two/a.tmp",
+                          true
+                      ],
+                      [
+                          "one/keep",
+                          false
+                      ]
+                  ],
+        "directories":  [
+                            "one",
+                            "one/two"
+                        ]
+    },
+    {
+        "policy":  "a[b-d]e\na[^b-d]z\n",
+        "paths":  [
+                      [
+                          "ace",
+                          true
+                      ],
+                      [
+                          "aae",
+                          false
+                      ],
+                      [
+                          "aaz",
+                          true
+                      ],
+                      [
+                          "acz",
+                          false
+                      ]
+                  ],
+        "directories":  [
+
+                        ]
+    },
+    {
+        "policy":  "a\\*b\n\\!literal\n",
+        "paths":  [
+                      [
+                          "a*b",
+                          true
+                      ],
+                      [
+                          "axxb",
+                          false
+                      ],
+                      [
+                          "!literal",
+                          true
+                      ]
+                  ],
+        "directories":  [
+
+                        ]
+    },
+    {
+        "policy":  "﻿# comment\n /top/ \n.\n",
+        "paths":  [
+                      [
+                          "top/child",
+                          true
+                      ],
+                      [
+                          "nested/top/child",
+                          false
+                      ],
+                      [
+                          "keep",
+                          false
+                      ]
+                  ],
+        "directories":  [
+                            "nested",
+                            "nested/top"
+                        ]
+    }
+]
