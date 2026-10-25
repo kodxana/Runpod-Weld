@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 from decimal import Decimal
+from fixture_tar import FixtureInfo
 
 
 def verified(layout, descriptor):
@@ -165,7 +166,7 @@ def self_test():
             data = io.BytesIO()
             with tarfile.open(fileobj=data, mode="w", format=tarfile.PAX_FORMAT) as archive:
                 for name, kind, content, *extra in entries:
-                    entry = tarfile.TarInfo(name)
+                    entry = FixtureInfo(name)
                     entry.uid, entry.gid, entry.mode, entry.mtime = 123, 456, 0o750, 1700000000
                     entry.uname = entry.gname = "root"  # Deliberately conflicts with numeric ownership.
                     entry.type = kind
@@ -175,10 +176,16 @@ def self_test():
                         entry.pax_headers["SCHILY.xattr.user.fixture"] = "preserved"
                     elif kind in (tarfile.LNKTYPE, tarfile.SYMTYPE):
                         entry.linkname = content.decode()
+                        if kind == tarfile.SYMTYPE:
+                            entry.mode = 0o777
                     if extra:
                         entry.pax_headers.update(extra[0])
                     archive.addfile(entry, io.BytesIO(content) if kind == tarfile.REGTYPE else None)
-            return blob(data.getvalue(), "application/vnd.oci.image.layer.v1.tar")
+            encoded = data.getvalue()
+            assert b"hdrcharset=" not in encoded
+            with tarfile.open(fileobj=io.BytesIO(encoded)) as check:
+                assert [os.fsencode(m.name) for m in check.getmembers()] == [os.fsencode(e[0]) for e in entries]
+            return blob(encoded, "application/vnd.oci.image.layer.v1.tar")
         layers = [layer([(".", tarfile.DIRTYPE, b""), ("removed", tarfile.REGTYPE, b"old"),
                          ("replace", tarfile.REGTYPE, b"old"), ("opaque", tarfile.DIRTYPE, b""),
                          ("opaque/lower", tarfile.REGTYPE, b"old"),

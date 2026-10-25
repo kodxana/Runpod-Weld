@@ -16,6 +16,17 @@ import tarfile
 import time
 
 from oracle import load, replay, snapshot, verified
+from fixture_tar import FixtureInfo
+
+
+def loaded_reference(output):
+    references = []
+    for line in output.decode("utf-8", "strict").splitlines():
+        for prefix in ["Loaded image ID: ", "Loaded image: "]:
+            if line.startswith(prefix):
+                references.append(line[len(prefix):].strip())
+    assert len(references) == 1 and references[0], output
+    return references[0]
 
 
 def rich_base(alpine, output):
@@ -42,7 +53,7 @@ def rich_base(alpine, output):
             (os.fsdecode(b"probe/raw-\xff"), tarfile.REGTYPE, b"raw filename\n"),
             ("probe/cap", tarfile.REGTYPE, b"capability bytes\n"),
         ]:
-            item = tarfile.TarInfo(name)
+            item = FixtureInfo(name)
             item.type, item.uid, item.gid, item.mode, item.mtime = kind, 123, 456, 0o751, 1700000000
             item.pax_headers = {"atime": "1700000000.125", "mtime": "1700000000.25"}
             if kind == tarfile.REGTYPE:
@@ -50,12 +61,19 @@ def rich_base(alpine, output):
                 item.pax_headers["SCHILY.xattr.user.layered"] = "base-value"
             elif kind in (tarfile.LNKTYPE, tarfile.SYMTYPE):
                 item.linkname = payload.decode()
+                if kind == tarfile.SYMTYPE:
+                    item.mode = 0o777
             if name == "probe/xattr-dir":
                 item.pax_headers["SCHILY.xattr.user.old"] = "must disappear"
             if name == "probe/cap":
                 item.pax_headers["SCHILY.xattr.security.capability"] = os.fsdecode(struct.pack("<5I", 0x02000001, 1024, 0, 0, 0))
             archive.addfile(item, io.BytesIO(payload) if kind == tarfile.REGTYPE else None)
-    layer = blob(buffer.getvalue(), "application/vnd.oci.image.layer.v1.tar")
+    data = buffer.getvalue()
+    assert b"hdrcharset=" not in data
+    with tarfile.open(fileobj=io.BytesIO(data)) as check:
+        raw = next(m for m in check if os.fsencode(m.name) == b"probe/raw-\xff")
+        assert check.extractfile(raw).read() == b"raw filename\n"
+    layer = blob(data, "application/vnd.oci.image.layer.v1.tar")
     layer["annotations"] = {"org.example.provenance": "preserve-this-descriptor"}
     manifest["layers"].append(layer)
     config["rootfs"]["diff_ids"].append(layer["digest"])
@@ -322,12 +340,12 @@ def main():
                 tar.add(child, arcname=child.name)
         loaded = subprocess.run(["docker", "load", "-i", str(archive)], capture_output=True, check=True)
         (a.evidence / "docker-load.log").write_bytes(loaded.stdout + loaded.stderr)
-        digest = load(edited)[0]["config"]["digest"]
-        inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", digest]))[0]
+        reference = loaded_reference(loaded.stdout)
+        inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", reference]))[0]
         assert inspected["RootFS"]["Layers"] == load(edited)[1]["rootfs"]["diff_ids"]
         for key in ["Env", "Cmd", "WorkingDir", "Labels"]:
             assert inspected["Config"][key] == load(edited)[1]["config"][key]
-        container = subprocess.check_output(["docker", "create", digest]).decode().strip()
+        container = subprocess.check_output(["docker", "create", "--network=none", reference]).decode().strip()
         try:
             subprocess.run(["docker", "export", "-o", str(a.evidence / "docker-export.tar"), container], check=True)
             expected_root = a.evidence / "edited-replay"

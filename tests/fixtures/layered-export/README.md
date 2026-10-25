@@ -5,6 +5,14 @@ and an existing local Alpine OCI layout. No pull or package installation occurs.
 RUN is trusted test code, not a sandbox. Invoke candidate tests only after the
 parent supplies a frozen binary/source handoff.
 
+Fixture input archives use `fixture_tar.py`: raw ustar name fields preserve
+`probe/raw-0xff` byte-for-byte, while local PAX records carry supported timestamps
+and xattrs. Python's automatic `hdrcharset=BINARY` extension is deliberately not
+emitted. Ordinary GNU headers are avoided because they introduce ctime fields.
+Symlinks use Linux's actual mode `0777`. Both the old-encoding baseline rejection
+and new-encoding baseline/frozen-candidate no-op setup acceptance were reproduced;
+these setup checks are not a full candidate acceptance verdict.
+
 `measure.py` reuses the existing offline Python/Node instruction-cache fixtures.
 These simulate dependency ordering; they do not install pip/npm dependencies or
 run the languages. Each language has its own empty managed store, then warm and
@@ -77,6 +85,8 @@ config, creates/exports a container, compares probe content/type, permissions,
 ownership, mtime, symlinks, hardlinks and deletions, and executes the configured
 command to verify edited app content. Export evidence is retained. Docker export alone is not used to
 claim atime/xattr fidelity; those are checked by independent replay.
+It uses the reference returned by `docker load`, rather than assuming a config
+digest is a Docker image ID. Container execution disables networking.
 
 Rust entry points live in `tests/layered_export_cli.rs`. Runtime cases are ignored
 unless explicitly selected. Set `RPWELD_TEST_LAYOUT`, a new native path in
