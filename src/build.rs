@@ -660,7 +660,7 @@ pub fn build(
     options: &BuildOptions,
     cancelled: impl Fn() -> bool,
 ) -> Result<BuildResult> {
-    build_inner(source, options, None, cancelled)
+    build_inner(source, options, None, None, cancelled)
 }
 
 /// Caller keeps this lease through use of returned managed paths, tagging and push.
@@ -670,13 +670,30 @@ pub fn build_with_lease(
     lease: &crate::store_lease::StoreLease,
     cancelled: impl Fn() -> bool,
 ) -> Result<BuildResult> {
-    build_inner(source, options, Some(lease), cancelled)
+    build_inner(source, options, Some(lease), None, cancelled)
+}
+
+#[cfg(target_os = "linux")]
+pub fn build_recorded(
+    source: &str,
+    options: &BuildOptions,
+    lease: &crate::store_lease::StoreLease,
+    record: &mut crate::build_record::BuildRecord,
+    cancelled: impl Fn() -> bool,
+) -> Result<BuildResult> {
+    record.update(lease, |r| r.phase = crate::build_record::Phase::Building)?;
+    let result = build_inner(source, options, Some(lease), Some(record), cancelled);
+    if result.is_err() && record.record.manifest.is_none() {
+        record.update(lease, |r| r.phase = crate::build_record::Phase::Failed)?;
+    }
+    result
 }
 
 fn build_inner(
     source: &str,
     options: &BuildOptions,
     lease: Option<&crate::store_lease::StoreLease>,
+    mut record: Option<&mut crate::build_record::BuildRecord>,
     cancelled: impl Fn() -> bool,
 ) -> Result<BuildResult> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -753,12 +770,24 @@ fn build_inner(
         evaluated.insert(n, (config, args));
     }
     let intermediate = if selected.len() > 1 {
-        Some(
-            tempfile::Builder::new()
-                .prefix(".weld-stages-")
-                .tempdir_in(work.parent().unwrap())?
-                .keep(),
-        )
+        #[cfg(target_os = "linux")]
+        if let Some(r) = record.as_deref_mut() {
+            let path = r.path.join("stages");
+            fs::create_dir(&path)?;
+            r.created(&path, lease.unwrap())?;
+            Some(path)
+        } else {
+            Some(
+                tempfile::Builder::new()
+                    .prefix(".weld-stages-")
+                    .tempdir_in(work.parent().unwrap())?
+                    .keep(),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None::<PathBuf>
+        }
     } else {
         None
     };
@@ -783,6 +812,8 @@ fn build_inner(
             &previous,
             &mut notice,
             &policy,
+            record.as_deref_mut(),
+            n == target,
             lease,
             &cancelled,
         )?;
@@ -792,6 +823,7 @@ fn build_inner(
 }
 
 #[allow(clippy::too_many_arguments)] // Keep the operation lease explicit at each call boundary.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables, unused_mut))]
 fn build_stage(
     plan: &build_plan::BuildPlan,
     index: usize,
@@ -799,6 +831,8 @@ fn build_stage(
     previous: &BTreeMap<usize, StageResult>,
     notice: &mut bool,
     policy: &crate::dockerignore::Policy,
+    mut record: Option<&mut crate::build_record::BuildRecord>,
+    final_stage: bool,
     lease: Option<&crate::store_lease::StoreLease>,
     cancelled: impl Fn() -> bool,
 ) -> Result<StageResult> {
@@ -979,6 +1013,10 @@ fn build_stage(
     }
     check(&cancelled)?;
     fs::create_dir(&work)?;
+    #[cfg(target_os = "linux")]
+    if let Some(r) = record.as_deref_mut() {
+        r.created(&work, lease.unwrap())?;
+    }
     let root = work.join("rootfs");
     let spool = work.join("spool");
     let state = work.join("state");
@@ -1061,17 +1099,45 @@ fn build_stage(
     let manifest = if cache_hit {
         // Preserve the cached OCI bytes: re-exporting a replayed tree changes
         // access timestamps and would invalidate every dependent stage.
-        crate::build_cache::publish(
+        crate::build_cache::publish_created(
             cache_entry.as_ref().unwrap(),
             lease,
             &output,
             None,
             &cancelled,
+            || {
+                #[cfg(target_os = "linux")]
+                if let Some(r) = record.as_deref_mut() {
+                    r.created(&output, lease.unwrap())?;
+                }
+                Ok(())
+            },
         )?;
         metadata.as_ref().unwrap().selected.clone()
     } else {
-        export::export_layout(&root, &output, &config, options.limits.export, &cancelled)?
+        export::export_layout_created(
+            &root,
+            &output,
+            &config,
+            options.limits.export,
+            &cancelled,
+            || {
+                #[cfg(target_os = "linux")]
+                if let Some(r) = record.as_deref_mut() {
+                    r.created(&output, lease.unwrap())?;
+                }
+                Ok(())
+            },
+        )?
     };
+    #[cfg(target_os = "linux")]
+    if final_stage && let Some(r) = record {
+        // A cache-publication failure must not erase evidence of a valid image.
+        r.update(lease.unwrap(), |r| {
+            r.phase = crate::build_record::Phase::ImageReady;
+            r.manifest = Some(manifest.clone());
+        })?;
+    }
     if !cache_hit && let Some(entry) = cache_entry {
         crate::build_cache::publish(&output, lease, &entry, Some(&copy_targets), &cancelled)?;
     }

@@ -2,6 +2,7 @@
 pub mod build;
 mod build_cache;
 pub mod build_plan;
+pub mod build_record;
 pub mod capabilities;
 pub mod context;
 pub mod devices;

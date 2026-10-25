@@ -553,13 +553,24 @@ pub fn export_layout(
     limits: Limits,
     cancelled: impl Fn() -> bool,
 ) -> Result<Descriptor, Error> {
+    export_layout_created(root, destination, config, limits, cancelled, || Ok(()))
+}
+
+pub(crate) fn export_layout_created(
+    root: &Path,
+    destination: &Path,
+    config: &Value,
+    limits: Limits,
+    cancelled: impl Fn() -> bool,
+    created: impl FnOnce() -> std::io::Result<()>,
+) -> Result<Descriptor, Error> {
     #[cfg(target_os = "linux")]
     {
-        linux::export(root, destination, config, limits, &cancelled)
+        linux::export(root, destination, config, limits, &cancelled, created)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (root, destination, config, limits, cancelled);
+        let _ = (root, destination, config, limits, cancelled, created);
         Err(Error::Invalid("export requires Linux"))
     }
 }
@@ -994,6 +1005,7 @@ mod linux {
         config: &Value,
         limits: Limits,
         c: &impl Fn() -> bool,
+        created: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<Descriptor, Error> {
         check(c)?;
         canonical_dir(root)?;
@@ -1059,6 +1071,7 @@ mod linux {
         preflight.visit(root, 0)?;
         remaining = preflight.remaining_metadata;
         fs::create_dir(dest)?; // exclusive ownership; never reuse existing output
+        created()?;
         let store = BlobStore::open(dest)?;
         let mut spool = tempfile::tempfile_in(dest)?;
         let layer = {

@@ -282,3 +282,35 @@ uninterruptible descendants can delay shutdown indefinitely. Do not kill the
 supervisors or replace `store.lock`. This is a cooperative local-store protocol,
 not isolation from hostile processes. Older binaries do not participate, so all
 old workers and transfers must exit before any future cleanup feature is used.
+
+### Build ownership records (no deletion)
+
+New program-allocated `build-*` runs contain a private, bounded
+`build-record.json` (version 1), published before base pulls. Updates sync the
+file and containing directory before returning and hold the shared store lease.
+Allocation interrupted before publication leaves an unknown, protected run.
+
+`rpweld builds inspect BUILD_ID --json` includes `build_record` only after schema,
+store/run identity, and every recorded owned-directory identity validate. Human
+output shows the same fields. The record reports `phase` (`preparing`, `building`,
+`image_ready`, `complete`, or `failed`), a manifest descriptor when available,
+requested output `references`, and separate `push` status. Requested references
+are not proof of a saved tag; the inventory's tag records show observed bindings.
+A failed push retains `image_ready` and its manifest. Interrupted operations may
+retain their last durable phase; no PID or phase proves inactivity.
+
+`owned` lists explicit relative component arrays and device/inode identities for
+created work/image/stage directories. It does not adopt arbitrary children merely
+because a run is private. Explicit `--work-dir` and `--output` paths are always
+informational `external` entries, even inside the store; `unix_bytes` preserves
+non-UTF-8 native paths losslessly. These paths are never followed to establish
+ownership. Managed multi-stage intermediates live in the allocated run's `stages`
+directory, independent of explicit work/output locations.
+
+All inventory entries remain protected, including valid records, legacy runs,
+missing/malformed/mismatched records, and `store.lock`. There is no deletion,
+pruning, or deletion eligibility API. Failed and interrupted builds remain on disk;
+record publication failures fail closed and may leave unrecorded retained data.
+Inventory is a bounded best-effort observation, not a snapshot or proof that an
+image is valid. Same-user code that replaces store paths violates the cooperative
+lease protocol; identities are checked again when inventory reads the record.

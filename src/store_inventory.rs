@@ -103,11 +103,13 @@ pub struct Usage {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Entry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_record: Option<crate::build_record::Record>,
     #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     pub status: Status,
     pub ownership: Ownership,
-    /// Always true until a separate lease-based lifecycle protocol exists.
+    /// Always true: ownership evidence does not authorize deletion.
     pub protected: bool,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -304,6 +306,7 @@ mod linux {
     }
     fn entry(path: PathBuf, status: Status, ownership: Ownership) -> Entry {
         Entry {
+            build_record: None,
             path,
             status,
             ownership,
@@ -889,9 +892,59 @@ mod linux {
             } else if ["base-cache-v1", "cache-v1"].contains(&s) {
                 scan.area(&root, p);
             } else if s.starts_with("build-") {
-                scan.out
-                    .builds
-                    .push(entry(p.into(), Status::LegacyUnknown, Ownership::Unknown));
+                let mut build = entry(p.into(), Status::LegacyUnknown, Ownership::Unknown);
+                if scan.limits.max_depth >= 2
+                    && let Some(d) = scan.dir(&root, p, p)
+                {
+                    let record_path = p.join(crate::build_record::FILE);
+                    let missing = open(
+                        d.as_raw_fd(),
+                        Path::new(crate::build_record::FILE),
+                        false,
+                        false,
+                    )
+                    .is_err_and(|e| e.kind() == io::ErrorKind::NotFound);
+                    let limit = scan.limits.max_record_bytes;
+                    scan.limits.max_record_bytes = limit.min(crate::build_record::MAX_BYTES);
+                    let record = if missing {
+                        None
+                    } else {
+                        scan.record::<crate::build_record::Record>(
+                            &d,
+                            Path::new(crate::build_record::FILE),
+                            &record_path,
+                        )
+                    };
+                    scan.limits.max_record_bytes = limit;
+                    if let Some(record) = record {
+                        if record
+                            .validate(&root, &d, p, |depth| {
+                                if scan.stop() {
+                                    return Err(io::Error::other("cancelled"));
+                                }
+                                if depth > scan.limits.max_depth {
+                                    scan.issue(p, "depth_budget");
+                                    return Err(io::Error::other("depth budget"));
+                                }
+                                if scan.entries >= scan.limits.max_entries {
+                                    scan.issue(p, "entry_budget");
+                                    scan.stopped = true;
+                                    return Err(io::Error::other("entry budget"));
+                                }
+                                scan.entries += 1;
+                                Ok(())
+                            })
+                            .is_ok()
+                        {
+                            build.status = Status::Present;
+                            build.ownership = Ownership::Managed;
+                            build.build_record = Some(record);
+                        } else {
+                            scan.issue(&record_path, "invalid_build_identity");
+                        }
+                    }
+                }
+                scan.out.builds.push(build);
                 if scan.limits.max_depth == 0 {
                     scan.issue(p, "depth_budget");
                 } else if let Some(d) = scan.dir(&root, p, p) {
@@ -948,6 +1001,7 @@ mod tests {
         let mut inventory = run(&temp.path().join("missing"));
         inventory.store = path.clone();
         let entry = Entry {
+            build_record: None,
             path: path.clone(),
             status: Status::Unknown,
             ownership: Ownership::Unknown,

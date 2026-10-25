@@ -85,6 +85,17 @@ pub(crate) fn publish(
     targets: Option<&[Vec<Vec<u8>>]>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
+    publish_created(source, lease, destination, targets, cancelled, || Ok(()))
+}
+
+pub(crate) fn publish_created(
+    source: &Path,
+    lease: Option<&crate::store_lease::StoreLease>,
+    destination: &Path,
+    targets: Option<&[Vec<Vec<u8>>]>,
+    cancelled: &impl Fn() -> bool,
+    created: impl FnOnce() -> std::io::Result<()>,
+) -> Result<()> {
     crate::store_access::validate_path(source, lease)?;
     if lookup(destination, lease)? {
         return Ok(());
@@ -124,6 +135,7 @@ pub(crate) fn publish(
     match fs::rename(temporary.path(), destination) {
         Ok(()) => {
             let _ = temporary.keep();
+            created()?;
             Ok(())
         }
         Err(_) if lookup(destination, lease)? => Ok(()), // A concurrent successful build won publication.

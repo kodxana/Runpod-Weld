@@ -192,6 +192,7 @@ fn storage_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct BuildCli {
+    record: Option<rpweld::build_record::BuildRecord>,
     dockerfile: String,
     options: rpweld::build::BuildOptions,
     tag: Option<String>,
@@ -381,6 +382,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
         return Err("scratch cannot have a base binding".into());
     }
     Ok(BuildCli {
+        record: None,
         dockerfile: dockerfile.clone(),
         tag,
         push,
@@ -479,12 +481,28 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
     let source = read_build_source(&cli.dockerfile)?;
     let lease = prepare_build(&source, &mut cli, early_lease, out)?;
     let result = match lease.as_ref() {
-        Some(lease) => rpweld::build::build_with_lease(&source, &cli.options, lease, || {
-            CANCELLED.load(Ordering::Relaxed)
-        }),
+        Some(lease) => {
+            #[cfg(target_os = "linux")]
+            if let Some(r) = cli.record.as_mut() {
+                rpweld::build::build_recorded(&source, &cli.options, lease, r, || {
+                    CANCELLED.load(Ordering::Relaxed)
+                })
+            } else {
+                rpweld::build::build_with_lease(&source, &cli.options, lease, || {
+                    CANCELLED.load(Ordering::Relaxed)
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                rpweld::build::build_with_lease(&source, &cli.options, lease, || {
+                    CANCELLED.load(Ordering::Relaxed)
+                })
+            }
+        }
         None => rpweld::build::build(&source, &cli.options, || CANCELLED.load(Ordering::Relaxed)),
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string());
+    let result = result?;
     writeln!(
         out,
         "Experimental OCI build: {}\nManifest: {}\nRetained work: {}",
@@ -493,7 +511,17 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
         result.work.display()
     )
     .map_err(|e| e.to_string())?;
-    finish_build(&cli, lease.as_ref(), out)
+    let finished = finish_build(&mut cli, lease.as_ref(), out);
+    #[cfg(target_os = "linux")]
+    if let (Some(r), Some(l)) = (cli.record.as_mut(), lease.as_ref()) {
+        r.update(l, |r| {
+            if finished.is_ok() {
+                r.phase = rpweld::build_record::Phase::Complete;
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    finished
 }
 
 #[cfg(target_os = "linux")]
@@ -524,7 +552,7 @@ fn prepare_build(
 }
 #[cfg(not(target_os = "linux"))]
 fn finish_build(
-    _: &BuildCli,
+    _: &mut BuildCli,
     _: Option<&rpweld::store_lease::StoreLease>,
     _: &mut impl Write,
 ) -> Result<(), String> {
@@ -613,60 +641,78 @@ fn prepare_build(
             "authfile must be outside the build context to prevent COPY leaking credentials".into(),
         );
     }
-    let run = tempfile::Builder::new()
-        .prefix("build-")
-        .tempdir_in(&store)
-        .map_err(|e| e.to_string())?
-        .keep();
-    writeln!(out, "Build state: {}", run.display()).map_err(|e| e.to_string())?;
-    if cli.options.work.as_os_str().is_empty() {
-        cli.options.work = run.join("work");
-    }
-    if cli.options.output.as_os_str().is_empty() {
-        cli.options.output = run.join("image");
-    }
-    let mut resolved = BTreeMap::new();
-    for name in pulls {
-        let reference = registry::reference(&name, true)?;
-        let layout = if let Some(layout) = resolved.get(&reference) {
-            std::path::PathBuf::clone(layout)
-        } else {
-            let layout = registry::cached_base(
-                &store,
-                &lease,
-                &reference,
-                cli.pull,
-                cli.options.limits.image,
-                || CANCELLED.load(Ordering::Relaxed),
-                |reference, layout| {
-                    writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
-                        .map_err(|e| e.to_string())?;
-                    out.flush().map_err(|e| e.to_string())?;
-                    registry::Transport::new(&cli.registry)?.pull(
-                        &lease,
-                        reference,
-                        layout,
-                        &|| CANCELLED.load(Ordering::Relaxed),
-                    )
+    cli.record = Some(
+        rpweld::build_record::BuildRecord::allocate(
+            &store,
+            &lease,
+            (!cli.options.work.as_os_str().is_empty()).then_some(cli.options.work.as_path()),
+            (!cli.options.output.as_os_str().is_empty()).then_some(cli.options.output.as_path()),
+            cli.tag.iter().cloned().collect(),
+            cli.push,
+        )
+        .map_err(|e| e.to_string())?,
+    );
+    let run = cli.record.as_ref().unwrap().path.clone();
+    let preparation = (|| -> Result<(), String> {
+        writeln!(out, "Build state: {}", run.display()).map_err(|e| e.to_string())?;
+        if cli.options.work.as_os_str().is_empty() {
+            cli.options.work = run.join("work");
+        }
+        if cli.options.output.as_os_str().is_empty() {
+            cli.options.output = run.join("image");
+        }
+        let mut resolved = BTreeMap::new();
+        for name in pulls {
+            let reference = registry::reference(&name, true)?;
+            let layout = if let Some(layout) = resolved.get(&reference) {
+                std::path::PathBuf::clone(layout)
+            } else {
+                let layout = registry::cached_base(
+                    &store,
+                    &lease,
+                    &reference,
+                    cli.pull,
+                    cli.options.limits.image,
+                    || CANCELLED.load(Ordering::Relaxed),
+                    |reference, layout| {
+                        writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
+                            .map_err(|e| e.to_string())?;
+                        out.flush().map_err(|e| e.to_string())?;
+                        registry::Transport::new(&cli.registry)?.pull(
+                            &lease,
+                            reference,
+                            layout,
+                            &|| CANCELLED.load(Ordering::Relaxed),
+                        )
+                    },
+                )?;
+                resolved.insert(reference, layout.clone());
+                layout
+            };
+            cli.options.bases.insert(
+                name.clone(),
+                rpweld::build::LocalBase {
+                    layout,
+                    reference: None,
                 },
-            )?;
-            resolved.insert(reference, layout.clone());
-            layout
-        };
-        cli.options.bases.insert(
-            name.clone(),
-            rpweld::build::LocalBase {
-                layout,
-                reference: None,
-            },
-        );
+            );
+        }
+        Ok(())
+    })();
+    if preparation.is_err() {
+        cli.record
+            .as_mut()
+            .unwrap()
+            .update(&lease, |r| r.phase = rpweld::build_record::Phase::Failed)
+            .map_err(|e| e.to_string())?;
     }
+    preparation?;
     Ok(Some(lease))
 }
 
 #[cfg(target_os = "linux")]
 fn finish_build(
-    cli: &BuildCli,
+    cli: &mut BuildCli,
     lease: Option<&rpweld::store_lease::StoreLease>,
     out: &mut impl Write,
 ) -> Result<(), String> {
@@ -676,7 +722,18 @@ fn finish_build(
         rpweld::registry::save_tag(&store, lease, tag, &cli.options.output)?;
         writeln!(out, "Tagged {tag}").map_err(|e| e.to_string())?;
         if cli.push {
-            push_image_path(lease, tag, &cli.options.output, &cli.registry, out)?;
+            let pushed = push_image_path(lease, tag, &cli.options.output, &cli.registry, out);
+            if let Some(r) = cli.record.as_mut() {
+                r.update(lease, |r| {
+                    r.push = if pushed.is_ok() {
+                        rpweld::build_record::PushResult::Succeeded
+                    } else {
+                        rpweld::build_record::PushResult::Failed
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+            }
+            pushed?;
         }
     }
     Ok(())
