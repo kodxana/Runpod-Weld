@@ -554,13 +554,53 @@ mod linux {
         limits: Limits,
         cancelled: &impl Fn() -> bool,
         validated_builds: &[(Record, Record)],
+        transactions: &[Transaction],
     ) -> io::Result<()> {
-        let inventory = store_inventory::inspect_recovery_references(
+        let mut inventory = store_inventory::inspect_recovery_references(
             store,
             limits,
             cancelled,
             validated_builds,
         )?;
+        let mut remaining = limits.max_metadata_bytes;
+        for tx in transactions {
+            if let Target::Tag { reference, digest } = &tx.journal.target {
+                if absent(&tx.dir, Path::new(PAYLOAD))? {
+                    continue;
+                }
+                validate_object(&tx.dir, Path::new(PAYLOAD), &tx.journal)?;
+                let data = bytes(
+                    &tx.dir,
+                    Path::new(PAYLOAD),
+                    remaining.min(build_record::MAX_BYTES),
+                )?;
+                remaining = remaining.saturating_sub(data.len());
+                #[derive(Deserialize)]
+                struct PendingTag {
+                    reference: String,
+                    image: PathBuf,
+                }
+                let tag: PendingTag = serde_json::from_slice(&data)?;
+                if format!("{:x}", Sha256::digest(&data)) != *digest
+                    || tag.reference != *reference
+                    || !tag.image.is_absolute()
+                    || tag
+                        .image
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(invalid("invalid pending tag reference"));
+                }
+                inventory.tags.push(store_inventory::Tag {
+                    record: tx.journal.path(),
+                    reference: Some(tag.reference),
+                    image: Some(tag.image),
+                    status: store_inventory::Status::Present,
+                    ownership: store_inventory::Ownership::Unknown,
+                    target_status: store_inventory::Status::Unknown,
+                });
+            }
+        }
         let view = snapshot.reference_view();
         let selected = cleanup_plan::cache_selection(store, &inventory, &view, cancelled)?;
         let j = snapshot
@@ -675,7 +715,7 @@ mod linux {
             .as_ref()
             .ok_or_else(|| invalid("missing retirement journal"))?
             .clone();
-        cache_references(store, &snapshot, limits, cancelled, &[])?;
+        cache_references(store, &snapshot, limits, cancelled, &[], &[])?;
         let cache_dir = open_dir(root.as_raw_fd(), Path::new("cache-v2"))?;
         if identity(&cache_dir.metadata()?) != j.namespace {
             return Err(invalid("cache namespace changed"));
@@ -688,19 +728,25 @@ mod linux {
         let pool = j.pool();
         check_cancel(cancelled)?;
         cache_journal_unchanged(&cache_dir, &snapshot)?;
-        if j.kind == Kind::Object && snapshot.nodes.contains_key(&pool) {
+        // A prior successful rename may have returned an fsync error.
+        cache_dir.sync_all()?;
+        if j.kind == Kind::Object {
             let pool_dir = open_dir(cache_dir.as_raw_fd(), Path::new("content/blobs/sha256"))?;
-            let st = stat(&pool_dir, Path::new(&j.key))?;
-            if snapshot.nodes[&pool].identity
-                != (Identity {
-                    device: libc::makedev(st.stx_dev_major, st.stx_dev_minor),
-                    inode: st.stx_ino,
-                })
-                || st.stx_mnt_id != stat(root, Path::new(""))?.stx_mnt_id
-            {
-                return Err(invalid("cache pool changed before retirement"));
+            if snapshot.nodes.contains_key(&pool) {
+                let st = stat(&pool_dir, Path::new(&j.key))?;
+                if snapshot.nodes[&pool].identity
+                    != (Identity {
+                        device: libc::makedev(st.stx_dev_major, st.stx_dev_minor),
+                        inode: st.stx_ino,
+                    })
+                    || st.stx_mnt_id != stat(root, Path::new(""))?.stx_mnt_id
+                {
+                    return Err(invalid("cache pool changed before retirement"));
+                }
+                unlink(&pool_dir, Path::new(&j.key), false)?;
             }
-            unlink(&pool_dir, Path::new(&j.key), false)?;
+            // An absent pool name may still be an unsynced unlink from a retry.
+            pool_dir.sync_all()?;
             check_cancel(cancelled)?;
             cache_journal_unchanged(&cache_dir, &snapshot)?;
         }
@@ -722,6 +768,7 @@ mod linux {
                 Path::new(&retired_leaf),
             )?;
         }
+        parent.sync_all()?;
         check_cancel(cancelled)?;
         let source = j.source();
         let retired = j.retired();
@@ -796,7 +843,7 @@ mod linux {
         {
             return Err(invalid("cache retirement journal changed"));
         }
-        cache_references(store, &final_state, limits, cancelled, &[])?;
+        cache_references(store, &final_state, limits, cancelled, &[], &[])?;
         // The journal's virtual target validates provenance only; all actual
         // remaining names now constitute an independently valid normal cache.
         if final_state.nodes.keys().any(|p| {
@@ -809,6 +856,8 @@ mod linux {
             return Err(invalid("cache retirement payload still present"));
         }
         cache_journal_unchanged(&cache_dir, &snapshot)?;
+        // Persist target absence even when this retry skipped every missing name.
+        parent.sync_all()?;
         unlink(&cache_dir, Path::new(cache::JOURNAL), false)?;
         report.removed.last_mut().unwrap().reason =
             "owned_cache_entry_or_unreferenced_object_removed";
@@ -964,7 +1013,18 @@ mod linux {
                         }
                     }
                 }
-                cache_references(store, state, limits, cancelled, &validated_builds)?;
+                cache_references(
+                    store,
+                    state,
+                    limits,
+                    cancelled,
+                    &validated_builds,
+                    &transactions,
+                )?;
+                let cache_dir = open_dir(root.as_raw_fd(), Path::new("cache-v2"))?;
+                cache_journal_unchanged(&cache_dir, state)?;
+                // Reestablish the durable barrier before even legacy recovery mutates.
+                cache_dir.sync_all()?;
             }
             // All journal and reference validation precedes ALL recovery mutation.
             recover(&root, transactions, &mut report, cancelled)?;

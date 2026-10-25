@@ -1145,3 +1145,278 @@ fn external_links_unknown_children_and_budgets_protect_the_whole_namespace() {
     );
     assert!(layer_path(&a, &layer).exists());
 }
+
+#[test]
+fn moved_tag_references_block_all_mixed_recovery() {
+    for target in ["retiring", "unresolved", "conflicting"] {
+        let f = CacheFixture::new();
+        let reference = "docker.io/example/pending:latest";
+        let tag = f
+            .store
+            .join(format!("tag-{:x}.json", Sha256::digest(reference)));
+        let image = if target == "unresolved" {
+            f.store.join("missing")
+        } else {
+            f.a.clone()
+        };
+        fs::write(
+            &tag,
+            serde_json::to_vec(&json!({"reference":reference,"image":image})).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&tag, fs::Permissions::from_mode(0o600)).unwrap();
+        let r = cleanup_apply::apply(
+            &f.store,
+            cleanup_plan::Request::ImageRemove(cleanup_plan::TagId::parse(reference).unwrap()),
+            Default::default(),
+            || legacy_transaction(&f.store).is_some_and(|tx| tx.join("payload").exists()),
+        )
+        .unwrap();
+        assert_eq!(r.status, "failed");
+        let tx = legacy_transaction(&f.store).unwrap();
+        let held = f._temp.path().join("held");
+        fs::rename(&tx, &held).unwrap();
+        f.tag();
+        let barrier = f.store.join("cache-v2/retirement.json");
+        let r = cleanup_apply::apply(
+            &f.store,
+            cleanup_plan::Request::CachePrune,
+            Default::default(),
+            || barrier.exists(),
+        )
+        .unwrap();
+        assert_eq!(r.status, "failed");
+        assert!(f.a.exists());
+        fs::rename(&held, &tx).unwrap();
+        if target == "conflicting" {
+            fs::write(
+                &tag,
+                serde_json::to_vec(&json!({"reference":reference,"image":f.b})).unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(&tag, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let journal_bytes = fs::read(&barrier).unwrap();
+        let tx_bytes = fs::read(tx.join("journal.json")).unwrap();
+        let payload_bytes = fs::read(tx.join("payload")).unwrap();
+        let r = f.prune();
+        assert_eq!(r.status, "failed", "{target}: {r:#?}");
+        assert!(
+            r.removed.is_empty() && r.recovered.is_empty(),
+            "{target}: {r:#?}"
+        );
+        assert_eq!(fs::read(&barrier).unwrap(), journal_bytes);
+        assert_eq!(fs::read(tx.join("journal.json")).unwrap(), tx_bytes);
+        assert_eq!(fs::read(tx.join("payload")).unwrap(), payload_bytes);
+        assert!(f.a.exists());
+        assert_eq!(tag.exists(), target == "conflicting");
+    }
+}
+
+// Interpose the real libc boundary in a disposable subprocess: the namespace
+// mutation succeeds, then fsync returns EIO. No production fault hooks.
+#[test]
+fn retirement_sync_errors_are_retried_before_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("fault.c");
+    let library = temp.path().join("fault.so");
+    fs::write(
+        &source,
+        r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int fsync(int fd) {
+    char name[64], path[4096];
+    snprintf(name, sizeof(name), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(name, path, sizeof(path)-1);
+    if (n >= 0) {
+        path[n] = 0;
+        const char *dir = getenv("RETIRE_FAIL_DIR");
+        const char *absent = getenv("RETIRE_FAIL_ABSENT");
+        if (dir && !strcmp(dir, path) && (!absent || access(absent, F_OK) != 0)) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    return ((int (*)(int))dlsym(RTLD_NEXT, "fsync"))(fd);
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .arg("-ldl")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut failures = Vec::new();
+    for phase in ["barrier", "pool", "target"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "retirement_sync_error_child", "--nocapture"])
+            .env("LD_PRELOAD", &library)
+            .env("RETIRE_SYNC_PHASE", phase)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            failures.push(format!(
+                "{phase}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn retirement_sync_error_child() {
+    let Ok(phase) = std::env::var("RETIRE_SYNC_PHASE") else {
+        return;
+    };
+    let f = CacheFixture::new();
+    f.tag();
+    let cache = f.store.join("cache-v2");
+    let barrier = cache.join("retirement.json");
+    let mut target = f.a.clone();
+    let (dir, absent) = match phase.as_str() {
+        "barrier" => (cache.clone(), None),
+        "target" => (
+            cache.join("entries"),
+            Some(cache.join("entries").join(format!(".retire-{}", key(1)))),
+        ),
+        "pool" => {
+            let r = cleanup_apply::apply(
+                &f.store,
+                cleanup_plan::Request::CachePrune,
+                Default::default(),
+                || {
+                    fs::read(&barrier)
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        .is_some_and(|j| j["kind"] == "object")
+                },
+            )
+            .unwrap();
+            assert_eq!(r.status, "failed", "{r:#?}");
+            let j: serde_json::Value =
+                serde_json::from_slice(&fs::read(&barrier).unwrap()).unwrap();
+            let key = j["key"].as_str().unwrap();
+            target = cache.join("objects").join(key);
+            (
+                cache.join("content/blobs/sha256"),
+                Some(cache.join("content/blobs/sha256").join(key)),
+            )
+        }
+        _ => unreachable!(),
+    };
+    let pending_tag = if phase == "barrier" {
+        let reference = "docker.io/example/pending:latest";
+        let tag = f
+            .store
+            .join(format!("tag-{:x}.json", Sha256::digest(reference)));
+        fs::write(
+            &tag,
+            serde_json::to_vec(&json!({"reference":reference,"image":f.b})).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&tag, fs::Permissions::from_mode(0o600)).unwrap();
+        let r = cleanup_apply::apply(
+            &f.store,
+            cleanup_plan::Request::ImageRemove(cleanup_plan::TagId::parse(reference).unwrap()),
+            Default::default(),
+            || legacy_transaction(&f.store).is_some_and(|tx| tx.join("payload").exists()),
+        )
+        .unwrap();
+        assert_eq!(r.status, "failed");
+        let tx = legacy_transaction(&f.store).unwrap();
+        let held = f._temp.path().join("held-tag");
+        fs::rename(&tx, &held).unwrap();
+        Some((held, tx))
+    } else {
+        None
+    };
+    // This child runs one test on one thread; no other environment users exist.
+    unsafe {
+        std::env::set_var("RETIRE_FAIL_DIR", &dir);
+        if let Some(absent) = &absent {
+            std::env::set_var("RETIRE_FAIL_ABSENT", absent);
+        }
+    }
+    let first = f.prune();
+    assert_eq!(first.status, "failed", "{phase}: {first:#?}");
+    assert!(
+        first.failure.as_ref().unwrap().contains("os error 5"),
+        "{first:#?}"
+    );
+    let journal = fs::read(&barrier).unwrap();
+    if let Some((held, tx)) = pending_tag {
+        fs::rename(held, tx).unwrap();
+    }
+    if phase == "target" {
+        assert!(!target.exists());
+    } else {
+        assert!(target.exists());
+    }
+    if phase == "pool" {
+        assert!(!absent.as_ref().unwrap().exists());
+    }
+    if phase == "target" {
+        assert!(
+            first
+                .removed
+                .iter()
+                .any(|item| item.reason == "cache_retirement_finalization_pending")
+        );
+    }
+    fn tree(path: &Path) -> Vec<(PathBuf, u64, u64, Vec<u8>)> {
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let data = if meta.is_file() {
+                fs::read(&path).unwrap()
+            } else {
+                vec![]
+            };
+            entries.push((path.clone(), meta.ino(), meta.nlink(), data));
+            if meta.is_dir() {
+                entries.extend(tree(&path));
+            }
+        }
+        entries.sort();
+        entries
+    }
+    let before = tree(&f.store);
+    let retry = f.prune();
+    assert_eq!(retry.status, "failed", "{phase}: {retry:#?}");
+    assert!(
+        retry.failure.as_ref().unwrap().contains("os error 5"),
+        "{retry:#?}"
+    );
+    assert_eq!(fs::read(&barrier).unwrap(), journal);
+    assert_eq!(tree(&f.store), before, "retry mutated before required sync");
+    if phase != "target" {
+        assert!(target.exists());
+    }
+    assert!(retry.recovered.is_empty());
+    {
+        let lease = StoreLease::shared(&f.store, &|| false).unwrap();
+        assert!(ManagedCache::open(&f.store, &lease, &|| false).is_err());
+    }
+    unsafe {
+        std::env::remove_var("RETIRE_FAIL_DIR");
+        std::env::remove_var("RETIRE_FAIL_ABSENT");
+    }
+    let recovered = f.prune();
+    assert_eq!(recovered.status, "complete", "{recovered:#?}");
+    f.verify_retained();
+}
