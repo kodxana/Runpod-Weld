@@ -4,19 +4,24 @@
 //! is required; nested mounts and magic links are refused. Roots themselves are
 //! trusted caller paths. No host-path destination resolution is performed.
 //!
-//! Sources are literal context-relative paths (`.` allowed); no `..`, absolute
-//! paths, glob/variable syntax, or symlink ancestors. Explicit source symlinks
+//! Sources are context-relative paths or Go filepath.Match wildcards (`.` allowed);
+//! no `..`, absolute paths, or symlink ancestors. `**` is not recursive. Explicit source symlinks
 //! are rejected; symlinks encountered inside directories are copied verbatim.
 //! Directory contents merge into destination. Multiple sources require a
-//! trailing slash. A single file uses its basename when destination is a
+//! trailing slash; matches from one wildcard overwrite in sorted order without it.
+//! Empty wildcard matches are no-ops; missing literals fail. A single file uses
+//! its basename when destination is a
 //! directory (including an image-root symlink to one). Type collisions fail.
 //! Ordered .dockerignore rules filter local sources before payload/xattr reads.
 //!
-//! Preserves permission bits, assigns uid/gid 0, and copies hardlinks as separate
+//! Preserves permission bits except new selected directory roots default to 0755;
+//! local sources default to uid/gid 0, stage sources
+//! preserve ownership. Octal chmod and image-local chown override copied metadata.
+//! Copies hardlinks as separate
 //! files. Nanosecond atime/mtime and user.* / security.capability xattrs are
 //! preserved. Other xattrs (including ACLs) fail preflight. Existing selected
 //! directory roots retain ownership/mode/xattrs; nested directories take source
-//! metadata. Sparse layout and COPY flags are unsupported.
+//! metadata, including with overrides. Sparse layout is unsupported.
 //! Cancellation is cooperative, not an I/O timeout. Metadata accounting includes
 //! xattr payloads and per-attribute overhead, not allocator bookkeeping/capacity.
 //! Temporary overhead: 128 traversal frames/FDs, 64 KiB xattr names, up to 64 KiB
@@ -71,6 +76,51 @@ pub struct Limits {
     /// bytes per entry, plus xattr names/values and 64 bytes per attribute.
     /// Also bounds the retained manifest; paths are <=4096 bytes.
     pub max_metadata_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CopyOptions<'a> {
+    pub chmod: Option<u32>,
+    pub chown: Option<&'a str>,
+}
+
+pub fn parse_chmod(value: &str) -> Result<u32, Error> {
+    if value.is_empty() || value.len() > 4 || !value.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return Err(Error::Unsupported(
+            "COPY --chmod requires an octal mode (0000..7777); symbolic modes are unsupported",
+        ));
+    }
+    u32::from_str_radix(value, 8).map_err(|_| Error::Invalid("COPY chmod"))
+}
+
+pub fn validate_chown(value: &str) -> Result<(), Error> {
+    if value.len() > 1024 {
+        return Err(Error::Limit("COPY chown length"));
+    }
+    let parts: Vec<_> = value.split(':').collect();
+    if value.len() > 1024
+        || parts.len() > 2
+        || parts[0].is_empty()
+        || parts.iter().any(|s| {
+            s.bytes()
+                .any(|b| b.is_ascii_whitespace() || b == 0 || b == b'/')
+        })
+    {
+        return Err(Error::Invalid("COPY --chown requires user[:group]"));
+    }
+    for part in parts {
+        if !part.is_empty()
+            && part.bytes().all(|b| b.is_ascii_digit())
+            && part
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n != u32::MAX)
+                .is_none()
+        {
+            return Err(Error::Invalid("COPY ownership ID out of range"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -132,14 +182,35 @@ pub fn copy_local(
     limits: Limits,
     cancelled: impl Fn() -> bool,
 ) -> Result<Summary, Error> {
+    copy_local_with_options(
+        context_root,
+        image_root,
+        sources,
+        destination,
+        limits,
+        CopyOptions::default(),
+        cancelled,
+    )
+}
+
+pub fn copy_local_with_options(
+    context_root: &Path,
+    image_root: &Path,
+    sources: &[&str],
+    destination: &str,
+    limits: Limits,
+    options: CopyOptions<'_>,
+    cancelled: impl Fn() -> bool,
+) -> Result<Summary, Error> {
     let policy = load_policy(context_root, None, &cancelled)?;
-    copy_filtered(
+    copy_filtered_with_options(
         context_root,
         image_root,
         sources,
         destination,
         limits,
         Some(&policy),
+        options,
         cancelled,
     )
 }
@@ -164,6 +235,27 @@ pub fn copy_stage(
     )
 }
 
+pub fn copy_stage_with_options(
+    context_root: &Path,
+    image_root: &Path,
+    sources: &[&str],
+    destination: &str,
+    limits: Limits,
+    options: CopyOptions<'_>,
+    cancelled: impl Fn() -> bool,
+) -> Result<Summary, Error> {
+    copy_filtered_with_options(
+        context_root,
+        image_root,
+        sources,
+        destination,
+        limits,
+        None,
+        options,
+        cancelled,
+    )
+}
+
 pub(crate) fn copy_filtered(
     context_root: &Path,
     image_root: &Path,
@@ -171,6 +263,29 @@ pub(crate) fn copy_filtered(
     destination: &str,
     limits: Limits,
     policy: Option<&Policy>,
+    cancelled: impl Fn() -> bool,
+) -> Result<Summary, Error> {
+    copy_filtered_with_options(
+        context_root,
+        image_root,
+        sources,
+        destination,
+        limits,
+        policy,
+        CopyOptions::default(),
+        cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_filtered_with_options(
+    context_root: &Path,
+    image_root: &Path,
+    sources: &[&str],
+    destination: &str,
+    limits: Limits,
+    policy: Option<&Policy>,
+    options: CopyOptions<'_>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Summary, Error> {
     #[cfg(target_os = "linux")]
@@ -182,6 +297,7 @@ pub(crate) fn copy_filtered(
             destination,
             limits,
             policy,
+            options,
             &cancelled,
         )
     }
@@ -194,6 +310,7 @@ pub(crate) fn copy_filtered(
             destination,
             limits,
             policy,
+            options,
             cancelled,
         );
         Err(Error::Unsupported("local COPY requires Linux"))
@@ -213,6 +330,346 @@ mod linux {
         },
     };
 
+    fn ownership_error(e: Error, uid: u32, gid: u32) -> Error {
+        match e {
+            Error::Io(e) => Error::Io(io::Error::new(
+                e.kind(),
+                format!(
+                    "COPY cannot set inode ownership to {uid}:{gid}: {e}; the Pod must permit this ownership change"
+                ),
+            )),
+            e => e,
+        }
+    }
+    fn resolve_owner(
+        image: &File,
+        value: &str,
+        c: &impl Fn() -> bool,
+    ) -> Result<(u32, u32), Error> {
+        validate_chown(value)?;
+        fn lookup(
+            image: &File,
+            name: &str,
+            group: bool,
+            c: &impl Fn() -> bool,
+        ) -> Result<Option<(u32, u32)>, Error> {
+            let path: &[u8] = if group { b"etc/group" } else { b"etc/passwd" };
+            let pin = match open(image, path, libc::O_PATH | libc::O_NOFOLLOW, false) {
+                Ok(pin) => pin,
+                Err(Error::Io(e))
+                    if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+            let pin = if pin.metadata()?.file_type().is_symlink() {
+                open(image, path, libc::O_PATH, false)?
+            } else {
+                pin
+            };
+            if !pin.metadata()?.is_file() {
+                return Err(Error::Invalid("COPY account database must be regular"));
+            }
+            let mut f = open(image, path, libc::O_RDONLY | libc::O_NONBLOCK, false)?;
+            let mut data = Vec::new();
+            let mut buf = [0; 8192];
+            loop {
+                check(c)?;
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                if data.len() + n > 1024 * 1024 {
+                    return Err(Error::Limit("COPY account database bytes"));
+                }
+                data.extend_from_slice(&buf[..n]);
+            }
+            let text = std::str::from_utf8(&data)
+                .map_err(|_| Error::Invalid("COPY account database UTF-8"))?;
+            for line in text.lines() {
+                check(c)?;
+                let fields: Vec<_> = line.split(':').collect();
+                if fields.first() != Some(&name) {
+                    continue;
+                }
+                let id = |i: usize| {
+                    fields
+                        .get(i)
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|n| *n != u32::MAX)
+                        .ok_or(Error::Invalid("COPY malformed account ID"))
+                };
+                return Ok(Some((id(2)?, if group { id(2)? } else { id(3)? })));
+            }
+            Ok(None)
+        }
+        let (user, group) = value.split_once(':').unwrap_or((value, ""));
+        let user = if user == "root" { "0" } else { user };
+        let group = if group == "root" { "0" } else { group };
+        let (uid, primary) = match user.parse::<u32>() {
+            Ok(id) => (id, id),
+            Err(_) => lookup(image, user, false, c)?.unwrap_or((0, 0)),
+        };
+        let gid = if group.is_empty() {
+            primary
+        } else {
+            match group.parse::<u32>() {
+                Ok(id) => id,
+                Err(_) => lookup(image, group, true, c)?.map_or(primary, |ids| ids.0),
+            }
+        };
+        Ok((uid, gid))
+    }
+
+    #[derive(Debug)]
+    enum Glob {
+        Literal(char),
+        Any,
+        Star,
+        Class(bool, Vec<(char, char)>),
+    }
+    fn pattern(s: &str) -> Result<Vec<Glob>, Error> {
+        let mut it = s.chars().peekable();
+        let mut tokens = Vec::new();
+        fn character(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<char, Error> {
+            match it.next() {
+                Some('\\') => it
+                    .next()
+                    .ok_or(Error::Invalid("COPY malformed wildcard escape")),
+                Some(']' | '-') | None => Err(Error::Invalid("COPY malformed wildcard class")),
+                Some(c) => Ok(c),
+            }
+        }
+        while let Some(c) = it.next() {
+            tokens.push(match c {
+                '*' => Glob::Star,
+                '?' => Glob::Any,
+                '\\' => Glob::Literal(
+                    it.next()
+                        .ok_or(Error::Invalid("COPY malformed wildcard escape"))?,
+                ),
+                '[' => {
+                    let neg = it.peek() == Some(&'^');
+                    if neg {
+                        it.next();
+                    }
+                    let mut ranges = Vec::new();
+                    loop {
+                        let lo = character(&mut it)?;
+                        let hi = if it.peek() == Some(&'-') {
+                            it.next();
+                            character(&mut it)?
+                        } else {
+                            lo
+                        };
+                        ranges.push((lo, hi));
+                        if it.peek() == Some(&']') {
+                            it.next();
+                            break;
+                        }
+                    }
+                    Glob::Class(neg, ranges)
+                }
+                c => Glob::Literal(c),
+            });
+        }
+        Ok(tokens)
+    }
+    fn matches(tokens: &[Glob], name: &[u8], work: &mut u64) -> Result<bool, Error> {
+        fn rune(bytes: &[u8]) -> (char, usize) {
+            let n = match bytes[0] {
+                0..=127 => 1,
+                0xc2..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf4 => 4,
+                _ => 0,
+            };
+            if n > 0
+                && bytes.len() >= n
+                && let Ok(s) = std::str::from_utf8(&bytes[..n])
+            {
+                return (s.chars().next().unwrap(), n);
+            }
+            ('\u{fffd}', 1)
+        }
+        let mut state = vec![false; name.len() + 1];
+        state[0] = true;
+        for token in tokens {
+            *work = work
+                .checked_sub(name.len() as u64 + 1)
+                .ok_or(Error::Limit("COPY wildcard work"))?;
+            let mut next = vec![false; state.len()];
+            for i in 0..state.len() {
+                if matches!(token, Glob::Star) {
+                    next[i] = state[i] || (i > 0 && next[i - 1]);
+                } else if state[i] && i < name.len() {
+                    let (ch, n) = rune(&name[i..]);
+                    let yes = match token {
+                        Glob::Literal(c) => {
+                            let mut bytes = [0; 4];
+                            let literal = c.encode_utf8(&mut bytes).as_bytes();
+                            if name[i..].starts_with(literal) {
+                                next[i + literal.len()] = true;
+                            }
+                            false
+                        }
+                        Glob::Any => true,
+                        Glob::Class(neg, ranges) => {
+                            ranges.iter().any(|(lo, hi)| *lo <= ch && ch <= *hi) != *neg
+                        }
+                        Glob::Star => unreachable!(),
+                    };
+                    if yes {
+                        next[i + n] = true;
+                    }
+                }
+            }
+            state = next;
+        }
+        Ok(state[name.len()])
+    }
+
+    fn names(dir: File, mut visit: impl FnMut(&[u8]) -> Result<(), Error>) -> Result<(), Error> {
+        let fd = dir.into_raw_fd();
+        let raw = unsafe { libc::fdopendir(fd) };
+        if raw.is_null() {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(io::Error::last_os_error().into());
+        }
+        struct Dir(*mut libc::DIR);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+        let dir = Dir(raw);
+        loop {
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let ent = unsafe { libc::readdir(dir.0) };
+            if ent.is_null() {
+                let e = io::Error::last_os_error();
+                return if e.raw_os_error() == Some(0) {
+                    Ok(())
+                } else {
+                    Err(e.into())
+                };
+            }
+            let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                visit(name)?;
+            }
+        }
+    }
+    fn select(
+        ctx: &File,
+        sources: &[&str],
+        plan: &mut Plan<'_>,
+        c: &impl Fn() -> bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if sources.len() > plan.limits.max_entries {
+            return Err(Error::Limit("COPY selected sources"));
+        }
+        let mut selected = Vec::new();
+        for source in sources {
+            check(c)?;
+            if source.is_empty()
+                || source.len() > 4096
+                || source.starts_with('/')
+                || source.contains('\0')
+                || source.split('/').any(|p| p == "..")
+                || source.split('/').count() > 128
+            {
+                return Err(Error::Invalid("COPY source path"));
+            }
+            let parts: Vec<_> = source
+                .split('/')
+                .filter(|p| !p.is_empty() && *p != ".")
+                .collect();
+            let wildcard = source.contains(['*', '?', '[', '\\']);
+            if !wildcard {
+                selected.push(path(source, false)?);
+                continue;
+            }
+            let patterns = parts
+                .iter()
+                .map(|p| pattern(p))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut pending = vec![Vec::new()];
+            for (index, tokens) in patterns.iter().enumerate() {
+                let mut next = Vec::new();
+                for parent in pending {
+                    let dir = open(
+                        ctx,
+                        &parent,
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOATIME,
+                        true,
+                    )?;
+                    names(dir, |name| {
+                        check(c)?;
+                        let child = join(&parent, name)?;
+                        if plan.visited >= plan.limits.max_entries {
+                            return Err(Error::Limit("wildcard entries"));
+                        }
+                        plan.visited += 1;
+                        plan.used.entries += 1;
+                        plan.used.metadata_bytes = plan
+                            .used
+                            .metadata_bytes
+                            .checked_add(512 + child.len() as u64)
+                            .filter(|n| *n <= plan.limits.max_metadata_bytes)
+                            .ok_or(Error::Limit("wildcard metadata"))?;
+                        if !matches(tokens, name, &mut plan.work)? {
+                            return Ok(());
+                        }
+                        let excluded = match plan.policy {
+                            Some(p) => p.excluded_cancellable(&child, &mut plan.work, c)?,
+                            None => false,
+                        };
+                        if excluded
+                            && (index + 1 == patterns.len()
+                                || !plan.policy.is_some_and(|p| p.negations))
+                        {
+                            return Ok(());
+                        }
+                        let m =
+                            open(ctx, &child, libc::O_PATH | libc::O_NOFOLLOW, true)?.metadata()?;
+                        if index + 1 < patterns.len() {
+                            if m.file_type().is_symlink() {
+                                return Err(Error::Unsupported(
+                                    "wildcard source symlink traversal",
+                                ));
+                            }
+                            if m.is_dir() {
+                                next.push(child);
+                            }
+                        } else if m.is_file() || m.is_dir() {
+                            next.push(child);
+                        } else {
+                            return Err(Error::Unsupported("explicit wildcard source type"));
+                        }
+                        Ok(())
+                    })?;
+                }
+                pending = next;
+            }
+            pending.sort();
+            selected.extend(pending);
+        }
+        if sources.is_empty() {
+            return Err(Error::Invalid("empty COPY sources"));
+        }
+        if selected.len() > plan.limits.max_entries {
+            return Err(Error::Limit("COPY selected sources"));
+        }
+        Ok(selected)
+    }
     fn check(c: &impl Fn() -> bool) -> Result<(), Error> {
         if c() { Err(Error::Cancelled) } else { Ok(()) }
     }
@@ -255,7 +712,12 @@ mod linux {
             )
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error().into());
+            let error = io::Error::last_os_error();
+            // O_NOATIME needs ownership or CAP_FOWNER; readable sources must not.
+            if flags & libc::O_NOATIME != 0 && error.raw_os_error() == Some(libc::EPERM) {
+                return open(root, p.as_bytes(), flags & !libc::O_NOATIME, source);
+            }
+            return Err(error.into());
         }
         Ok(unsafe { File::from_raw_fd(fd as i32) })
     }
@@ -342,12 +804,21 @@ mod linux {
         c: &impl Fn() -> bool,
     ) -> Result<(), Error> {
         let ctx = root(ctx)?;
-        let mut work = crate::dockerignore::WORK;
-        for source in sources {
-            check(c)?;
-            let src = path(source, false)?;
+        let mut plan = Plan {
+            policy: Some(policy),
+            work: crate::dockerignore::WORK,
+            visited: 0,
+            entries: Vec::new(),
+            used: Summary::default(),
+            limits: Limits {
+                max_entries: 1_000_000,
+                max_bytes: u64::MAX,
+                max_metadata_bytes: 256 * 1024 * 1024,
+            },
+        };
+        for src in select(&ctx, sources, &mut plan, c)? {
             let m = open(&ctx, &src, libc::O_PATH | libc::O_NOFOLLOW, true)?.metadata()?;
-            if policy.excluded_cancellable(&src, &mut work, c)? {
+            if policy.excluded_cancellable(&src, &mut plan.work, c)? {
                 return Err(Error::Invalid(
                     "explicit COPY source excluded by dockerignore",
                 ));
@@ -437,7 +908,7 @@ mod linux {
         policy: Option<&Policy>,
         c: &impl Fn() -> bool,
     ) -> Result<Summary, Error> {
-        if sources.len() != targets.len() || sources.is_empty() {
+        if sources.is_empty() {
             return Err(Error::Invalid("cached COPY targets"));
         }
         let ctx = root(ctx)?;
@@ -449,11 +920,21 @@ mod linux {
             used: Summary::default(),
             limits,
         };
-        for (source, target) in sources.iter().zip(targets) {
-            if target.len() > 4096 || target.contains(&0) {
+        let selected = select(&ctx, sources, &mut plan, c)?;
+        if selected.len() != targets.len() {
+            return Err(Error::Invalid("cached COPY targets"));
+        }
+        for (source, target) in selected.into_iter().zip(targets) {
+            if target.len() > 4096
+                || target.contains(&0)
+                || target.starts_with(b"/")
+                || target
+                    .split(|b| *b == b'/')
+                    .any(|p| p == b".." || p == b".")
+            {
                 return Err(Error::Invalid("cached COPY target"));
             }
-            plan.visit(&ctx, path(source, false)?, target.clone(), true, 0, c)?;
+            plan.visit(&ctx, source, target.clone(), true, 0, c)?;
         }
         Ok(plan.used)
     }
@@ -461,7 +942,7 @@ mod linux {
         if p.is_empty()
             || p.len() > 4096
             || p.starts_with('/') != absolute
-            || p.bytes().any(|b| b"\0*?[$\\".contains(&b))
+            || p.bytes().any(|b| b"\0".contains(&b))
             || p.split('/').any(|s| s == "..")
             || p.split('/').count() > 128
         {
@@ -494,6 +975,8 @@ mod linux {
         src: Vec<u8>,
         dst: Vec<u8>,
         mode: u32,
+        uid: u32,
+        gid: u32,
         size: u64,
         kind: u32,
         link: Vec<u8>,
@@ -666,6 +1149,8 @@ mod linux {
                     src: src.clone(),
                     dst: dst.clone(),
                     mode: m.mode() & 0o7777,
+                    uid: m.uid(),
+                    gid: m.gid(),
                     size,
                     kind,
                     link,
@@ -776,22 +1261,31 @@ mod linux {
         Ok(result)
     }
     fn restore(f: &File, e: &Entry, c: &impl Fn() -> bool) -> Result<(), Error> {
-        // chown and payload writes clear capabilities: install xattrs last.
-        metadata(f, e.mode)?;
+        // user.* requires inode write permission, even through an open writable FD.
+        metadata(f, e.mode | 0o600, e.uid, e.gid)?;
         for (name, _) in attrs(f, b"", false, c)? {
             cv(unsafe { libc::fremovexattr(f.as_raw_fd(), name.as_ptr()) })?;
         }
-        for (name, value) in &e.attrs {
-            check(c)?;
-            cv(unsafe {
-                libc::fsetxattr(
-                    f.as_raw_fd(),
-                    name.as_ptr(),
-                    value.as_ptr().cast(),
-                    value.len(),
-                    0,
-                )
-            })?;
+        for capability in [false, true] {
+            if capability {
+                // Install capabilities only after payload, ownership and final mode.
+                metadata(f, e.mode, e.uid, e.gid)?;
+            }
+            for (name, value) in &e.attrs {
+                if (name.as_bytes() == b"security.capability") != capability {
+                    continue;
+                }
+                check(c)?;
+                cv(unsafe {
+                    libc::fsetxattr(
+                        f.as_raw_fd(),
+                        name.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                    )
+                })?;
+            }
         }
         cv(unsafe { libc::futimens(f.as_raw_fd(), e.times.as_ptr()) })?;
         Ok(())
@@ -855,7 +1349,12 @@ mod linux {
         }
         Ok(resolved)
     }
-    fn mkdirs(image: &File, p: &[u8], c: &impl Fn() -> bool) -> Result<File, Error> {
+    fn mkdirs(
+        image: &File,
+        p: &[u8],
+        created: &mut std::collections::BTreeSet<Vec<u8>>,
+        c: &impl Fn() -> bool,
+    ) -> Result<File, Error> {
         check(c)?;
         match open(image, p, libc::O_RDONLY | libc::O_DIRECTORY, false) {
             Ok(f) => return Ok(f),
@@ -866,23 +1365,29 @@ mod linux {
         if name.is_empty() {
             return Err(Error::Invalid("missing root"));
         }
-        let d = mkdirs(image, parent, c)?;
+        let d = mkdirs(image, parent, created, c)?;
         cv(unsafe { libc::mkdirat(d.as_raw_fd(), cs(name)?.as_ptr(), 0o755) })?;
         let f = open(image, p, libc::O_RDONLY | libc::O_DIRECTORY, false)?;
-        metadata(&f, 0o755)?;
+        cv(unsafe { libc::fchmod(f.as_raw_fd(), 0o755) })?;
+        created.insert(p.to_vec());
         Ok(f)
     }
-    fn metadata(f: &File, mode: u32) -> Result<(), Error> {
-        cv(unsafe { libc::fchown(f.as_raw_fd(), 0, 0) })?;
+    fn metadata(f: &File, mode: u32, uid: u32, gid: u32) -> Result<(), Error> {
+        let current = f.metadata()?;
+        if current.uid() != uid || current.gid() != gid {
+            cv(unsafe { libc::fchown(f.as_raw_fd(), uid, gid) })
+                .map_err(|e| ownership_error(e, uid, gid))?;
+        }
         cv(unsafe { libc::fchmod(f.as_raw_fd(), mode) })?;
         let m = f.metadata()?;
-        if m.uid() != 0 || m.gid() != 0 || m.mode() & 0o7777 != mode {
+        if m.uid() != uid || m.gid() != gid || m.mode() & 0o7777 != mode {
             return Err(Error::Unsupported(
                 "filesystem did not preserve uid/gid/mode",
             ));
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn copy(
         ctx: &Path,
         image: &Path,
@@ -890,6 +1395,7 @@ mod linux {
         destination: &str,
         limits: Limits,
         policy: Option<&Policy>,
+        options: CopyOptions<'_>,
         c: &impl Fn() -> bool,
     ) -> Result<Summary, Error> {
         check(c)?;
@@ -905,6 +1411,13 @@ mod linux {
         }
         let ctx = root(ctx)?;
         let image = root(image)?;
+        if options.chmod.is_some_and(|m| m > 0o7777) {
+            return Err(Error::Invalid("COPY chmod exceeds 7777"));
+        }
+        let owner = options
+            .chown
+            .map(|v| resolve_owner(&image, v, c))
+            .transpose()?;
         let dst = destination_path(&image, &dst, c)?;
         let dest_dir = match open(&image, &dst, libc::O_PATH, false) {
             Ok(f) => f.metadata()?.is_dir(),
@@ -919,9 +1432,9 @@ mod linux {
             used: Summary::default(),
             limits,
         };
-        for s in sources {
+        let selected = select(&ctx, sources, &mut plan, c)?;
+        for src in selected {
             check(c)?;
-            let src = path(s, false)?;
             let m = open(&ctx, &src, libc::O_PATH | libc::O_NOFOLLOW, true)?.metadata()?;
             let target = if !m.is_dir() && (dest_dir || destination.ends_with('/')) {
                 join(&dst, split(&src).1)?
@@ -930,6 +1443,20 @@ mod linux {
             };
             plan.used.targets.push(target.clone());
             plan.visit(&ctx, src, target, true, 0, c)?;
+        }
+        for e in &mut plan.entries {
+            if let Some(mode) = options.chmod {
+                e.mode = mode;
+            } else if e.explicit && e.kind == libc::S_IFDIR {
+                e.mode = 0o755;
+            }
+            let (uid, gid) = owner.unwrap_or(if policy.is_some() {
+                (0, 0)
+            } else {
+                (e.uid, e.gid)
+            });
+            e.uid = uid;
+            e.gid = gid;
         }
         // Inspect destination metadata too, before any mutation. Do not silently
         // retain unsupported ACLs on merged directories.
@@ -962,6 +1489,7 @@ mod linux {
         }
         // Preflight completes before creating any destination. File payloads are
         // reread only under the caller's stable-context contract.
+        let mut created = std::collections::BTreeSet::new();
         let mut directory_metadata = std::collections::BTreeMap::new();
         for e in &plan.entries {
             check(c)?;
@@ -977,7 +1505,7 @@ mod linux {
                     Err(e) => return Err(e),
                 }
                 let existed = open(&image, &e.dst, libc::O_PATH | libc::O_DIRECTORY, false).is_ok();
-                let f = mkdirs(&image, &e.dst, c)?;
+                let f = mkdirs(&image, &e.dst, &mut created, c)?;
                 if !e.explicit || !existed {
                     let m = f.metadata()?;
                     directory_metadata.insert((m.dev(), m.ino()), e);
@@ -988,7 +1516,7 @@ mod linux {
             if name.is_empty() {
                 return Err(Error::Invalid("non-directory image root"));
             }
-            let d = mkdirs(&image, parent, c)?;
+            let d = mkdirs(&image, parent, &mut created, c)?;
             if e.kind == libc::S_IFLNK {
                 let n = cs(name)?;
                 let rc = unsafe { libc::unlinkat(d.as_raw_fd(), n.as_ptr(), 0) };
@@ -996,9 +1524,19 @@ mod linux {
                     return Err(io::Error::last_os_error().into());
                 }
                 cv(unsafe { libc::symlinkat(cs(&e.link)?.as_ptr(), d.as_raw_fd(), n.as_ptr()) })?;
-                cv(unsafe {
-                    libc::fchownat(d.as_raw_fd(), n.as_ptr(), 0, 0, libc::AT_SYMLINK_NOFOLLOW)
-                })?;
+                let m = open(&image, &e.dst, libc::O_PATH | libc::O_NOFOLLOW, false)?.metadata()?;
+                if m.uid() != e.uid || m.gid() != e.gid {
+                    cv(unsafe {
+                        libc::fchownat(
+                            d.as_raw_fd(),
+                            n.as_ptr(),
+                            e.uid,
+                            e.gid,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    })
+                    .map_err(|err| ownership_error(err, e.uid, e.gid))?;
+                }
                 let (_parent, p) = attr_path(&image, &e.dst, false)?;
                 for (name, value) in &e.attrs {
                     cv(unsafe {
@@ -1072,6 +1610,9 @@ mod linux {
                 restore(&out, e, c)?;
             }
         }
+        for e in plan.entries.iter().filter(|e| e.kind == libc::S_IFDIR) {
+            created.remove(&e.dst);
+        }
         // Postorder lets children be created before restrictive directory modes.
         let mut finished = std::collections::BTreeSet::new();
         for e in plan
@@ -1090,6 +1631,12 @@ mod linux {
                 restore(&f, metadata_entry, c)?;
             }
             cv(unsafe { libc::futimens(f.as_raw_fd(), e.times.as_ptr()) })?;
+        }
+        for parent in created.iter().rev() {
+            check(c)?;
+            let f = open(&image, parent, libc::O_RDONLY | libc::O_DIRECTORY, false)?;
+            let (uid, gid) = owner.unwrap_or((0, 0));
+            metadata(&f, options.chmod.unwrap_or(0o755), uid, gid)?;
         }
         Ok(plan.used)
     }
@@ -1114,6 +1661,588 @@ mod tests {
         copy_local(ctx, image, src, dst, limits(), || false)
     }
 
+    #[test]
+    fn wildcard_options_receipts_and_filtering() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::create_dir_all(ctx.path().join("tree/deep")).unwrap();
+        for name in [
+            "a.txt",
+            "b.txt",
+            "skip.txt",
+            "arr[0]",
+            "?.txt",
+            "tree/c.txt",
+            "tree/deep/d.txt",
+        ] {
+            fs::write(ctx.path().join(name), name).unwrap();
+        }
+        fs::write(ctx.path().join(".dockerignore"), "skip.txt\n").unwrap();
+        let policy = load_policy(ctx.path(), None, &|| false).unwrap();
+        validate_sources(ctx.path(), &["[ab].txt"], &policy, &|| false).unwrap();
+        let options = CopyOptions {
+            chmod: Some(0o640),
+            chown: Some("0:0"),
+        };
+        let result = copy_local_with_options(
+            ctx.path(),
+            image.path(),
+            &["*.txt"],
+            "/out/",
+            limits(),
+            options,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(result.targets.len(), 3);
+        assert!(!image.path().join("out/skip.txt").exists());
+        assert_eq!(
+            fs::metadata(image.path().join("out/a.txt")).unwrap().mode() & 0o7777,
+            0o640
+        );
+        let cached = validate_copy_budget(
+            ctx.path(),
+            &["*.txt"],
+            &result.targets,
+            limits(),
+            Some(&policy),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(
+            (result.entries, result.bytes_written, result.metadata_bytes),
+            (cached.entries, cached.bytes_written, cached.metadata_bytes)
+        );
+        assert!(
+            validate_copy_budget(
+                ctx.path(),
+                &["*.txt"],
+                &result.targets[..1],
+                limits(),
+                Some(&policy),
+                &|| false
+            )
+            .is_err()
+        );
+        run(ctx.path(), image.path(), &[r"arr\[0\]"], "/escaped").unwrap();
+        run(ctx.path(), image.path(), &["**/*.txt"], "/one-level/").unwrap();
+        assert!(image.path().join("one-level/c.txt").exists());
+        assert!(!image.path().join("one-level/d.txt").exists());
+        run(ctx.path(), image.path(), &["?.txt"], "/unicode/").unwrap();
+        assert!(image.path().join("unicode/?.txt").exists());
+        let overwritten = run(ctx.path(), image.path(), &["[ab].txt"], "/file").unwrap();
+        assert_eq!(fs::read(image.path().join("file")).unwrap(), b"b.txt");
+        assert_eq!(overwritten.targets, vec![b"file".to_vec(); 2]);
+        let cached = validate_copy_budget(
+            ctx.path(),
+            &["[ab].txt"],
+            &overwritten.targets,
+            limits(),
+            Some(&policy),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(
+            (cached.entries, cached.bytes_written, cached.metadata_bytes),
+            (
+                overwritten.entries,
+                overwritten.bytes_written,
+                overwritten.metadata_bytes
+            )
+        );
+        for pattern in ["missing*", "skip.*"] {
+            let empty = run(ctx.path(), image.path(), &[pattern], "/none/").unwrap();
+            assert!(empty.targets.is_empty());
+            assert!(empty.entries > 0);
+            assert_eq!(empty.bytes_written, 0);
+            assert!(!image.path().join("none").exists());
+            assert_eq!(
+                empty,
+                validate_copy_budget(
+                    ctx.path(),
+                    &[pattern],
+                    &[],
+                    limits(),
+                    Some(&policy),
+                    &|| false
+                )
+                .unwrap()
+            );
+            assert!(matches!(
+                validate_copy_budget(
+                    ctx.path(),
+                    &[pattern],
+                    &[],
+                    Limits {
+                        max_entries: 1,
+                        ..limits()
+                    },
+                    Some(&policy),
+                    &|| false
+                ),
+                Err(Error::Limit(_))
+            ));
+        }
+        assert!(run(ctx.path(), image.path(), &["missing"], "/none/").is_err());
+        assert!(run(ctx.path(), image.path(), &["skip.txt"], "/none/").is_err());
+        assert!(run(ctx.path(), image.path(), &["[a-]"], "/bad/").is_err());
+        let tiny = Limits {
+            max_entries: 1,
+            ..limits()
+        };
+        assert!(matches!(
+            copy_local(
+                ctx.path(),
+                image.path(),
+                &["*.txt"],
+                "/limited/",
+                tiny,
+                || false
+            ),
+            Err(Error::Limit(_))
+        ));
+        assert!(!image.path().join("limited").exists());
+    }
+
+    #[test]
+    fn wildcard_raw_names_keep_distinct_receipts() {
+        use std::os::unix::ffi::OsStrExt;
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        for name in [b"\xff.txt", b"\xfe.txt"] {
+            fs::write(ctx.path().join(std::ffi::OsStr::from_bytes(name)), name).unwrap();
+        }
+        let copied = run(ctx.path(), image.path(), &["?.txt"], "/out/").unwrap();
+        assert_eq!(
+            copied.targets,
+            vec![b"out/\xfe.txt".to_vec(), b"out/\xff.txt".to_vec()]
+        );
+        for name in [b"\xff.txt", b"\xfe.txt"] {
+            assert_eq!(
+                fs::read(
+                    image
+                        .path()
+                        .join("out")
+                        .join(std::ffi::OsStr::from_bytes(name))
+                )
+                .unwrap(),
+                name
+            );
+        }
+        let policy = load_policy(ctx.path(), None, &|| false).unwrap();
+        let cached = validate_copy_budget(
+            ctx.path(),
+            &["?.txt"],
+            &copied.targets,
+            limits(),
+            Some(&policy),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(cached.bytes_written, copied.bytes_written);
+        assert!(
+            validate_copy_budget(
+                ctx.path(),
+                &["?.txt"],
+                &[b"../escape".to_vec(), b"safe".to_vec()],
+                limits(),
+                Some(&policy),
+                &|| false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn copy_options_root_aliases_ignore_account_databases() {
+        let ctx = tempfile::tempdir().unwrap();
+        fs::write(ctx.path().join("file"), "payload").unwrap();
+        std::os::unix::fs::chown(ctx.path().join("file"), Some(123), Some(456)).unwrap();
+        for accounts in [false, true] {
+            for stage in [false, true] {
+                for (owner, expected) in [
+                    ("root", (0, 0)),
+                    ("root:", (0, 0)),
+                    ("root:root", (0, 0)),
+                    ("root:789", (0, 789)),
+                    ("123:root", (123, 0)),
+                ] {
+                    let image = tempfile::tempdir().unwrap();
+                    if accounts {
+                        fs::create_dir(image.path().join("etc")).unwrap();
+                        fs::write(
+                            image.path().join("etc/passwd"),
+                            "root:x:111:222::/:/bin/sh\n",
+                        )
+                        .unwrap();
+                        fs::write(image.path().join("etc/group"), "root:x:333:\n").unwrap();
+                    }
+                    let copy = if stage {
+                        copy_stage_with_options
+                    } else {
+                        copy_local_with_options
+                    };
+                    copy(
+                        ctx.path(),
+                        image.path(),
+                        &["file"],
+                        "/file",
+                        limits(),
+                        CopyOptions {
+                            chown: Some(owner),
+                            ..CopyOptions::default()
+                        },
+                        || false,
+                    )
+                    .unwrap();
+                    let m = fs::metadata(image.path().join("file")).unwrap();
+                    assert_eq!(
+                        (m.uid(), m.gid()),
+                        expected,
+                        "{owner}, accounts={accounts}, stage={stage}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_options_names_stage_ownership_and_roots() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::create_dir_all(ctx.path().join("dir/nested")).unwrap();
+        fs::write(ctx.path().join("dir/nested/file"), "payload").unwrap();
+        fs::create_dir(image.path().join("etc")).unwrap();
+        fs::write(
+            image.path().join("etc/passwd"),
+            "builder:x:123:456::/:/bin/sh\n",
+        )
+        .unwrap();
+        fs::write(image.path().join("etc/group"), "team:x:789:\n").unwrap();
+        fs::set_permissions(image.path(), fs::Permissions::from_mode(0o711)).unwrap();
+        let options = CopyOptions {
+            chmod: Some(0o750),
+            chown: Some("builder"),
+        };
+        copy_local_with_options(
+            ctx.path(),
+            image.path(),
+            &["dir"],
+            "/",
+            limits(),
+            options,
+            || false,
+        )
+        .unwrap();
+        let m = fs::metadata(image.path().join("nested/file")).unwrap();
+        assert_eq!((m.uid(), m.gid(), m.mode() & 0o7777), (123, 456, 0o750));
+        assert_eq!(fs::metadata(image.path()).unwrap().mode() & 0o7777, 0o711);
+        let options = CopyOptions {
+            chmod: Some(0o4750),
+            chown: Some("builder:team"),
+        };
+        copy_local_with_options(
+            ctx.path(),
+            image.path(),
+            &["dir"],
+            "/new",
+            limits(),
+            options,
+            || false,
+        )
+        .unwrap();
+        let m = fs::metadata(image.path().join("new")).unwrap();
+        assert_eq!((m.uid(), m.gid(), m.mode() & 0o7777), (123, 789, 0o4750));
+        let stage = tempfile::tempdir().unwrap();
+        copy_stage(
+            image.path(),
+            stage.path(),
+            &["new/nested/file"],
+            "/file",
+            limits(),
+            || false,
+        )
+        .unwrap();
+        let m = fs::metadata(stage.path().join("file")).unwrap();
+        assert_eq!((m.uid(), m.gid()), (123, 789));
+        copy_local_with_options(
+            ctx.path(),
+            stage.path(),
+            &["dir"],
+            "/default",
+            limits(),
+            CopyOptions {
+                chown: Some("builder"),
+                ..CopyOptions::default()
+            },
+            || false,
+        )
+        .unwrap();
+        let m = fs::metadata(stage.path().join("default")).unwrap();
+        assert_eq!((m.uid(), m.gid()), (0, 0));
+        assert_eq!(parse_chmod("0755").unwrap(), 0o755);
+        assert!(parse_chmod("u+x").is_err());
+        assert!(parse_chmod("888").is_err());
+        assert!(validate_chown("4294967295").is_err());
+    }
+
+    #[test]
+    fn options_preserve_canary_hardlinks_and_confine_account_lookup() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(ctx.path().join("payload"), "new").unwrap();
+        fs::hard_link(ctx.path().join("payload"), ctx.path().join("payload2")).unwrap();
+        fs::write(outside.path().join("canary"), "outside").unwrap();
+        fs::hard_link(outside.path().join("canary"), image.path().join("payload")).unwrap();
+        let options = CopyOptions {
+            chmod: Some(0o600),
+            chown: Some("12:34"),
+        };
+        copy_local_with_options(
+            ctx.path(),
+            image.path(),
+            &["payload*"],
+            "/",
+            limits(),
+            options,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(fs::read(outside.path().join("canary")).unwrap(), b"outside");
+        assert_ne!(
+            fs::metadata(image.path().join("payload")).unwrap().ino(),
+            fs::metadata(image.path().join("payload2")).unwrap().ino()
+        );
+        symlink(outside.path(), ctx.path().join("escape")).unwrap();
+        assert!(run(ctx.path(), image.path(), &["escape/*"], "/escape/").is_err());
+        assert!(!image.path().join("escape").exists());
+        fs::create_dir(image.path().join("etc")).unwrap();
+        fs::write(outside.path().join("passwd"), "evil:x:12:34::/:/bin/sh\n").unwrap();
+        symlink(
+            outside.path().join("passwd"),
+            image.path().join("etc/passwd"),
+        )
+        .unwrap();
+        assert!(
+            copy_local_with_options(
+                ctx.path(),
+                image.path(),
+                &["payload"],
+                "/bad",
+                limits(),
+                CopyOptions {
+                    chown: Some("evil"),
+                    ..CopyOptions::default()
+                },
+                || false
+            )
+            .is_err()
+        );
+        fs::remove_file(image.path().join("etc/passwd")).unwrap();
+        fs::write(image.path().join("etc/passwd"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        assert!(matches!(
+            copy_local_with_options(
+                ctx.path(),
+                image.path(),
+                &["payload"],
+                "/bad",
+                limits(),
+                CopyOptions {
+                    chown: Some("evil"),
+                    ..CopyOptions::default()
+                },
+                || false
+            ),
+            Err(Error::Limit(_))
+        ));
+    }
+
+    #[test]
+    fn wildcard_nested_mount_is_refused() {
+        let image = tempfile::tempdir().unwrap();
+        fs::write(image.path().join("canary"), b"unchanged").unwrap();
+        assert!(
+            copy_stage(
+                Path::new("/"),
+                image.path(),
+                &["proc/[v]ersion"],
+                "/out/",
+                limits(),
+                || false
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(image.path()).unwrap().count(), 1);
+        assert_eq!(fs::read(image.path().join("canary")).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn copy_options_unprivileged_subprocess() {
+        const CHILD: &str = "WELD_COPY_UNPRIVILEGED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "context::tests::copy_options_unprivileged_subprocess",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+            let readable = tempfile::tempdir().unwrap();
+            fs::set_permissions(readable.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(readable.path().join("file"), "readable without CAP_FOWNER").unwrap();
+            fs::set_permissions(
+                readable.path().join("file"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            cmd.env("WELD_COPY_READABLE_SOURCE", readable.path());
+            if unsafe { libc::geteuid() } == 0 {
+                cmd.gid(65534).uid(65534);
+            }
+            assert!(cmd.status().unwrap().success());
+            return;
+        }
+        assert_ne!(unsafe { libc::geteuid() }, 0);
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::write(ctx.path().join("file"), "payload").unwrap();
+        fs::create_dir(ctx.path().join("dir")).unwrap();
+        symlink("../file", ctx.path().join("dir/link")).unwrap();
+        let owner = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+            libc::getegid()
+        });
+        let options = CopyOptions {
+            chmod: Some(0o750),
+            chown: Some(&owner),
+        };
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let caps = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:\t"))
+            .unwrap();
+        assert_eq!(u64::from_str_radix(caps, 16).unwrap(), 0);
+        fs::set_permissions(ctx.path().join("file"), fs::Permissions::from_mode(0o644)).unwrap();
+        set_attr(&ctx.path().join("file"), "user.test", b"value");
+        fs::create_dir_all(ctx.path().join("attrs/nested")).unwrap();
+        set_attr(&ctx.path().join("attrs/nested"), "user.test", b"value");
+        for stage in [false, true] {
+            let copy = if stage {
+                copy_stage_with_options
+            } else {
+                copy_local_with_options
+            };
+            for existing in [false, true] {
+                let target = tempfile::tempdir().unwrap();
+                if existing {
+                    fs::write(target.path().join("file"), "old").unwrap();
+                    fs::set_permissions(
+                        target.path().join("file"),
+                        fs::Permissions::from_mode(0o444),
+                    )
+                    .unwrap();
+                    fs::create_dir(target.path().join("nested")).unwrap();
+                    set_attr(&target.path().join("nested"), "user.old", b"stale");
+                    fs::set_permissions(
+                        target.path().join("nested"),
+                        fs::Permissions::from_mode(0o555),
+                    )
+                    .unwrap();
+                }
+                for (source, dest, mode) in [("file", "/file", 0o444), ("attrs", "/", 0o555)] {
+                    copy(
+                        ctx.path(),
+                        target.path(),
+                        &[source],
+                        dest,
+                        limits(),
+                        CopyOptions {
+                            chmod: Some(mode),
+                            chown: Some(&owner),
+                        },
+                        || false,
+                    )
+                    .unwrap();
+                }
+                for (path, mode) in [("file", 0o444), ("nested", 0o555)] {
+                    let path = target.path().join(path);
+                    assert_eq!(get_attr(&path, "user.test"), Some(b"value".to_vec()));
+                    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, mode);
+                    assert_eq!(get_attr(&path, "user.old"), None);
+                }
+            }
+        }
+        let readable =
+            std::path::PathBuf::from(std::env::var_os("WELD_COPY_READABLE_SOURCE").unwrap());
+        copy_local_with_options(
+            &readable,
+            image.path(),
+            &["file"],
+            "/readable",
+            limits(),
+            options,
+            || false,
+        )
+        .unwrap();
+
+        copy_local_with_options(
+            ctx.path(),
+            image.path(),
+            &["file"],
+            "/new/parents/file",
+            limits(),
+            options,
+            || false,
+        )
+        .unwrap();
+        copy_local_with_options(
+            ctx.path(),
+            image.path(),
+            &["dir"],
+            "/links",
+            limits(),
+            options,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(image.path().join("new/parents/file"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o750
+        );
+        let denied = copy_local_with_options(
+            ctx.path(),
+            image.path(),
+            &["file"],
+            "/denied",
+            limits(),
+            CopyOptions {
+                chown: Some("123:456"),
+                ..CopyOptions::default()
+            },
+            || false,
+        )
+        .unwrap_err();
+        assert!(denied.to_string().contains("Pod must permit"), "{denied}");
+        assert_eq!(
+            fs::metadata(image.path().join("denied")).unwrap().uid(),
+            unsafe { libc::geteuid() }
+        );
+        assert!(
+            copy_local(
+                ctx.path(),
+                image.path(),
+                &["file"],
+                "/root-owner",
+                limits(),
+                || false
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn cached_budget_uses_resolved_targets_and_execution_planner() {
         let ctx = tempfile::tempdir().unwrap();
@@ -1410,6 +2539,29 @@ mod tests {
             get_attr(&image.path().join("out"), "user.dir"),
             Some(b"directory".to_vec())
         );
+        copy_local_with_options(
+            ctx.path(),
+            image.path(),
+            &["dir/file"],
+            "/readonly",
+            limits(),
+            CopyOptions {
+                chmod: Some(0o444),
+                chown: Some("root"),
+            },
+            || false,
+        )
+        .unwrap();
+        let m = fs::metadata(image.path().join("readonly")).unwrap();
+        assert_eq!((m.uid(), m.gid(), m.mode() & 0o7777), (0, 0, 0o444));
+        assert_eq!(
+            get_attr(&image.path().join("readonly"), "security.capability"),
+            Some(cap.to_vec())
+        );
+        assert_eq!(
+            get_attr(&image.path().join("readonly"), "user.file"),
+            Some(b"payload".to_vec())
+        );
     }
     #[test]
     fn unsupported_acl_and_xattr_budget_fail_before_any_mutation() {
@@ -1479,7 +2631,7 @@ mod tests {
         run(ctx.path(), image.path(), &["first", "second"], "/new/").unwrap();
         assert_eq!(
             fs::metadata(image.path().join("new")).unwrap().mode() & 0o7777,
-            0o710
+            0o755
         );
         assert_eq!(
             get_attr(&image.path().join("new"), "user.first"),

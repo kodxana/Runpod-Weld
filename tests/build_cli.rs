@@ -274,7 +274,7 @@ fn all_copy_syntax_and_ignore_are_checked_before_mutation() {
     for tail in [
         "COPY ../escape /x",
         "COPY /absolute /x",
-        "COPY *.txt /x",
+        "COPY [a-].txt /x",
         "COPY plain /../x",
         "COPY plain other /x",
         "COPY '$SRC' /x",
@@ -282,7 +282,7 @@ fn all_copy_syntax_and_ignore_are_checked_before_mutation() {
         "COPY ${SRC:-plain} /x",
         "COPY plain $UNSET",
         "COPY [\"quote'file\", \"/x\"]",
-        "COPY --chown=1 plain /x",
+        "COPY --chown=1:2:3 plain /x",
         "FROM scratch\nCOPY --from=0 /x /x",
         "IGNORE",
     ] {

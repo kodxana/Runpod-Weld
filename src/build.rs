@@ -1,8 +1,8 @@
 //! Minimal, trusted/stable Linux amd64 builds from local OCI bindings or scratch.
-//! Supports dependency-selected stages: FROM, RUN, local/stage COPY, ARG, ENV, WORKDIR, JSON
-//! CMD/ENTRYPOINT, EXPOSE.
-//! Local/stage COPY is supported; other COPY flags, custom shells, USER/OnBuild and complex
-//! expansion fail closed. RUN exec
+//! Supports dependency-selected stages: FROM, RUN, local/stage COPY, ARG, ENV, WORKDIR,
+//! SHELL, LABEL, shell/JSON CMD/ENTRYPOINT, EXPOSE.
+//! COPY supports bounded patterns and --chown/--chmod. USER/OnBuild and complex
+//! expansion fail closed. RUN exec and custom shell argv
 //! form uses `/bin/sh -c 'exec ...'` with every argv element literally quoted.
 //! This is not a sandbox. Caller owns stable ancestors and trusted image/commands;
 //! no concurrent writers, mounts or external hardlinks are allowed. WORKDIR
@@ -54,7 +54,7 @@ fn copy_limits(limits: Limits, used: &context::Summary) -> context::Limits {
     }
 }
 
-/// Exact literal FROM name -> local OCI layout and optional ref annotation.
+/// Exact expanded FROM name -> local OCI layout and optional ref annotation.
 #[derive(Clone, Debug)]
 pub struct LocalBase {
     pub layout: PathBuf,
@@ -113,6 +113,8 @@ enum Step {
         from: Option<usize>,
         sources: Vec<String>,
         destination: String,
+        chown: Option<String>,
+        chmod: Option<u32>,
     },
     Run {
         command: String,
@@ -256,11 +258,12 @@ fn copy_path(value: &str, absolute: bool) -> Result<()> {
     if value.is_empty()
         || value.len() > 4096
         || value.starts_with('/') != absolute
-        || value.bytes().any(|b| b"\0*?[$\\".contains(&b))
+        || value.bytes().any(|b| b"\0$\\".contains(&b))
+        || (absolute && value.contains(['*', '?', '[']))
         || value.split('/').any(|p| p == "..")
         || value.split('/').count() > 128
     {
-        return Err("COPY requires literal context-relative sources and bounded image destinations; no glob, parent, or unresolved variable syntax".into());
+        return Err("COPY requires bounded context-relative patterns and literal image destinations; no parent or unresolved variable syntax".into());
     }
     Ok(())
 }
@@ -304,6 +307,98 @@ fn array(config: &Value, key: &str) -> Result<Vec<String>> {
     }
 }
 
+fn shell_argv(shell: &[String], command: &str) -> Vec<String> {
+    let mut argv = shell.to_vec();
+    argv.push(command.to_owned());
+    argv
+}
+
+fn exec_command(argv: &[String]) -> String {
+    format!(
+        "exec {}",
+        argv.iter()
+            .map(|s| format!("'{}'", s.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+fn global_args(
+    plan: &build_plan::BuildPlan,
+    supplied: &BTreeMap<String, String>,
+    cap: usize,
+) -> Result<BTreeMap<String, String>> {
+    map_bytes(supplied, cap)?;
+    for (name, value) in supplied {
+        if !identifier(name) {
+            return Err("invalid build argument name".into());
+        }
+        text(value)?;
+    }
+    let mut globals = BTreeMap::new();
+    for instruction in &plan.global_args {
+        if let I::Arg { name, default } = &instruction.kind {
+            let default = default
+                .as_deref()
+                .map(|s| expand(s, &globals, cap))
+                .transpose()?;
+            if let Some(value) = supplied.get(name).cloned().or(default) {
+                globals.insert(name.clone(), value);
+                map_bytes(&globals, cap)?;
+            }
+        }
+    }
+    Ok(globals)
+}
+
+/// Resolve FROM using global ARGs before dependency selection or registry/cache work.
+/// Dynamic aliases may select only backward stages; COPY --from stays literal.
+pub fn resolve_plan(
+    source: &str,
+    supplied: &BTreeMap<String, String>,
+    cap: usize,
+) -> Result<build_plan::BuildPlan> {
+    let mut plan = build_plan::parse(source)?;
+    let globals = global_args(&plan, supplied, cap)?;
+    let mut charged = map_bytes(&globals, cap)?;
+    for index in 0..plan.stages.len() {
+        let Base::Image(raw) = &plan.stages[index].base else {
+            continue;
+        };
+        let name = expand(raw, &globals, cap)?;
+        charged = charged
+            .checked_add(name.len())
+            .filter(|n| *n <= cap)
+            .ok_or("resolved FROM budget exceeded")?;
+        let alias = plan.stages.iter().position(|s| {
+            s.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&name))
+        });
+        let base = if let Some(previous) = alias.filter(|n| *n < index) {
+            Base::Stage(previous)
+        } else {
+            // A literal self-named stage can still use an image with that name.
+            // Dynamic forward/self aliases are rejected rather than accidentally pulled.
+            if raw.contains('$') && alias.is_some() {
+                return Err("dynamic FROM must reference a backward stage".into());
+            }
+            crate::registry::reference(&name, true)
+                .map_err(|e| format!("invalid FROM {name:?}: {e}"))?;
+            Base::Image(name)
+        };
+        plan.stages[index].base = base.clone();
+        if let I::From {
+            base: instruction_base,
+            ..
+        } = &mut plan.stages[index].instructions[0].kind
+        {
+            *instruction_base = base;
+        }
+    }
+    Ok(plan)
+}
+
 fn preflight_stage(
     plan: &build_plan::BuildPlan,
     index: usize,
@@ -327,9 +422,18 @@ fn preflight_stage(
     if !array(cfg, "OnBuild")?.is_empty() {
         return Err("base OnBuild unsupported".into());
     }
-    let shell = array(cfg, "Shell")?;
-    if !shell.is_empty() && shell != ["/bin/sh", "-c"] {
-        return Err("custom base Shell unsupported".into());
+    let mut shell = array(cfg, "Shell")?;
+    if shell.first().is_some_and(String::is_empty) {
+        return Err("base Shell requires a nonempty executable".into());
+    }
+    if shell.is_empty() {
+        shell = vec!["/bin/sh".into(), "-c".into()];
+    }
+    if let Some(labels) = cfg.get("Labels").filter(|v| !v.is_null()) {
+        for (k, v) in labels.as_object().ok_or("invalid base Labels")? {
+            text(k)?;
+            text(v.as_str().ok_or("base Labels values must be strings")?)?;
+        }
     }
     array(cfg, "Cmd")?;
     array(cfg, "Entrypoint")?;
@@ -373,19 +477,7 @@ fn preflight_stage(
     if supplied_bytes > cap {
         return Err("argument budget exceeded".into());
     }
-    let mut globals = BTreeMap::new();
-    for i in &plan.global_args {
-        if let I::Arg { name, default } = &i.kind {
-            let default = default
-                .as_deref()
-                .map(|s| expand(s, &globals, cap))
-                .transpose()?;
-            if let Some(v) = options.args.get(name).cloned().or(default) {
-                globals.insert(name.clone(), v);
-                map_bytes(&globals, cap)?;
-            }
-        }
-    }
+    let globals = global_args(plan, &options.args, cap)?;
     let mut args = inherited_args;
     let mut steps = vec![Step::Directory(wd.clone())];
     let mut charge = supplied_bytes + wd.len() + map_bytes(&globals, cap)?;
@@ -395,7 +487,23 @@ fn preflight_stage(
         vars.extend(env.clone()); // ENV shadows ARG, including empty values.
         match &i.kind {
             I::From { .. } => (),
-            I::Copy { from, paths } => {
+            I::Copy {
+                from,
+                paths,
+                chown,
+                chmod,
+            } => {
+                let chown = chown
+                    .as_deref()
+                    .map(|s| expand(s, &vars, cap))
+                    .transpose()?;
+                if let Some(owner) = &chown {
+                    context::validate_chown(owner)?;
+                }
+                let chmod = chmod
+                    .as_deref()
+                    .map(|s| Ok::<_, Error>(context::parse_chmod(&expand(s, &vars, cap)?)?))
+                    .transpose()?;
                 let mut values = copy_words(paths, &vars, cap)?;
                 let dest = values.pop().ok_or("COPY destination missing")?;
                 for source in &mut values {
@@ -417,12 +525,15 @@ fn preflight_stage(
                 copy_path(&destination, true)?;
                 charge = charge
                     .checked_add(destination.len())
+                    .and_then(|n| n.checked_add(chown.as_ref().map_or(0, String::len)))
                     .and_then(|n| values.iter().try_fold(n, |n, s| n.checked_add(s.len())))
                     .ok_or("plan budget overflow")?;
                 steps.push(Step::Copy {
                     from: *from,
                     sources: values,
                     destination,
+                    chown,
+                    chmod,
                 });
             }
             I::Arg { name, default } => {
@@ -435,8 +546,8 @@ fn preflight_stage(
                     .get(name)
                     .cloned()
                     .or(default)
-                    .or_else(|| args.get(name).cloned())
-                    .or_else(|| globals.get(name).cloned());
+                    .or_else(|| globals.get(name).cloned())
+                    .or_else(|| args.get(name).cloned());
                 if let Some(value) = value {
                     args.insert(name.clone(), value);
                 }
@@ -448,6 +559,23 @@ fn preflight_stage(
                     map_bytes(&env, cap)?;
                 }
             }
+            I::Label(words) => {
+                if cfg.get("Labels").is_none_or(Value::is_null) {
+                    cfg["Labels"] = json!({});
+                }
+                for word in words {
+                    let (key, value) = word.raw.split_once('=').ok_or("invalid LABEL")?;
+                    let key = expand(key, &vars, cap)?;
+                    if key.is_empty() {
+                        return Err("empty LABEL key".into());
+                    }
+                    cfg["Labels"][key] = json!(expand(value, &vars, cap)?);
+                }
+            }
+            I::Shell(argv) => {
+                shell = argv.clone();
+                cfg["Shell"] = json!(argv);
+            }
             I::Workdir(word) => {
                 wd = path(&wd, &expand(&word.raw, &vars, cap)?)?;
                 steps.push(Step::Directory(wd.clone()));
@@ -455,6 +583,16 @@ fn preflight_stage(
             I::Cmd(argv) => {
                 cfg["Cmd"] = json!(argv);
                 cmd_set = true;
+            }
+            I::ShellCmd(command) => {
+                cfg["Cmd"] = json!(shell_argv(&shell, command));
+                cmd_set = true;
+            }
+            I::ShellEntrypoint(command) => {
+                cfg["Entrypoint"] = json!(shell_argv(&shell, command));
+                if !cmd_set {
+                    cfg["Cmd"] = Value::Null;
+                }
             }
             I::Entrypoint(argv) => {
                 cfg["Entrypoint"] = json!(argv);
@@ -476,14 +614,8 @@ fn preflight_stage(
             }
             I::Run(run) => {
                 let command = match run {
-                    Run::Shell(s) => s.clone(),
-                    Run::Exec(argv) => format!(
-                        "exec {}",
-                        argv.iter()
-                            .map(|s| format!("'{}'", s.replace('\'', "'\\''")))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    ),
+                    Run::Shell(s) => exec_command(&shell_argv(&shell, s)),
+                    Run::Exec(argv) => exec_command(argv),
                 };
                 let entries: Vec<_> = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 charge = charge
@@ -616,7 +748,15 @@ struct StageResult {
 }
 
 /// Select the target and only its transitive FROM/COPY dependencies.
+/// Plans containing FROM templates must pass through resolve_plan first.
 pub fn selected_stages(plan: &build_plan::BuildPlan, target: Option<&str>) -> Result<Vec<usize>> {
+    if plan
+        .stages
+        .iter()
+        .any(|s| matches!(&s.base, Base::Image(name) if name.contains('$')))
+    {
+        return Err("resolve FROM arguments before selecting stages".into());
+    }
     let last = match target {
         Some(name) => plan
             .stages
@@ -708,7 +848,7 @@ fn build_inner(
     {
         crate::store_access::validate_path(path, lease)?;
     }
-    let plan = build_plan::parse(source)?;
+    let plan = resolve_plan(source, &options.args, options.limits.max_plan_bytes)?;
     let policy = context::load_policy(&options.context, options.dockerfile.as_deref(), &cancelled)?;
     let selected = selected_stages(&plan, options.target.as_deref())?;
     let target = *selected.last().unwrap();
@@ -963,6 +1103,10 @@ fn build_stage(
             entry,
             lease,
             options.limits.layer.max_metadata_bytes,
+            steps
+                .iter()
+                .filter(|step| matches!(step, Step::Copy { .. }))
+                .count(),
         )?;
         let mut targets = targets.iter();
         let mut copied = context::Summary::default();
@@ -1045,6 +1189,7 @@ fn build_stage(
     }
     let mut copied = context::Summary::default();
     let mut copy_targets = Vec::new();
+    let mut materialized = metadata.is_some();
     for (index, step) in steps.iter().enumerate() {
         check(&cancelled)?;
         match step {
@@ -1052,15 +1197,33 @@ fn build_stage(
                 from,
                 sources,
                 destination,
+                chown,
+                chmod,
             } => {
+                // Untouched scratch has no filesystem reference for named lookup.
+                if !materialized
+                    && chown.as_deref().is_some_and(|value| {
+                        value.split(':').any(|part| {
+                            !part.is_empty() && part != "root" && part.parse::<u32>().is_err()
+                        })
+                    })
+                {
+                    return Err(
+                        "COPY named ownership requires a materialized image filesystem".into(),
+                    );
+                }
                 let stage_root = from.map(|n| previous[&n].result.work.join("rootfs"));
-                let summary = context::copy_filtered(
+                let summary = context::copy_filtered_with_options(
                     stage_root.as_deref().unwrap_or(&options.context),
                     &root,
                     &sources.iter().map(String::as_str).collect::<Vec<_>>(),
                     destination,
                     copy_limits(options.limits, &copied),
                     if from.is_some() { None } else { Some(policy) },
+                    context::CopyOptions {
+                        chown: chown.as_deref(),
+                        chmod: *chmod,
+                    },
                     &cancelled,
                 )?;
                 copied.bytes_written += summary.bytes_written;
@@ -1093,6 +1256,8 @@ fn build_stage(
                 result?;
             }
         }
+        // Preflight inserts an initial root WORKDIR step even for untouched scratch.
+        materialized |= !matches!(step, Step::Directory(p) if p == "/");
         root_budget(&root, options.limits, &cancelled)?;
     }
     check(&cancelled)?;
@@ -1139,7 +1304,13 @@ fn build_stage(
         })?;
     }
     if !cache_hit && let Some(entry) = cache_entry {
-        crate::build_cache::publish(&output, lease, &entry, Some(&copy_targets), &cancelled)?;
+        crate::build_cache::publish(
+            &output,
+            lease,
+            &entry,
+            Some((&copy_targets, options.limits.layer.max_metadata_bytes)),
+            &cancelled,
+        )?;
     }
     Ok(StageResult {
         result: BuildResult {
@@ -1338,6 +1509,33 @@ mod tests {
         }
     }
     #[test]
+    fn shell_run_uses_selected_argv_and_exec_form_stays_literal() {
+        let t = tempfile::tempdir().unwrap();
+        let o = options(t.path());
+        let (_, steps) = preflight(
+            "FROM scratch\nRUN echo 'one' $V\nSHELL [\"/new shell\",\"--flag\",\"-c\"]\nRUN echo 'two' $V\nRUN [\"echo\",\"$V\"]",
+            &o,
+            json!({"config":{"Shell":["/base shell", "-c"]}}),
+        ).unwrap();
+        let commands: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                "exec '/base shell' '-c' 'echo '\\''one'\\'' $V'",
+                "exec '/new shell' '--flag' '-c' 'echo '\\''two'\\'' $V'",
+                "exec 'echo' '$V'",
+            ]
+        );
+        assert!(preflight("FROM scratch", &o, json!({"config":{"Shell":[""]}})).is_err());
+        assert!(preflight("FROM scratch", &o, json!({"config":{"Labels":{"bad":42}}})).is_err());
+    }
+    #[test]
     fn scratch_export_and_arg_scope() {
         let t = tempfile::tempdir().unwrap();
         let mut o = options(t.path());
@@ -1394,6 +1592,118 @@ mod tests {
             assert_eq!(fs::read(o.work.join("rootfs/a")).unwrap(), b"data");
             assert!(!o.output.exists());
         }
+    }
+
+    #[test]
+    fn cached_many_empty_copies_fit_small_metadata_budget() {
+        for (budget, count) in [(1024, 3000), (1536, 4095)] {
+            let t = tempfile::tempdir().unwrap();
+            let mut o = options(t.path());
+            o.limits.layer.max_metadata_bytes = budget;
+            o.cache = Some(t.path().join("cache"));
+            fs::create_dir(o.cache.as_ref().unwrap()).unwrap();
+            let source = format!("FROM scratch\n{}", "COPY missing* /out/\n".repeat(count));
+            let first = build(&source, &o, || false).unwrap();
+            assert!(!o.work.join("rootfs/out").exists());
+            let entry = fs::read_dir(o.cache.as_ref().unwrap())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let receipt_size = fs::metadata(entry.join("weld-copy-targets.json"))
+                .unwrap()
+                .len();
+            assert_eq!(receipt_size, 3 * count as u64 + 1);
+            assert!(receipt_size > 6 * budget); // Both cases fail the old receipt cap.
+            let receipt = crate::build_cache::copy_targets(&entry, None, budget, count).unwrap();
+            assert_eq!(receipt.len(), count);
+            assert!(receipt.iter().all(Vec::is_empty));
+            o.work = t.path().join("work-warm");
+            o.output = t.path().join("output-warm");
+            let warm = build(&source, &o, || false);
+            if budget == 1024 {
+                // Root metadata PAX replay independently exceeds this layer budget.
+                assert_eq!(
+                    warm.unwrap_err().to_string(),
+                    "layer limit exceeded: metadata bytes"
+                );
+                assert!(o.work.join("rootfs").is_dir());
+                assert!(!o.output.exists());
+            } else {
+                assert_eq!(first.manifest, warm.unwrap().manifest);
+            }
+            assert!(!o.work.join("rootfs/out").exists());
+            assert_eq!(fs::read_dir(o.cache.as_ref().unwrap()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn cached_wildcards_keep_empty_and_repeated_targets_and_invalidate() {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        let source =
+            "FROM scratch\nCOPY missing* /absent/\nCOPY ignored* /ignored/\nCOPY ?.txt /file\n";
+        fs::write(o.context.join(".dockerignore"), "ignored*\n").unwrap();
+        fs::write(o.context.join("ignored.txt"), "ignored").unwrap();
+        // Reverse creation order must not change the sorted wildcard overwrite order.
+        fs::write(o.context.join("b.txt"), "B").unwrap();
+        fs::write(o.context.join("a.txt"), "A").unwrap();
+        let future = std::time::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        for entry in fs::read_dir(&o.context).unwrap() {
+            fs::File::open(entry.unwrap().path())
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_accessed(future)
+                        .set_modified(future),
+                )
+                .unwrap();
+        }
+        fs::File::open(&o.context)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(future)
+                    .set_modified(future),
+            )
+            .unwrap();
+        o.cache = Some(t.path().join("cache"));
+        fs::create_dir(o.cache.as_ref().unwrap()).unwrap();
+        let first = build(source, &o, || false).unwrap();
+        assert_eq!(fs::read(o.work.join("rootfs/file")).unwrap(), b"B");
+        assert!(!o.work.join("rootfs/absent").exists());
+        assert!(!o.work.join("rootfs/ignored").exists());
+        let entry = fs::read_dir(o.cache.as_ref().unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let targets =
+            crate::build_cache::copy_targets(&entry, None, o.limits.layer.max_metadata_bytes, 3)
+                .unwrap();
+        assert_eq!(targets, vec![vec![], vec![], vec![b"file".to_vec(); 2]]);
+        o.work = t.path().join("work-hit");
+        o.output = t.path().join("output-hit");
+        assert_eq!(
+            first.manifest,
+            build(source, &o, || false).unwrap().manifest
+        );
+        assert_eq!(fs::read(o.work.join("rootfs/file")).unwrap(), b"B");
+        // A formerly empty selection must not reuse its completed stage.
+        fs::write(o.context.join("missing-now"), "new").unwrap();
+        o.work = t.path().join("work-new-match");
+        o.output = t.path().join("output-new-match");
+        assert_ne!(
+            first.manifest,
+            build(source, &o, || false).unwrap().manifest
+        );
+        assert_eq!(
+            fs::read(o.work.join("rootfs/absent/missing-now")).unwrap(),
+            b"new"
+        );
+        assert_eq!(fs::read_dir(o.cache.as_ref().unwrap()).unwrap().count(), 2);
     }
 
     #[test]
@@ -1489,7 +1799,7 @@ mod tests {
         for config in [
             json!({"User":"root"}),
             json!({"OnBuild":["RUN true"]}),
-            json!({"Shell":["bash","-c"]}),
+            json!({"Shell":[42]}),
             json!({"Cmd":[1]}),
             json!({"WorkingDir":"relative"}),
             json!({"Env":["bad"]}),

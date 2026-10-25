@@ -24,11 +24,13 @@ pub(crate) fn key(
     cancelled: &impl Fn() -> bool,
 ) -> Result<String> {
     let mut hash = Sha256::new();
-    field(&mut hash, b"weld-stage-cache-v3-copy-budgets");
+    field(&mut hash, b"weld-stage-cache-v4-copy-options-wildcards");
     field(&mut hash, inputs);
     // Development builds share a version string: bind cache entries to executable bytes.
     let mut executable = fs::File::open(std::env::current_exe()?)?;
-    if executable.metadata()?.len() > 64 * 1024 * 1024 {
+    // Unit-test executables also embed the test harness and its debug data.
+    let executable_limit = if cfg!(test) { 256 } else { 64 } * 1024 * 1024;
+    if executable.metadata()?.len() > executable_limit {
         return Err("builder executable exceeds cache identity budget".into());
     }
     let mut buf = [0u8; 65536];
@@ -82,7 +84,7 @@ pub(crate) fn publish(
     source: &Path,
     lease: Option<&crate::store_lease::StoreLease>,
     destination: &Path,
-    targets: Option<&[Vec<Vec<u8>>]>,
+    targets: Option<(&[Vec<Vec<u8>>], u64)>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
     publish_created(source, lease, destination, targets, cancelled, || Ok(()))
@@ -92,7 +94,7 @@ pub(crate) fn publish_created(
     source: &Path,
     lease: Option<&crate::store_lease::StoreLease>,
     destination: &Path,
-    targets: Option<&[Vec<Vec<u8>>]>,
+    targets: Option<(&[Vec<Vec<u8>>], u64)>,
     cancelled: &impl Fn() -> bool,
     created: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<()> {
@@ -126,11 +128,14 @@ pub(crate) fn publish_created(
             }
         }
     }
-    if let Some(targets) = targets {
-        fs::write(
-            temporary.path().join(COPY_TARGETS),
-            serde_json::to_vec(targets)?,
-        )?;
+    if let Some((targets, metadata_limit)) = targets {
+        let limit = receipt_limit(metadata_limit, targets.len())?;
+        let bytes = serde_json::to_vec(targets)?;
+        if bytes.len() as u64 > limit {
+            return Err("cached COPY targets exceed metadata budget".into());
+        }
+        validate_receipt(&bytes, metadata_limit, targets.len())?;
+        fs::write(temporary.path().join(COPY_TARGETS), bytes)?;
     }
     match fs::rename(temporary.path(), destination) {
         Ok(()) => {
@@ -145,14 +150,100 @@ pub(crate) fn publish_created(
 
 const COPY_TARGETS: &str = "weld-copy-targets.json";
 
+fn receipt_limit(metadata_limit: u64, instructions: usize) -> Result<u64> {
+    if instructions > crate::build_plan::MAX_INSTRUCTIONS {
+        return Err("cached COPY instruction count exceeds limit".into());
+    }
+    // Byte-array expansion and path delimiters, plus even empty instruction arrays.
+    metadata_limit
+        .checked_mul(6)
+        .and_then(|n| n.checked_add((instructions as u64).checked_mul(3)?))
+        .and_then(|n| n.checked_add(2))
+        .filter(|n| *n < usize::MAX as u64)
+        .ok_or_else(|| "cached COPY receipt limit overflow".into())
+}
+
+// Validate structure and counts without allocating the nested receipt vectors.
+fn validate_receipt(bytes: &[u8], metadata_limit: u64, instructions: usize) -> Result<()> {
+    use serde::de::{DeserializeSeed, Error as _, SeqAccess, Visitor};
+    struct Array<'a> {
+        depth: u8,
+        count: usize,
+        budget: &'a mut u64,
+    }
+    impl<'de> DeserializeSeed<'de> for Array<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<(), D::Error> {
+            d.deserialize_seq(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Array<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("bounded COPY receipt array")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
+            let mut count = 0usize;
+            loop {
+                let present = if self.depth == 2 {
+                    seq.next_element::<u8>()?.is_some()
+                } else {
+                    seq.next_element_seed(Array {
+                        depth: self.depth + 1,
+                        count: if self.depth == 0 {
+                            (*self.budget / 512).min(usize::MAX as u64) as usize
+                        } else {
+                            4096
+                        },
+                        budget: self.budget,
+                    })?
+                    .is_some()
+                };
+                if !present {
+                    break;
+                }
+                if count == self.count {
+                    return Err(A::Error::custom("cached COPY receipt count exceeds limit"));
+                }
+                count += 1;
+                let charge = match self.depth {
+                    1 => 512,
+                    2 => 1,
+                    _ => 0,
+                };
+                *self.budget = self.budget.checked_sub(charge).ok_or_else(|| {
+                    A::Error::custom("cached COPY targets exceed metadata budget")
+                })?;
+            }
+            if self.depth == 0 && count != self.count {
+                return Err(A::Error::custom("missing cached COPY targets"));
+            }
+            Ok(())
+        }
+    }
+    let mut budget = metadata_limit;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    Array {
+        depth: 0,
+        count: instructions,
+        budget: &mut budget,
+    }
+    .deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(())
+}
+
 pub(crate) fn copy_targets(
     path: &Path,
     lease: Option<&crate::store_lease::StoreLease>,
     metadata_limit: u64,
+    instructions: usize,
 ) -> Result<Vec<Vec<Vec<u8>>>> {
     crate::store_access::validate_path(path, lease)?;
-    // JSON byte arrays take at most four bytes per destination byte.
-    let limit = metadata_limit.saturating_mul(6).max(2);
+    let limit = receipt_limit(metadata_limit, instructions)?;
     if !fs::symlink_metadata(path.join(COPY_TARGETS))?.is_file() {
         return Err("cached COPY targets must be a regular file".into());
     }
@@ -161,9 +252,90 @@ pub(crate) fn copy_targets(
         return Err("cached COPY targets exceed metadata budget".into());
     }
     let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    file.take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err("cached COPY targets exceed metadata budget".into());
     }
+    validate_receipt(&bytes, metadata_limit, instructions)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_limits_are_checked_and_include_empty_instructions() {
+        assert_eq!(receipt_limit(0, 0).unwrap(), 2);
+        assert_eq!(receipt_limit(1024, 3000).unwrap(), 15146);
+        assert!(receipt_limit(0, crate::build_plan::MAX_INSTRUCTIONS).is_ok());
+        assert!(receipt_limit(0, crate::build_plan::MAX_INSTRUCTIONS + 1).is_err());
+        assert!(receipt_limit(0, usize::MAX).is_err());
+        assert!(receipt_limit(u64::MAX, 0).is_err());
+        assert!(receipt_limit(u64::MAX / 6, 1).is_err());
+    }
+
+    #[test]
+    fn receipts_reject_oversize_malformed_and_excess_counts() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join(COPY_TARGETS);
+        for bytes in [
+            b"[[],[]]".as_slice(),
+            b"[",
+            b"[[[256]]]",
+            b"[[]] null",
+            b"[[{}]]",
+        ] {
+            assert!(validate_receipt(bytes, 10000, 1).is_err(), "{bytes:?}");
+        }
+        for bytes in [
+            b"[[],[]]".as_slice(),
+            b"[",
+            b"[[[256]]]",
+            b"[[]] null",
+            b"[[[]]]",
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert!(copy_targets(t.path(), None, 0, 1).is_err(), "{bytes:?}");
+        }
+        fs::write(&path, b"[[]] ").unwrap(); // Exact serialized cap for one empty COPY.
+        assert_eq!(
+            copy_targets(t.path(), None, 0, 1).unwrap(),
+            vec![Vec::<Vec<u8>>::new()]
+        );
+        fs::write(&path, b"[[]]  ").unwrap();
+        assert!(copy_targets(t.path(), None, 0, 1).is_err());
+        fs::write(&path, b"[]").unwrap();
+        assert!(copy_targets(t.path(), None, 0, 1).is_err());
+        assert!(copy_targets(t.path(), None, u64::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn publication_and_reads_share_byte_path_and_count_limits() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let targets = vec![vec![vec![255; 4096]], vec![]];
+        let budget = 512 + 4096;
+        let entry = t.path().join("entry");
+        publish(&source, None, &entry, Some((&targets, budget)), &|| false).unwrap();
+        assert_eq!(copy_targets(&entry, None, budget, 2).unwrap(), targets);
+        assert!(copy_targets(&entry, None, budget - 1, 2).is_err());
+        let rejected = t.path().join("rejected");
+        assert!(
+            publish(
+                &source,
+                None,
+                &rejected,
+                Some((&targets, budget - 1)),
+                &|| false
+            )
+            .is_err()
+        );
+        assert!(!rejected.exists());
+        let too_long = serde_json::to_vec(&vec![vec![vec![0u8; 4097]]]).unwrap();
+        assert!(validate_receipt(&too_long, 10000, 1).is_err());
+        assert!(validate_receipt(b"[[[]]]", 511, 1).is_err());
+        assert!(validate_receipt(b"[[[]]]", 512, 1).is_ok());
+    }
 }

@@ -4,17 +4,17 @@
 //! shell syntax. `Word::value` only removes lexical quotes/backslash escapes;
 //! `Word::raw` retains their spelling for a future Docker-style evaluator.
 //! That evaluator must implement instruction-specific expansion (including
-//! quote/escape handling) or reject it, never feed COPY/ENV to a shell. Shell
-//! RUN alone delegates its payload to the stage shell. RUN/CMD/ENTRYPOINT JSON
+//! quote/escape handling) or reject it, never feed COPY/ENV to a shell.
+//! Shell RUN/CMD/ENTRYPOINT delegate their payload to the stage shell. JSON
 //! arrays are literal argv. COPY JSON strings still require Docker-style path
 //! expansion by the evaluator (never shell expansion). ARG scope/defaults and
 //! ENV inheritance also belong to the evaluator. Accept the entire `parse`
 //! result before doing any work. Base image reference grammar and availability
-//! are validated by the future image resolver; references here are literal.
+//! are validated by the evaluator before dependency selection or image lookup.
 //!
 //! Deliberate limits: default backslash escape only, no parser directives,
-//! heredocs, USER, external COPY images, dynamic FROM/--from, flags except
-//! COPY --from, legacy ENV, shell CMD/ENTRYPOINT, or other instructions.
+//! heredocs, USER, external COPY images, dynamic COPY --from, flags except
+//! COPY --from/--chmod/--chown, legacy ENV/LABEL, or other instructions.
 //! Empty continuation lines, repeated trailing escapes and non-ASCII syntax
 //! whitespace are rejected rather than guessed. This is not full Dockerfile.
 //! WORKDIR paths containing spaces must be quoted. Any `<<` payload is rejected,
@@ -67,7 +67,7 @@ pub struct Stage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Base {
-    /// Literal reference, validated further by the image resolver, never shell.
+    /// Reference or global ARG template; resolved by build::resolve_plan, never shell.
     Image(String),
     Stage(usize),
 }
@@ -110,6 +110,8 @@ pub enum InstructionKind {
     Copy {
         from: Option<usize>,
         paths: Arguments,
+        chown: Option<String>,
+        chmod: Option<String>,
     },
     Workdir(Word),
     /// Each word is a modern key=value assignment; order is preserved.
@@ -121,6 +123,10 @@ pub enum InstructionKind {
     },
     Cmd(Vec<String>),
     Entrypoint(Vec<String>),
+    ShellCmd(String),
+    ShellEntrypoint(String),
+    Shell(Vec<String>),
+    Label(Vec<Word>),
     Expose(Vec<Port>),
 }
 
@@ -327,12 +333,12 @@ fn parse_instruction(
             if reference.is_empty()
                 || !reference
                     .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"._/:@+-".contains(&c))
-                || !reference.as_bytes()[0].is_ascii_alphanumeric()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._/:@+-${}".contains(&c))
+                || (!reference.contains('$') && !reference.as_bytes()[0].is_ascii_alphanumeric())
             {
                 return error(
                     line,
-                    "FROM requires a literal nonempty image or backward stage name",
+                    "FROM requires an image reference or backward stage name with optional ARG expansion",
                 );
             }
             let alias = words.get(2).map(|w| w.value.clone());
@@ -365,27 +371,42 @@ fn parse_instruction(
             Run::Shell(payload.to_owned())
         }),
         "COPY" => {
-            let (from, paths) = if let Some(rest) = payload.strip_prefix("--from=") {
-                let split = rest.find([' ', '\t']).ok_or_else(|| ParseError {
+            let mut from = None;
+            let mut chown = None;
+            let mut chmod = None;
+            let mut paths = payload;
+            while paths.starts_with("--") {
+                let split = paths.find([' ', '\t']).ok_or_else(|| ParseError {
                     line,
                     message: "COPY requires paths".into(),
                 })?;
-                let reference = &rest[..split];
-                let index = stage_index(reference, plan).ok_or_else(|| ParseError {
-                    line,
-                    message: "COPY --from must reference an earlier stage".into(),
-                })?;
-                // Current stage already exists in the plan but cannot copy itself.
-                if index + 1 >= plan.stages.len() {
-                    return error(line, "COPY cannot reference its current stage");
+                let flag = &paths[..split];
+                if let Some(reference) = flag.strip_prefix("--from=") {
+                    if from.is_some() || reference.contains('$') {
+                        return error(line, "duplicate or dynamic COPY --from unsupported");
+                    }
+                    let index = stage_index(reference, plan).ok_or_else(|| ParseError {
+                        line,
+                        message: "COPY --from must reference an earlier stage".into(),
+                    })?;
+                    // Current stage already exists in the plan but cannot copy itself.
+                    if index + 1 >= plan.stages.len() {
+                        return error(line, "COPY cannot reference its current stage");
+                    }
+                    from = Some(index);
+                } else if let Some(value) = flag.strip_prefix("--chown=") {
+                    if value.is_empty() || chown.replace(value.to_owned()).is_some() {
+                        return error(line, "empty or duplicate COPY --chown");
+                    }
+                } else if let Some(value) = flag.strip_prefix("--chmod=") {
+                    if value.is_empty() || chmod.replace(value.to_owned()).is_some() {
+                        return error(line, "empty or duplicate COPY --chmod");
+                    }
+                } else {
+                    return error(line, "unsupported COPY flag");
                 }
                 charge(tokens, 1, line)?;
-                (Some(index), rest[split..].trim_start_matches([' ', '\t']))
-            } else {
-                (None, payload)
-            };
-            if paths.starts_with("--") {
-                return error(line, "unsupported or duplicate COPY flag");
+                paths = paths[split..].trim_start_matches([' ', '\t']);
             }
             let paths = if paths.starts_with('[') {
                 let values = argv(paths, line, tokens, false)?;
@@ -407,7 +428,12 @@ fn parse_instruction(
                 }
                 Arguments::Words(values)
             };
-            InstructionKind::Copy { from, paths }
+            InstructionKind::Copy {
+                from,
+                paths,
+                chown,
+                chmod,
+            }
         }
         "WORKDIR" => {
             let mut values = words(payload, line, tokens)?;
@@ -416,17 +442,21 @@ fn parse_instruction(
             }
             InstructionKind::Workdir(values.remove(0))
         }
-        "ENV" => {
+        "ENV" | "LABEL" => {
             let values = words(payload, line, tokens)?;
             for word in &values {
                 let Some((key, _)) = word.raw.split_once('=') else {
-                    return error(line, "ENV requires key=value assignments");
+                    return error(line, format!("{name} requires key=value assignments"));
                 };
-                if !identifier(key) {
-                    return error(line, "invalid ENV key");
+                if name == "ENV" && !identifier(key) || key.is_empty() {
+                    return error(line, format!("invalid {name} key"));
                 }
             }
-            InstructionKind::Env(values)
+            if name == "ENV" {
+                InstructionKind::Env(values)
+            } else {
+                InstructionKind::Label(values)
+            }
         }
         "ARG" => {
             let declarations = words(payload, line, tokens)?;
@@ -449,8 +479,15 @@ fn parse_instruction(
                 default,
             }
         }
-        "CMD" => InstructionKind::Cmd(argv(payload, line, tokens, false)?),
-        "ENTRYPOINT" => InstructionKind::Entrypoint(argv(payload, line, tokens, false)?),
+        "CMD" if payload.starts_with('[') => {
+            InstructionKind::Cmd(argv(payload, line, tokens, false)?)
+        }
+        "CMD" => InstructionKind::ShellCmd(payload.to_owned()),
+        "ENTRYPOINT" if payload.starts_with('[') => {
+            InstructionKind::Entrypoint(argv(payload, line, tokens, false)?)
+        }
+        "ENTRYPOINT" => InstructionKind::ShellEntrypoint(payload.to_owned()),
+        "SHELL" => InstructionKind::Shell(argv(payload, line, tokens, true)?),
         "EXPOSE" => {
             let values = words(payload, line, tokens)?;
             let mut ports = Vec::new();
@@ -663,7 +700,6 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
         for source in [
             "FROM",
             "FROM ''",
-            "FROM $BASE",
             "FROM --platform=linux/amd64 alpine",
             "# escape=`\nFROM alpine",
             "# syntax=docker/dockerfile:1\nFROM alpine",
@@ -675,7 +711,7 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
             "FROM alpine\nRUN [bad]",
             "FROM alpine\nRUN []",
             "FROM alpine\nRUN [1]",
-            "FROM alpine\nCOPY --chown=root a b",
+            "FROM alpine\nCOPY --chown=root --chown=root a b",
             "FROM alpine\nCOPY --from=next a b\nFROM alpine AS next",
             "FROM alpine AS current\nCOPY --from=current a b",
             "FROM alpine\nCOPY --from=0 a b",
@@ -685,7 +721,7 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
             "FROM alpine\nENV legacy value",
             "FROM alpine\nENV =bad",
             "FROM alpine\nARG bad name=x",
-            "FROM alpine\nCMD echo hi",
+            "FROM alpine\nSHELL echo hi",
             "FROM alpine\nEXPOSE 65536",
             "FROM alpine\nEXPOSE 80/sctp",
             "FROM alpine\nRUN hi\\",

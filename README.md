@@ -64,7 +64,11 @@ Resource inspection reads cgroup v1/v2 membership, visible ancestor limits and u
 
 ## Experimental image build
 
-Supported instructions: FROM, RUN (shell or JSON), local/stage COPY (plain or JSON), ARG, ENV, WORKDIR, JSON CMD/ENTRYPOINT and EXPOSE. Unsupported features fail before execution. Base images are pulled from registries automatically or supplied as local OCI layouts with --base; explicit USER and inherited nonempty User/OnBuild are rejected. WORKDIR traversal through symlinks is currently unsupported.
+Supported instructions: FROM, RUN (shell or JSON), local/stage COPY (plain or JSON), ARG, ENV, WORKDIR, SHELL, LABEL, shell or JSON CMD/ENTRYPOINT and EXPOSE. Base images are pulled from registries automatically or supplied as local OCI layouts with --base; explicit USER and inherited nonempty User/OnBuild are rejected. WORKDIR traversal through symlinks is currently unsupported.
+
+Global ARG values and `--build-arg` overrides can select FROM images before pulls and cache lookup. Redeclare a global ARG inside a stage to use it there. Expansion supports basic `$NAME` and `${NAME}` forms, not shell expressions. Dynamic COPY `--from` and dynamic forward/self stage references remain unsupported. Explicit `--base` bindings use the resolved image reference.
+
+SHELL accepts a JSON argument array and affects subsequent shell-form RUN, CMD and ENTRYPOINT. Exec-form commands remain literal argument arrays. LABEL supports variable expansion and inherited labels. RUN currently still needs `/bin/sh` in the image for Weld's dispatch wrapper, even when a custom shell is selected.
 
 ```sh
 # Given a local Alpine OCI layout in ./base-layout and context/Dockerfile:
@@ -77,7 +81,9 @@ rpweld build -f context/Dockerfile --base alpine=./base-layout \
 
 Output is an OCI layout with a flattened, uncompressed layer. Work/output paths must be new and disjoint from the context and bases. Failed builds retain partial directories; do not reuse them. Optional `--host-dns` supplies temporary resolver configuration and restores it before export. Run `rpweld build --help` for base reference selection and budget controls.
 
-Local COPY supports directory merges, `COPY .`, and WORKDIR-relative destinations with cumulative budgets. COPY flags other than `--from`, source glob patterns, and source symlink traversal are rejected. Supported timestamps and xattrs are preserved; unsupported attributes/ACLs fail preflight. Copying is nontransactional: a later filesystem failure can leave earlier instructions executed and a partial work directory.
+Local COPY supports directory merges, `COPY .`, WORKDIR-relative destinations, and bounded source wildcard selection (`*`, `?`, and bracket classes) with cumulative budgets. Wildcards do not provide recursive `**` traversal. Following the recorded Docker 29.7.2 behavior, unmatched or entirely ignored patterns are successful no-ops; missing or ignored literal sources still fail. Multiple matches from one wildcard overwrite a file destination in sorted match order. New selected directory destinations default to 0755; nested directories retain source modes. `--chmod` overrides these modes with octal values, including expanded ARG values; symbolic modes are unsupported. `--chown` accepts numeric IDs or names resolved from the destination image's `/etc/passwd` and `/etc/group`, never the host; `root` means zero. On a materialized filesystem, missing account files or names retain resolver defaults (unknown user: 0:0; unknown group: the user's default GID). Named lookup on untouched scratch still fails. Account lookup remains bounded and confined; malformed/nonregular databases and dangling account-file symlinks fail. Actual ownership changes require filesystem permission and fail explicitly when denied. Explicit source symlinks and source symlink traversal remain unsupported.
+
+Ownership and mode changes use actual filesystem operations: no Pod capability is assumed, and denied changes fail rather than exporting fake ownership. Local COPY defaults to root ownership; stage COPY preserves source IDs unless overridden. Existing selected destination directories retain their metadata; new and nested copied directories receive the requested overrides. Supported timestamps and xattrs are preserved; unsupported attributes/ACLs fail preflight. Copying is nontransactional: a later filesystem failure can leave earlier instructions executed and a partial work directory.
 
 Legacy builds with explicit output/work directories and no tag default to 256 MiB rootfs/layer sizes and 16 MiB metadata per subsystem. Managed builds default to 2 GiB rootfs/layer sizes and 64 MiB metadata. The default RUN timeout is 300 seconds. These limits do not enforce RUN memory or disk quotas. End-to-end builds have been checked in WSL and Ubuntu 24.04 builds on a Runpod CPU Pod; broader Dockerfile compatibility remains experimental.
 
@@ -187,8 +193,8 @@ CMD ["/opt/venv/bin/python", "/app/app.py"]
 Run `rpweld build -t yourname/app:latest --push .`, or select a named stage with
 `--target builder`. Only dependencies of the selected target are built. Stage
 names and zero-based indexes work for `COPY --from`; `FROM previous-stage`
-inherits image configuration and declared ARG values. Other COPY flags and
-external-image COPY sources remain unsupported. Use a separate FROM stage for
+inherits image configuration and declared ARG values. COPY also supports
+`--chmod` and `--chown`; external-image COPY sources remain unsupported. Use a separate FROM stage for
 external images. Stage COPY bypasses the context ignore policy.
 
 Local COPY uses the context-root `.dockerignore`, unless a file named exactly

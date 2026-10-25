@@ -1,0 +1,1037 @@
+{
+  "engine": "29.7.2",
+  "client": "29.7.2",
+  "cases": [
+    {
+      "name": "arg_default",
+      "dockerfile": "ARG BASE=scratch\nFROM ${BASE}\nLABEL ok=yes\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": {
+          "ok": "yes"
+        }
+      },
+      "entries": {}
+    },
+    {
+      "name": "arg_override",
+      "dockerfile": "ARG BASE=invalid@@\nFROM $BASE\nARG BASE\nLABEL base=$BASE\n",
+      "files": {},
+      "args": [
+        "BASE=scratch"
+      ],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": {
+          "base": "scratch"
+        }
+      },
+      "entries": {}
+    },
+    {
+      "name": "arg_scope",
+      "dockerfile": "ARG BASE=scratch\nARG VALUE=global\nFROM $BASE AS parent\nLABEL before=$VALUE\nARG VALUE\nLABEL after=$VALUE\nFROM parent\nLABEL inherited=$VALUE\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": {
+          "after": "global",
+          "before": "",
+          "inherited": "global"
+        }
+      },
+      "entries": {}
+    },
+    {
+      "name": "arg_stage_reset",
+      "dockerfile": "ARG BASE=scratch\nARG VALUE=global\nFROM $BASE AS first\nARG VALUE=stage\nFROM $BASE\nLABEL before=$VALUE\nARG VALUE\nLABEL after=$VALUE\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": {
+          "after": "global",
+          "before": ""
+        }
+      },
+      "entries": {}
+    },
+    {
+      "name": "arg_redeclare_override",
+      "dockerfile": "ARG BASE=scratch\nARG VALUE=global\nFROM $BASE\nARG VALUE=stage\nLABEL value=$VALUE\n",
+      "files": {},
+      "args": [
+        "VALUE=cli"
+      ],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": {
+          "value": "cli"
+        }
+      },
+      "entries": {}
+    },
+    {
+      "name": "arg_missing",
+      "dockerfile": "ARG BASE\nFROM $BASE\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": true,
+      "success": false,
+      "diagnostic": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 57B done\n#1 WARN: InvalidDefaultArgInFrom: Default value for ARG $BASE results in empty or invalid base image name (line 2)\n#1 DONE 0.0s\n\n \u001b[33m1 warning found (use docker --debug to expand):\n\u001b[0m - InvalidDefaultArgInFrom: Default value for ARG $BASE results in empty or invalid base image name (line 2)\nDockerfile:2\n--------------------\n   1 |     ARG BASE\n   2 | >>> FROM $BASE\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: base name ($BASE) should not be blank\n"
+    },
+    {
+      "name": "arg_invalid",
+      "dockerfile": "ARG BASE=bad@@\nFROM $BASE\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": true,
+      "success": false,
+      "diagnostic": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 63B done\n#1 WARN: InvalidDefaultArgInFrom: Default value for ARG $BASE results in empty or invalid base image name (line 2)\n#1 DONE 0.0s\n\n \u001b[33m1 warning found (use docker --debug to expand):\n\u001b[0m - InvalidDefaultArgInFrom: Default value for ARG $BASE results in empty or invalid base image name (line 2)\nDockerfile:2\n--------------------\n   1 |     ARG BASE=bad@@\n   2 | >>> FROM $BASE\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: failed to parse stage name \"bad@@\": invalid reference format\n"
+    },
+    {
+      "name": "arg_stage_not_global",
+      "dockerfile": "FROM scratch AS first\nARG BASE=scratch\nFROM $BASE\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": true,
+      "success": false,
+      "diagnostic": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 87B done\n#1 WARN: InvalidDefaultArgInFrom: Default value for ARG $BASE results in empty or invalid base image name (line 3)\n#1 WARN: UndefinedArgInFrom: FROM argument 'BASE' is not declared (line 3)\n#1 DONE 0.0s\n\n \u001b[33m2 warnings found (use docker --debug to expand):\n\u001b[0m - InvalidDefaultArgInFrom: Default value for ARG $BASE results in empty or invalid base image name (line 3)\n - UndefinedArgInFrom: FROM argument 'BASE' is not declared (line 3)\nDockerfile:3\n--------------------\n   1 |     FROM scratch AS first\n   2 |     ARG BASE=scratch\n   3 | >>> FROM $BASE\n   4 |     \n--------------------\nERROR: failed to build: failed to solve: base name ($BASE) should not be blank\n"
+    },
+    {
+      "name": "shell_default",
+      "dockerfile": "FROM scratch\nENV X=expanded\nENTRYPOINT echo $X\nCMD echo \"$X\"\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": [
+          "/bin/sh",
+          "-c",
+          "echo \"$X\""
+        ],
+        "Entrypoint": [
+          "/bin/sh",
+          "-c",
+          "echo $X"
+        ],
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {}
+    },
+    {
+      "name": "shell_exec",
+      "dockerfile": "FROM scratch\nENV X=expanded\nSHELL [\"/custom\", \"-c\"]\nENTRYPOINT [\"echo\", \"$X\"]\nCMD [\"echo\", \"$X\"]\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": [
+          "echo",
+          "$X"
+        ],
+        "Entrypoint": [
+          "echo",
+          "$X"
+        ],
+        "Shell": [
+          "/custom",
+          "-c"
+        ],
+        "Labels": null
+      },
+      "entries": {}
+    },
+    {
+      "name": "shell_later",
+      "dockerfile": "FROM scratch\nSHELL [\"/first\", \"-c\"]\nENTRYPOINT echo first\nCMD echo earlier\nSHELL [\"/later\", \"-x\", \"-c\"]\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": [
+          "/first",
+          "-c",
+          "echo earlier"
+        ],
+        "Entrypoint": [
+          "/first",
+          "-c",
+          "echo first"
+        ],
+        "Shell": [
+          "/later",
+          "-x",
+          "-c"
+        ],
+        "Labels": null
+      },
+      "entries": {}
+    },
+    {
+      "name": "shell_inherited",
+      "dockerfile": "FROM scratch AS parent\nSHELL [\"/custom\", \"-c\"]\nCMD echo parent\nFROM parent\nENTRYPOINT echo child\nCMD echo child-arg\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": [
+          "/custom",
+          "-c",
+          "echo child-arg"
+        ],
+        "Entrypoint": [
+          "/custom",
+          "-c",
+          "echo child"
+        ],
+        "Shell": [
+          "/custom",
+          "-c"
+        ],
+        "Labels": null
+      },
+      "entries": {}
+    },
+    {
+      "name": "entrypoint_resets_cmd",
+      "dockerfile": "FROM scratch AS parent\nCMD [\"old\"]\nFROM parent\nENTRYPOINT [\"new\"]\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": [
+          "new"
+        ],
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {}
+    },
+    {
+      "name": "wildcard_multiple",
+      "dockerfile": "FROM scratch\nCOPY ?.txt /out/\n",
+      "files": {
+        "a.txt": "A",
+        "b.txt": "B",
+        "nested/c.txt": "C",
+        "arr[0].txt": "bracket"
+      },
+      "args": [],
+      "paths": [
+        "out",
+        "out/a.txt",
+        "out/b.txt"
+      ],
+      "absent": [
+        "out/c.txt",
+        "out/nested"
+      ],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out": {
+          "mode": 493,
+          "uid": 0,
+          "gid": 0,
+          "dir": true
+        },
+        "out/a.txt": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "A"
+        },
+        "out/b.txt": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "B"
+        }
+      }
+    },
+    {
+      "name": "wildcard_brackets",
+      "dockerfile": "FROM scratch\nCOPY arr[[]0].txt /selected\n",
+      "files": {
+        "a.txt": "A",
+        "b.txt": "B",
+        "nested/c.txt": "C",
+        "arr[0].txt": "bracket"
+      },
+      "args": [],
+      "paths": [
+        "selected"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "selected": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "bracket"
+        }
+      }
+    },
+    {
+      "name": "wildcard_ignore",
+      "dockerfile": "FROM scratch\nCOPY ?.txt /out/\n",
+      "files": {
+        "a.txt": "A",
+        "b.txt": "B",
+        "nested/c.txt": "C",
+        "arr[0].txt": "bracket",
+        ".dockerignore": "b.txt\n"
+      },
+      "args": [],
+      "paths": [
+        "out/a.txt"
+      ],
+      "absent": [
+        "out/b.txt"
+      ],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out/a.txt": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "A"
+        }
+      }
+    },
+    {
+      "name": "wildcard_missing",
+      "dockerfile": "FROM scratch\nCOPY missing* /out/\n",
+      "files": {
+        "a.txt": "A",
+        "b.txt": "B",
+        "nested/c.txt": "C",
+        "arr[0].txt": "bracket"
+      },
+      "args": [],
+      "paths": [],
+      "absent": [
+        "out"
+      ],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {}
+    },
+    {
+      "name": "wildcard_all_ignored",
+      "dockerfile": "FROM scratch\nCOPY ?.txt /out/\n",
+      "files": {
+        "a.txt": "A",
+        "b.txt": "B",
+        "nested/c.txt": "C",
+        "arr[0].txt": "bracket",
+        ".dockerignore": "*.txt\n"
+      },
+      "args": [],
+      "paths": [],
+      "absent": [
+        "out"
+      ],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {}
+    },
+    {
+      "name": "wildcard_multiple_file_dest",
+      "dockerfile": "FROM scratch\nCOPY ?.txt /file\n",
+      "files": {
+        "a.txt": "A",
+        "b.txt": "B",
+        "nested/c.txt": "C",
+        "arr[0].txt": "bracket"
+      },
+      "args": [],
+      "paths": [
+        "file"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "file": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "B"
+        }
+      }
+    },
+    {
+      "name": "wildcard_one_file_dest",
+      "dockerfile": "FROM scratch\nCOPY a.* /renamed\n",
+      "files": {
+        "a.txt": "A",
+        "b.txt": "B",
+        "nested/c.txt": "C",
+        "arr[0].txt": "bracket"
+      },
+      "args": [],
+      "paths": [
+        "renamed"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "renamed": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "A"
+        }
+      }
+    },
+    {
+      "name": "numeric_chown",
+      "dockerfile": "FROM scratch\nCOPY --chown=12345:23456 payload /out\nCOPY --chown=34567 payload /single\n",
+      "files": {
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [
+        "out",
+        "single"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out": {
+          "mode": 420,
+          "uid": 12345,
+          "gid": 23456,
+          "dir": false,
+          "data": "data"
+        },
+        "single": {
+          "mode": 420,
+          "uid": 34567,
+          "gid": 34567,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "named_chown",
+      "dockerfile": "FROM scratch\nCOPY passwd /etc/passwd\nCOPY group /etc/group\nCOPY --chown=root:root payload /pair\nCOPY --chown=root payload /single\nCOPY --chown=12345:root payload /mixed\n",
+      "files": {
+        "passwd": "root:x:12345:23456::/:/bin/false\n",
+        "group": "root:x:34567:\n",
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [
+        "pair",
+        "single",
+        "mixed"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "pair": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "data"
+        },
+        "single": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "data"
+        },
+        "mixed": {
+          "mode": 420,
+          "uid": 12345,
+          "gid": 0,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "named_image_account",
+      "dockerfile": "FROM scratch\nCOPY passwd /etc/passwd\nCOPY group /etc/group\nCOPY --chown=nobody:qa payload /pair\nCOPY --chown=nobody payload /single\n",
+      "files": {
+        "passwd": "nobody:x:12345:23456::/:/bin/false\n",
+        "group": "qa:x:34567:\n",
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [
+        "pair",
+        "single"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "pair": {
+          "mode": 420,
+          "uid": 12345,
+          "gid": 34567,
+          "dir": false,
+          "data": "data"
+        },
+        "single": {
+          "mode": 420,
+          "uid": 12345,
+          "gid": 23456,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "chown_absent_group",
+      "dockerfile": "FROM scratch\nCOPY passwd /etc/passwd\nCOPY --chown=root:missing payload /out\n",
+      "files": {
+        "passwd": "root:x:12345:23456::/:/bin/false\n",
+        "group": "root:x:34567:\n",
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [
+        "out"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "chown_unknown_user",
+      "dockerfile": "FROM scratch\nCOPY passwd /etc/passwd\nCOPY --chown=missing payload /out\n",
+      "files": {
+        "passwd": "root:x:12345:23456::/:/bin/false\n",
+        "group": "root:x:34567:\n",
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [
+        "out"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "chown_unknown_group",
+      "dockerfile": "FROM scratch\nCOPY passwd /etc/passwd\nCOPY group /etc/group\nCOPY --chown=12345:missing payload /out\n",
+      "files": {
+        "passwd": "root:x:12345:23456::/:/bin/false\n",
+        "group": "root:x:34567:\n",
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [
+        "out"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out": {
+          "mode": 420,
+          "uid": 12345,
+          "gid": 12345,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "chmod_octal_arg",
+      "dockerfile": "FROM scratch\nARG MODE=0751\nCOPY --chmod=$MODE payload /out\nCOPY --chmod=0640 payload /other\n",
+      "files": {
+        "payload": "data"
+      },
+      "args": [
+        "MODE=0705"
+      ],
+      "paths": [
+        "out",
+        "other"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out": {
+          "mode": 453,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "data"
+        },
+        "other": {
+          "mode": 416,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "chmod_invalid",
+      "dockerfile": "FROM scratch\nCOPY --chmod=0899 payload /out\n",
+      "files": {
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": true,
+      "success": false,
+      "diagnostic": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 DONE 0.0s\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 81B done\n#1 DONE 0.0s\n\n#2 [internal] load .dockerignore\n#2 transferring context: 2B done\n#2 DONE 0.0s\nDockerfile:2\n--------------------\n   1 |     FROM scratch\n   2 | >>> COPY --chmod=0899 payload /out\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: invalid chmod parameter: '0899'. it should be octal string and between 0 and 07777\n"
+    },
+    {
+      "name": "multistage_owner_default",
+      "dockerfile": "FROM scratch AS first\nCOPY --chown=12345:23456 --chmod=0711 payload /owned\nFROM scratch\nCOPY --from=first /owned /copied\nCOPY --from=first --chown=34567:45678 /owned /override\n",
+      "files": {
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [
+        "copied",
+        "override"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "copied": {
+          "mode": 457,
+          "uid": 12345,
+          "gid": 23456,
+          "dir": false,
+          "data": "data"
+        },
+        "override": {
+          "mode": 457,
+          "uid": 34567,
+          "gid": 45678,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "directory_metadata",
+      "dockerfile": "FROM scratch\nCOPY tree /out/\nCOPY --chmod=0750 --chown=12345:23456 tree /changed/\n",
+      "files": {
+        "tree/nested/file": {
+          "data": "data",
+          "mode": 416
+        },
+        "tree": {
+          "dir": true,
+          "mode": 457
+        },
+        "tree/nested": {
+          "dir": true,
+          "mode": 448
+        }
+      },
+      "args": [],
+      "paths": [
+        "out",
+        "out/nested",
+        "out/nested/file",
+        "changed",
+        "changed/nested",
+        "changed/nested/file"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out": {
+          "mode": 493,
+          "uid": 0,
+          "gid": 0,
+          "dir": true
+        },
+        "out/nested": {
+          "mode": 448,
+          "uid": 0,
+          "gid": 0,
+          "dir": true
+        },
+        "out/nested/file": {
+          "mode": 416,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "data"
+        },
+        "changed": {
+          "mode": 488,
+          "uid": 12345,
+          "gid": 23456,
+          "dir": true
+        },
+        "changed/nested": {
+          "mode": 488,
+          "uid": 12345,
+          "gid": 23456,
+          "dir": true
+        },
+        "changed/nested/file": {
+          "mode": 488,
+          "uid": 12345,
+          "gid": 23456,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "label_expansion",
+      "dockerfile": "FROM scratch\nARG X=argument\nLABEL arg=\"$X\" saved=\"$X\" single='$X' literal=\"\\$X\" spaced=\"two words\" equals=\"a=b\"\nENV X=environment\nLABEL env=$X arg=\"replaced\" empty=$UNSET\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": {
+          "arg": "replaced",
+          "empty": "",
+          "env": "environment",
+          "equals": "a=b",
+          "literal": "$X",
+          "saved": "argument",
+          "single": "$X",
+          "spaced": "two words"
+        }
+      },
+      "entries": {}
+    },
+    {
+      "name": "wildcard_slash",
+      "dockerfile": "FROM scratch\nCOPY nested/*.txt /out/\n",
+      "files": {
+        "a.txt": "A",
+        "b.txt": "B",
+        "nested/c.txt": "C",
+        "nested/deeper/d.txt": "D",
+        "arr[0].txt": "bracket"
+      },
+      "args": [],
+      "paths": [
+        "out/c.txt"
+      ],
+      "absent": [
+        "out/a.txt",
+        "out/d.txt",
+        "out/deeper"
+      ],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out/c.txt": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "C"
+        }
+      }
+    },
+    {
+      "name": "chown_absent_passwd",
+      "dockerfile": "FROM scratch\nCOPY --chown=missing payload /out\n",
+      "files": {
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": true,
+      "success": false,
+      "diagnostic": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 84B done\n#1 DONE 0.0s\n\n#2 [internal] load .dockerignore\n#2 transferring context: 2B done\n#2 DONE 0.0s\n\n#3 [internal] load build context\n#3 transferring context: 38B done\n#3 DONE 0.0s\n\n#4 [1/1] COPY --chown=missing payload /out\n#4 ERROR: invalid user index: -1\n------\n > [1/1] COPY --chown=missing payload /out:\n------\nDockerfile:2\n--------------------\n   1 |     FROM scratch\n   2 | >>> COPY --chown=missing payload /out\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: invalid user index: -1\n"
+    },
+    {
+      "name": "chown_absent_passwd_materialized",
+      "dockerfile": "FROM scratch\nCOPY payload /seed\nCOPY --chown=missing payload /out\n",
+      "files": {
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [
+        "out"
+      ],
+      "absent": [],
+      "fail": false,
+      "success": true,
+      "diagnostic": "",
+      "config": {
+        "Cmd": null,
+        "Entrypoint": null,
+        "Shell": null,
+        "Labels": null
+      },
+      "entries": {
+        "out": {
+          "mode": 420,
+          "uid": 0,
+          "gid": 0,
+          "dir": false,
+          "data": "data"
+        }
+      }
+    },
+    {
+      "name": "chown_absent_group_scratch",
+      "dockerfile": "FROM scratch\nCOPY --chown=12345:missing payload /out\n",
+      "files": {
+        "payload": "data"
+      },
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": true,
+      "success": false,
+      "diagnostic": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 90B done\n#1 DONE 0.0s\n\n#2 [internal] load .dockerignore\n#2 transferring context: 2B done\n#2 DONE 0.0s\n\n#3 [internal] load build context\n#3 transferring context: 38B done\n#3 DONE 0.0s\n\n#4 [1/1] COPY --chown=12345:missing payload /out\n#4 ERROR: invalid user index: -1\n------\n > [1/1] COPY --chown=12345:missing payload /out:\n------\nDockerfile:2\n--------------------\n   1 |     FROM scratch\n   2 | >>> COPY --chown=12345:missing payload /out\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: invalid user index: -1\n"
+    },
+    {
+      "name": "literal_missing",
+      "dockerfile": "FROM scratch\nCOPY missing /out\n",
+      "files": {},
+      "args": [],
+      "paths": [],
+      "absent": [],
+      "fail": true,
+      "success": false,
+      "diagnostic": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 68B done\n#1 DONE 0.0s\n\n#2 [internal] load .dockerignore\n#2 transferring context: 2B done\n#2 DONE 0.0s\n\n#3 [internal] load build context\n#3 transferring context: 2B done\n#3 DONE 0.0s\n\n#4 [1/1] COPY missing /out\n#4 ERROR: failed to calculate checksum of ref 3zpnva8rg5iouv7ywu58zwf53::rw6wdm01wa4dkpg0gxbgkt8aw: \"/missing\": not found\n------\n > [1/1] COPY missing /out:\n------\nDockerfile:2\n--------------------\n   1 |     FROM scratch\n   2 | >>> COPY missing /out\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: failed to compute cache key: failed to calculate checksum of ref 3zpnva8rg5iouv7ywu58zwf53::rw6wdm01wa4dkpg0gxbgkt8aw: \"/missing\": not found\n"
+    }
+  ]
+}

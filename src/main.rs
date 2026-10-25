@@ -45,13 +45,16 @@ Managed builds/push hold a persistent store lease; cross-store inputs are reject
 Cancellation waits for all descendants; uninterruptible tasks can delay it indefinitely.
 Managed defaults: 2 GiB rootfs/layer, 64 MiB metadata; temporary host DNS enabled
 (--no-host-dns disables it). Explicit output/work without -t keep legacy defaults.
-Bindings match literal FROM names; --base-ref selects an OCI ref annotation.
+Bindings match ARG-expanded FROM names; --base-ref selects an OCI ref annotation.
 Without --base-ref the layout must have an unambiguous image selection.
 Local COPY supports plain/JSON paths, directory merges and multiple sources
 (destination must end in /), relative to WORKDIR. Basic $NAME/${NAME} expansion
 and Docker word quotes are supported; JSON embedded quotes/backslashes rejected.
-Sources must be context-relative: no globs, parent paths, explicit symlinks,
-unsupported COPY flags. .dockerignore filters local COPY sources. COPY --from accepts prior stages.
+Sources support bounded wildcards (*, ?, character classes); no parent paths or explicit symlinks.
+COPY --chmod accepts octal modes; --chown resolves image users/groups. Both support ARG expansion.
+.dockerignore filters local COPY sources. COPY --from accepts literal prior stages.
+Global ARG expands FROM; stage ARG redeclares globals. SHELL JSON overrides subsequent
+shell RUN/CMD/ENTRYPOINT. LABEL and shell/JSON CMD/ENTRYPOINT inherit from bases.
 --target selects a named stage and its dependencies. Managed builds cache completed
 stages locally; --no-cache bypasses stage reads/writes only. No container run command yet. COPY bytes/entries/metadata accumulate across steps
 under the rootfs/layer limits; rootfs is also checked after each step.
@@ -665,11 +668,10 @@ fn prepare_build(
     early_lease: Option<rpweld::store_lease::StoreLease>,
     out: &mut impl Write,
 ) -> Result<Option<rpweld::store_lease::StoreLease>, String> {
-    use rpweld::{
-        build_plan::{self, Base},
-        registry,
-    };
-    let plan = build_plan::parse(source).map_err(|e| e.to_string())?;
+    use rpweld::{build_plan::Base, registry};
+    let plan =
+        rpweld::build::resolve_plan(source, &cli.options.args, cli.options.limits.max_plan_bytes)
+            .map_err(|e| e.to_string())?;
     let selected = rpweld::build::selected_stages(&plan, cli.options.target.as_deref())
         .map_err(|e| e.to_string())?;
     let mut pulls = std::collections::BTreeSet::new();
