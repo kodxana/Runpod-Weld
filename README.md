@@ -288,12 +288,15 @@ creating a lock. Credentials and certificates are never modified.
 
 Plans list candidates and protected scopes with reasons. Validated ownership
 records authorize consideration of their listed components, never an entire run.
-Currently only empty owned components are candidates: populated directories need
-finer child provenance, and their contents, run records, and unlisted children
-stay protected. Any tag conservatively protects every build because the current
-API cannot prove the absence of target aliases without resolving untrusted paths.
-Recorded explicit/external paths conservatively protect all builds for the same reason.
-Malformed or incomplete inventories select nothing. Explicit and external paths
+Populated owned components are candidates after a bounded descriptor-confined scan
+on the store's statx mount ID; nested mounts fail closed. Symlinks count as entries,
+never target trees. Run records, unlisted run children and stage-container siblings
+stay protected. Canonical path and inode intersections scope valid tag and explicit
+path protection to components. Unresolved references and unrelated external directory
+targets remain broadly conservative: their unscanned descendants may contain aliases.
+External regular files with unrelated identities need not protect every build.
+Malformed or incomplete scans select nothing. Inventory skips of symlinks/special
+entries inside validated components are resolved by the component scan. Explicit and external paths
 are never owned. `image rm` selects only the validated tag record; its target stays
 unchanged, including after a retag. Cache generations, temporary entries, and
 structurally complete layouts lack ownership proof and stay protected. Thus cache
@@ -305,9 +308,9 @@ Inventory logical bytes include repeated hardlinks; unique logical and allocated
 bytes deduplicate inodes. They are observations, not reclamation estimates. The
 separate estimate covers selected items only, with a zero lower bound (open files
 and reflinks may retain storage). A tag record's allocation is an upper bound;
-empty directory metadata has an unknown upper bound. No cache/build totals are
-summed into reclaimable space. `shared_inode_count` counts selected shared inodes,
-currently zero because selected tag records must be singly linked.
+component directory metadata has an unknown upper bound. No cache/build totals are
+summed into reclaimable space. `shared_inode_count` counts selected regular-file
+inodes with more than one hardlink, once each.
 
 A dry run is a point-in-time report, not authorization for deletion. Saved JSON
 cannot be applied. Any future deletion implementation must acquire a new exclusive
@@ -357,3 +360,14 @@ record publication failures fail closed and may leave unrecorded retained data.
 Inventory is a bounded best-effort observation, not a snapshot or proof that an
 image is valid. Same-user code that replaces store paths violates the cooperative
 lease protocol; identities are checked again when inventory reads the record.
+
+Cleanup planning performs reads only, but directory enumeration and metadata-record
+reads can update access times. It does not restore atime (that would itself mutate
+metadata). Selected regular-file logical bytes count each inode once; selected entry
+counts include component roots and symlinks. `reclaimable_file_allocated_bytes` counts
+file blocks once only when every observed link is selected. Unselected links contribute
+zero and receive a protected-sharing reason. This is not guaranteed physical reclaim:
+reflinks, open descriptors and directory blocks remain unknown, the total upper bound
+is unknown for component plans, and the lower bound stays zero. Entry/depth limits bound
+the additional component pass separately from inventory; record/metadata byte limits
+apply to inventory reads. Partial scans and cancellation clear every selection.

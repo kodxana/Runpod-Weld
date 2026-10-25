@@ -147,6 +147,11 @@ pub struct Inventory {
     pub status: Status,
     pub best_effort: bool,
     pub partial: bool,
+    /// False on any scan failure or interruption, independently of diagnostics.
+    /// Intentional symlink/special payload skips alone do not make this false.
+    pub scan_complete: bool,
+    /// True if any diagnostic was omitted by the bounded issue list.
+    pub issues_truncated: bool,
     pub tags: Vec<Tag>,
     pub base_refs: Vec<BaseRef>,
     pub generations: Vec<Entry>,
@@ -328,6 +333,9 @@ mod linux {
     impl Scan<'_> {
         fn issue(&mut self, path: &Path, code: &str) {
             self.out.partial = true;
+            if code != "symlink_or_special_file_skipped" {
+                self.out.scan_complete = false;
+            }
             self.diagnostic(path, code);
         }
         fn diagnostic(&mut self, path: &Path, code: &str) {
@@ -337,6 +345,8 @@ mod linux {
                     path: path.into(),
                     code: code.into(),
                 });
+            } else {
+                self.out.issues_truncated = true;
             }
         }
         fn stop(&mut self) -> bool {
@@ -845,6 +855,8 @@ mod linux {
                 status: Status::Present,
                 best_effort: true,
                 partial: false,
+                scan_complete: true,
+                issues_truncated: false,
                 tags: vec![],
                 base_refs: vec![],
                 generations: vec![],
@@ -988,6 +1000,60 @@ mod linux {
             }
         }
         Ok(scan.out)
+    }
+
+    #[test]
+    fn suppressed_failures_still_invalidate_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        for code in [
+            "cancelled",
+            "metadata_budget",
+            "entry_budget",
+            "metadata_failed",
+        ] {
+            let cancel = || code == "cancelled";
+            let mut scan = Scan {
+                out: inspect(&temp.path().join("missing"), Limits::default(), &|| false).unwrap(),
+                limits: Limits::default(),
+                cancel: &cancel,
+                entries: 0,
+                bytes: 0,
+                stopped: false,
+                seen: HashSet::new(),
+                cache_seen: HashSet::new(),
+                builds_seen: HashSet::new(),
+                refs_uncertain: false,
+            };
+            for _ in 0..1024 {
+                scan.issue(
+                    Path::new("build-test/work/link"),
+                    "symlink_or_special_file_skipped",
+                );
+            }
+            assert!(scan.out.scan_complete);
+            assert!(!scan.out.issues_truncated);
+            match code {
+                "cancelled" => assert!(scan.stop()),
+                "metadata_budget" => assert!(!scan.charge(usize::MAX, Path::new("cache-v1"))),
+                "entry_budget" => {
+                    scan.entries = scan.limits.max_entries;
+                    std::fs::write(temp.path().join("entry"), b"").unwrap();
+                    let dir = File::open(temp.path()).unwrap();
+                    assert!(scan.names(&dir, Path::new("cache-v1")).is_empty());
+                }
+                _ => scan.issue(Path::new("cache-v1/file"), code),
+            }
+            assert!(scan.out.partial);
+            assert!(!scan.out.scan_complete, "{code}");
+            assert!(scan.out.issues_truncated, "{code}");
+            assert_eq!(scan.out.issues.len(), 1024);
+            assert!(
+                scan.out
+                    .issues
+                    .iter()
+                    .all(|i| i.code == "symlink_or_special_file_skipped")
+            );
+        }
     }
 }
 
