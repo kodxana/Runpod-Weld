@@ -84,6 +84,10 @@ pub struct ManagedCache<'a> {
     root: PathBuf,
     lease: &'a StoreLease,
     owner: Namespace,
+    #[cfg(test)]
+    scan_limit: usize,
+    #[cfg(test)]
+    before_objects_sync: Option<fn(&Path) -> io::Result<()>>,
 }
 
 impl<'a> ManagedCache<'a> {
@@ -146,6 +150,10 @@ impl<'a> ManagedCache<'a> {
             root,
             lease,
             owner,
+            #[cfg(test)]
+            scan_limit: MAX_SCAN_ENTRIES,
+            #[cfg(test)]
+            before_objects_sync: None,
         };
         cache.validate()?;
         // Also make a concurrent winner durable before returning success.
@@ -202,7 +210,7 @@ impl<'a> ManagedCache<'a> {
         check(cancelled)?;
         self.validate()?;
         let _lock = self.lock(cancelled)?;
-        self.audit_links(cancelled)?;
+        let remaining = self.audit_links(cancelled)?;
         store_access::validate_path(source, Some(self.lease))?;
         let receipt = build_cache::receipt_bytes(targets, receipt_metadata_limit)?;
         let metadata = image::load_layout(source, None, limits, cancelled)?;
@@ -219,6 +227,7 @@ impl<'a> ManagedCache<'a> {
             )?;
             return Ok(destination);
         }
+        self.reserve_publication(&metadata, limits, remaining, cancelled)?;
         let temp = tempfile::Builder::new()
             .prefix(".publish-")
             .tempdir_in(self.root.join("entries"))?;
@@ -383,12 +392,57 @@ impl<'a> ManagedCache<'a> {
             check(cancelled)?;
             rename_new(staging.path(), &object)?;
             let _ = staging.keep();
-            File::open(self.root.join("objects"))?.sync_all()?;
         }
         self.blob_owner(&object, digest.encoded())?;
+        // Reuse may follow a crash after rename but before its parent fsync.
+        // Establish the anchor name durably before publishing any new aliases.
+        self.sync_objects()?;
         // The durable anchor is published before any pool/entry alias. A crash
         // before this link leaves a reusable owned object, never an adopted inode.
         BlobStore::open(&object)?.link_verified(pool, descriptor, cap, cancelled)?;
+        Ok(())
+    }
+
+    fn sync_objects(&self) -> Result<()> {
+        let path = self.root.join("objects");
+        #[cfg(test)]
+        if let Some(before) = self.before_objects_sync {
+            before(&path)?;
+        }
+        File::open(path)?.sync_all()?;
+        Ok(())
+    }
+
+    fn reserve_publication(
+        &self,
+        metadata: &image::ImageMetadata,
+        limits: image::Limits,
+        mut remaining: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<()> {
+        let capacity = || "cache publication would exceed alias scan capacity";
+        // The publication lock keeps this reservation valid through final audit.
+        // .publish -> entry and .ingest -> object renames consume the same slots;
+        // abandoned staging from earlier crashes is already charged by the audit.
+        remaining = remaining.checked_sub(1).ok_or_else(capacity)?;
+        let mut unique = BTreeSet::new();
+        for (descriptor, _) in descriptors(metadata, limits) {
+            check(cancelled)?;
+            let digest = descriptor.digest.parse::<crate::oci::Sha256Digest>()?;
+            if !unique.insert(digest.encoded().to_owned()) {
+                continue;
+            }
+            let object_missing = !exists(&self.root.join("objects").join(digest.encoded()))?;
+            let pool_missing = !exists(
+                &self
+                    .root
+                    .join("content/blobs/sha256")
+                    .join(digest.encoded()),
+            )?;
+            remaining = remaining
+                .checked_sub(1 + usize::from(object_missing) + usize::from(pool_missing))
+                .ok_or_else(capacity)?;
+        }
         Ok(())
     }
 
@@ -417,8 +471,11 @@ impl<'a> ManagedCache<'a> {
     // else (including an external hardlink added after publication) fails closed.
     // shortcut: bounded full scan under one lock; replace with a durable link
     // ledger only if measured cache sizes make this scan a bottleneck.
-    fn audit_links(&self, cancelled: &impl Fn() -> bool) -> Result<()> {
+    fn audit_links(&self, cancelled: &impl Fn() -> bool) -> Result<usize> {
+        #[cfg(not(test))]
         let mut budget = MAX_SCAN_ENTRIES;
+        #[cfg(test)]
+        let mut budget = self.scan_limit;
         let mut blobs = BTreeMap::new();
         let mut inodes = BTreeSet::new();
         for name in scan_names(&self.root.join("objects"), &mut budget, cancelled)? {
@@ -488,7 +545,8 @@ impl<'a> ManagedCache<'a> {
                 return Err("cache blob has unaccounted hardlink aliases".into());
             }
         }
-        check(cancelled)
+        check(cancelled)?;
+        Ok(budget)
     }
 
     fn verify_entry(
@@ -577,6 +635,7 @@ impl<'a> ManagedCache<'a> {
             return Err("cache publication winner differs from source".into());
         }
         self.audit_links(cancelled)?;
+        self.sync_objects()?;
         sync_dirs(
             &self.root,
             &["content/blobs/sha256", "content/blobs", "content"],
@@ -786,4 +845,175 @@ fn rename_new(source: &Path, destination: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> image::Limits {
+        image::Limits {
+            max_metadata_bytes: 65536,
+            max_total_metadata_bytes: 262144,
+            max_descriptors: 32,
+            max_layer_bytes: 4096,
+            max_total_layer_bytes: 8192,
+        }
+    }
+
+    fn blob(store: &BlobStore, media: &str, bytes: &[u8]) -> Descriptor {
+        let d = Descriptor {
+            media_type: media.into(),
+            digest: format!("sha256:{}", hash(bytes)),
+            size: bytes.len() as i64,
+            annotations: Default::default(),
+            extensions: Default::default(),
+        };
+        store.ingest(bytes, &d, 65536, || false).unwrap();
+        d
+    }
+
+    fn source(path: &Path, version: u32) -> Descriptor {
+        fs::create_dir(path).unwrap();
+        let store = BlobStore::open(path).unwrap();
+        let layer = blob(
+            &store,
+            "application/vnd.oci.image.layer.v1.tar",
+            &[42; 4096],
+        );
+        let config = blob(
+            &store,
+            "application/vnd.oci.image.config.v1+json",
+            &serde_json::to_vec(&serde_json::json!({
+                "architecture":"amd64", "os":"linux", "version":version, "config":{},
+                "rootfs":{"type":"layers", "diff_ids":[layer.digest]}
+            }))
+            .unwrap(),
+        );
+        let manifest = blob(&store, "application/vnd.oci.image.manifest.v1+json", &serde_json::to_vec(&serde_json::json!({
+            "schemaVersion":2, "mediaType":"application/vnd.oci.image.manifest.v1+json", "config":config, "layers":[layer]
+        })).unwrap());
+        fs::write(
+            path.join("oci-layout"),
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            path.join("index.json"),
+            serde_json::to_vec(&serde_json::json!({"schemaVersion":2,"manifests":[manifest]}))
+                .unwrap(),
+        )
+        .unwrap();
+        layer
+    }
+
+    #[test]
+    fn capacity_rejection_does_not_poison_existing_lookups() {
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("source-a");
+        source(&a, 1);
+        let b = t.path().join("source-b");
+        source(&b, 2);
+        let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+        let mut cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+        cache.scan_limit = 12;
+        let key = "a".repeat(64);
+        cache
+            .publish(&a, &key, limits(), &[], 0, &|| false)
+            .unwrap();
+        assert!(
+            cache
+                .publish(&b, &"b".repeat(64), limits(), &[], 0, &|| false)
+                .is_err()
+        );
+        assert!(
+            cache
+                .lookup(&key, limits(), 0, 0, &|| false)
+                .unwrap()
+                .is_some()
+        );
+        for area in ["objects", "content/blobs/sha256"] {
+            assert_eq!(fs::read_dir(cache.root.join(area)).unwrap().count(), 3);
+        }
+        assert_eq!(fs::read_dir(cache.root.join("entries")).unwrap().count(), 1);
+        // Exactly full remains readable and idempotent. An all-shared new entry
+        // still needs its directory and three links, so it must be rejected.
+        cache.scan_limit = 10;
+        cache
+            .publish(&a, &key, limits(), &[], 0, &|| false)
+            .unwrap();
+        assert!(
+            cache
+                .publish(&a, &"c".repeat(64), limits(), &[], 0, &|| false)
+                .is_err()
+        );
+        assert!(
+            cache
+                .lookup(&key, limits(), 0, 0, &|| false)
+                .unwrap()
+                .is_some()
+        );
+        // Crash staging consumes capacity even before records or links exist.
+        cache.scan_limit = 12;
+        fs::create_dir(cache.root.join("objects/.ingest-abandoned")).unwrap();
+        fs::create_dir(cache.root.join("entries/.publish-abandoned")).unwrap();
+        assert!(
+            cache
+                .publish(&b, &"b".repeat(64), limits(), &[], 0, &|| false)
+                .is_err()
+        );
+        assert!(
+            cache
+                .lookup(&key, limits(), 0, 0, &|| false)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(fs::read_dir(cache.root.join("objects")).unwrap().count(), 4);
+        assert_eq!(
+            fs::read_dir(cache.root.join("content/blobs/sha256"))
+                .unwrap()
+                .count(),
+            3
+        );
+        assert_eq!(fs::read_dir(cache.root.join("entries")).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn recovered_object_requires_parent_sync_before_alias_publication() {
+        fn fail_sync(_: &Path) -> io::Result<()> {
+            Err(io::Error::other("injected objects fsync failure"))
+        }
+        let t = tempfile::tempdir().unwrap();
+        let input = t.path().join("source");
+        let layer = source(&input, 1);
+        let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+        let mut cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+        let source = BlobStore::open(&input).unwrap();
+        let pool = BlobStore::open(cache.root.join("content")).unwrap();
+        cache.before_objects_sync = Some(fail_sync);
+        // Inject exactly after the atomic object rename, before parent fsync.
+        assert!(
+            cache
+                .ensure_blob(&source, &pool, &layer, 4096, &|| false)
+                .is_err()
+        );
+        let digest = &layer.digest[7..];
+        assert!(cache.root.join("objects").join(digest).is_dir());
+        let pooled = cache.root.join("content/blobs/sha256").join(digest);
+        assert!(!pooled.exists());
+        // Reopen to discard all in-memory knowledge, as after a process crash.
+        let mut reopened = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+        reopened.before_objects_sync = Some(fail_sync);
+        assert!(
+            reopened
+                .ensure_blob(&source, &pool, &layer, 4096, &|| false)
+                .is_err()
+        );
+        assert!(!pooled.exists());
+        reopened.before_objects_sync = None;
+        reopened
+            .ensure_blob(&source, &pool, &layer, 4096, &|| false)
+            .unwrap();
+        assert!(pool.open_verified(&layer, 4096, || false).is_ok());
+    }
 }
