@@ -213,6 +213,26 @@ fn split_instruction(text: &str) -> (&str, &str) {
 }
 
 fn inspect(report: &mut Report, line: usize, name: &str, arguments: &str) {
+    if matches!(name, "STOPSIGNAL" | "HEALTHCHECK") {
+        match crate::build_plan::parse(&format!("FROM scratch\n{name} {arguments}")) {
+            Err(error) => report.diagnostic(
+                line,
+                "error",
+                "invalid_runtime_metadata",
+                &error.message,
+                Some(name),
+            ),
+            Ok(_) if name == "STOPSIGNAL" && arguments.contains('$') => report.diagnostic(
+                line,
+                "review",
+                "stopsignal_expansion",
+                "STOPSIGNAL requires build-time ARG/ENV expansion and signal validation.",
+                Some(name),
+            ),
+            Ok(_) => (),
+        }
+        return;
+    }
     if name == "USER" {
         match crate::build_plan::parse(&format!("FROM scratch\nUSER {arguments}")) {
             Err(error) => report.diagnostic(line, "error", "invalid_user", &error.message, Some(name)),

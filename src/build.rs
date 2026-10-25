@@ -517,6 +517,41 @@ fn preflight_checkpoints(
     }
     array(cfg, "Cmd")?;
     array(cfg, "Entrypoint")?;
+    if let Some(signal) = cfg.get("StopSignal").filter(|v| !v.is_null()) {
+        let signal = signal
+            .as_str()
+            .ok_or("invalid base StopSignal: expected a string")?;
+        if !signal.is_empty() {
+            build_plan::validate_stop_signal(signal)?;
+        }
+    }
+    if let Some(health) = cfg.get("Healthcheck").filter(|v| !v.is_null()) {
+        if !health.is_object() {
+            return Err("invalid base Healthcheck: expected an object".into());
+        }
+        let test = array(health, "Test")?;
+        if !test.is_empty() && !matches!(test[0].as_str(), "NONE" | "CMD" | "CMD-SHELL") {
+            return Err("unsupported base Healthcheck Test".into());
+        }
+        for field in [
+            "Interval",
+            "Timeout",
+            "StartPeriod",
+            "StartInterval",
+            "Retries",
+        ] {
+            if let Some(value) = health.get(field).filter(|v| !v.is_null()) {
+                let limit = if field == "Retries" {
+                    i32::MAX as i64
+                } else {
+                    i64::MAX
+                };
+                if !value.as_i64().is_some_and(|n| (0..=limit).contains(&n)) {
+                    return Err(format!("invalid base Healthcheck {field}").into());
+                }
+            }
+        }
+    }
     if let Some(ports) = cfg.get("ExposedPorts").filter(|v| !v.is_null()) {
         let ports = ports.as_object().ok_or("invalid base ExposedPorts")?;
         for (port, value) in ports {
@@ -680,6 +715,16 @@ fn preflight_checkpoints(
                 }
                 crate::user::validate_user_spec(&user)?;
                 cfg["User"] = json!(user);
+            }
+            I::StopSignal(word) => {
+                let signal = expand(&word.raw, &vars, cap)
+                    .map_err(|e| format!("line {}: STOPSIGNAL: {e}", i.line))?;
+                build_plan::validate_stop_signal(&signal)
+                    .map_err(|e| format!("line {}: {e}", i.line))?;
+                cfg["StopSignal"] = json!(signal);
+            }
+            I::Healthcheck(health) => {
+                cfg["Healthcheck"] = serde_json::to_value(health)?;
             }
             I::Cmd(argv) => {
                 cfg["Cmd"] = json!(argv);
@@ -1326,6 +1371,10 @@ fn build_stage(
                 default: Some(s), ..
             } => {
                 expand(s, &empty, options.limits.max_plan_bytes)?;
+            }
+            I::StopSignal(w) => {
+                expand(&w.raw, &empty, options.limits.max_plan_bytes)
+                    .map_err(|e| format!("line {}: STOPSIGNAL: {e}", instruction.line))?;
             }
             I::Workdir(w) | I::User(w) => {
                 expand(&w.raw, &empty, options.limits.max_plan_bytes)?;
@@ -2134,6 +2183,44 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn runtime_metadata_inheritance_validation_and_budget() {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        let inherited = json!({"config": {
+            "StopSignal":"SIGTERM", "User":"missing",
+            "Healthcheck":{"Test":["CMD-SHELL","missing"],"Interval":1234567,"Extension":"preserved"}
+        }});
+        let (cfg, steps) = preflight("FROM scratch", &o, inherited.clone()).unwrap();
+        assert_eq!(
+            cfg["config"]["Healthcheck"],
+            inherited["config"]["Healthcheck"]
+        );
+        assert_eq!(cfg["config"]["StopSignal"], "SIGTERM");
+        assert_eq!(steps.len(), 1); // Only the inherited working directory, no healthcheck work.
+        for cfg in [
+            json!({"StopSignal":12}),
+            json!({"StopSignal":"BOGUS"}),
+            json!({"Healthcheck":[]}),
+            json!({"Healthcheck":{"Test":[42]}}),
+            json!({"Healthcheck":{"Test":["UNKNOWN"]}}),
+            json!({"Healthcheck":{"Timeout":-1}}),
+            json!({"Healthcheck":{"Interval":9223372036854775808u64}}),
+            json!({"Healthcheck":{"Retries":2147483648i64}}),
+        ] {
+            assert!(preflight("FROM scratch", &o, json!({"config":cfg})).is_err());
+        }
+        o.limits.max_plan_bytes = 128;
+        assert!(
+            preflight(
+                &format!("FROM scratch\nHEALTHCHECK CMD {}", "x".repeat(200)),
+                &o,
+                json!({"config":{}})
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn shell_run_uses_selected_argv_and_exec_form_stays_literal() {
         let t = tempfile::tempdir().unwrap();

@@ -55,6 +55,8 @@ COPY --chmod accepts octal modes; --chown resolves image users/groups. Both supp
 .dockerignore filters local COPY sources. COPY --from accepts literal prior stages or images.
 Global ARG expands FROM; stage ARG redeclares globals. SHELL JSON overrides subsequent
 shell RUN/CMD/ENTRYPOINT. LABEL and shell/JSON CMD/ENTRYPOINT inherit from bases.
+STOPSIGNAL expands ARG/ENV; HEALTHCHECK CMD (shell/JSON) and NONE set image metadata.
+Healthchecks are never executed during build; runtime monitoring is not implemented.
 USER accepts user/uid with optional group/gid and basic ARG/ENV expansion.
 Names remain in image config; RUN resolves accounts in the current image and uses
 real kernel credentials. WORKDIR gives only newly created directories that owner.

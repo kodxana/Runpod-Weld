@@ -1,0 +1,171 @@
+{
+  "engine": "29.7.2",
+  "cases": [
+    {
+      "name": "scratch",
+      "dockerfile": "FROM scratch\nSTOPSIGNAL sigusr1\nHEALTHCHECK --interval=1h2m3.004s --timeout=1.5ms --start-period=5s --start-interval=2s --retries=3 CMD echo $X || exit 1\n",
+      "success": true,
+      "config": {
+        "StopSignal": "sigusr1",
+        "Healthcheck": {
+          "Test": [
+            "CMD-SHELL",
+            "echo $X || exit 1"
+          ],
+          "Interval": 3723004000000,
+          "Timeout": 1500000,
+          "StartPeriod": 5000000000,
+          "StartInterval": 2000000000,
+          "Retries": 3
+        }
+      }
+    },
+    {
+      "name": "inherit",
+      "dockerfile": "FROM scratch AS base\nUSER missing\nSTOPSIGNAL SIGQUIT\nHEALTHCHECK --timeout=9s CMD [\"missing\", \"$X\"]\nFROM base\nLABEL child=yes\n",
+      "success": true,
+      "config": {
+        "StopSignal": "SIGQUIT",
+        "Healthcheck": {
+          "Test": [
+            "CMD",
+            "missing",
+            "$X"
+          ],
+          "Timeout": 9000000000
+        },
+        "User": "missing"
+      }
+    },
+    {
+      "name": "reset",
+      "dockerfile": "FROM scratch AS base\nSTOPSIGNAL SIGQUIT\nHEALTHCHECK --timeout=9s --retries=9 CMD old\nFROM base\nSTOPSIGNAL +15\nHEALTHCHECK CMD [\"new\", \"$X\"]\n",
+      "success": true,
+      "config": {
+        "StopSignal": "+15",
+        "Healthcheck": {
+          "Test": [
+            "CMD",
+            "new",
+            "$X"
+          ]
+        }
+      }
+    },
+    {
+      "name": "none",
+      "dockerfile": "FROM scratch AS base\nHEALTHCHECK --timeout=9s CMD old\nFROM base\nHEALTHCHECK NONE\n",
+      "success": true,
+      "config": {
+        "Healthcheck": {
+          "Test": [
+            "NONE"
+          ]
+        }
+      }
+    },
+    {
+      "name": "reenable",
+      "dockerfile": "FROM scratch\nHEALTHCHECK NONE\nHEALTHCHECK CMD new\n",
+      "success": true,
+      "config": {
+        "Healthcheck": {
+          "Test": [
+            "CMD-SHELL",
+            "new"
+          ]
+        }
+      }
+    },
+    {
+      "name": "shell",
+      "dockerfile": "FROM scratch\nSHELL [\"/custom\", \"-c\"]\nENV X=value\nHEALTHCHECK CMD echo \"$X\"\nSHELL [\"/later\", \"-c\"]\n",
+      "success": true,
+      "config": {
+        "Healthcheck": {
+          "Test": [
+            "CMD-SHELL",
+            "echo \"$X\""
+          ]
+        },
+        "Shell": [
+          "/later",
+          "-c"
+        ]
+      }
+    },
+    {
+      "name": "expansion",
+      "dockerfile": "FROM scratch\nARG S=SIGUSR1\nSTOPSIGNAL \"$S\"\nENV S=SIGUSR2\nSTOPSIGNAL ${S}\n",
+      "success": true,
+      "config": {
+        "StopSignal": "SIGUSR2"
+      }
+    },
+    {
+      "name": "zero",
+      "dockerfile": "FROM scratch\nHEALTHCHECK --interval=0 --timeout=0s --start-period= --start-interval=0 --retries=0 CMD true\n",
+      "success": true,
+      "config": {
+        "Healthcheck": {
+          "Test": [
+            "CMD-SHELL",
+            "true"
+          ]
+        }
+      }
+    },
+    {
+      "name": "max",
+      "dockerfile": "FROM scratch\nSTOPSIGNAL 9223372036854775807\nHEALTHCHECK --interval=9223372036854775807ns --retries=2147483647 CMD true\n",
+      "success": true,
+      "config": {
+        "StopSignal": "9223372036854775807",
+        "Healthcheck": {
+          "Test": [
+            "CMD-SHELL",
+            "true"
+          ],
+          "Interval": 9223372036854775807,
+          "Retries": 2147483647
+        }
+      }
+    },
+    {
+      "name": "bad_duration",
+      "dockerfile": "FROM scratch\nHEALTHCHECK --interval=9223372036854775808ns CMD true\n",
+      "success": false,
+      "error": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 104B done\n#1 DONE 0.0s\nDockerfile:2\n--------------------\n   1 |     FROM scratch\n   2 | >>> HEALTHCHECK --interval=9223372036854775808ns CMD true\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: dockerfile parse error on line 2: time: invalid duration \"9223372036854775808ns\"\n"
+    },
+    {
+      "name": "bad_retries",
+      "dockerfile": "FROM scratch\nHEALTHCHECK --retries=2147483648 CMD true\n",
+      "success": false,
+      "error": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 92B done\n#1 DONE 0.0s\nDockerfile:2\n--------------------\n   1 |     FROM scratch\n   2 | >>> HEALTHCHECK --retries=2147483648 CMD true\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: dockerfile parse error on line 2: strconv.ParseInt: parsing \"2147483648\": value out of range\n"
+    },
+    {
+      "name": "duplicate_flag",
+      "dockerfile": "FROM scratch\nHEALTHCHECK --timeout=1s --timeout=2s CMD true\n",
+      "success": false,
+      "error": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 97B done\n#1 DONE 0.0s\nDockerfile:2\n--------------------\n   1 |     FROM scratch\n   2 | >>> HEALTHCHECK --timeout=1s --timeout=2s CMD true\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: dockerfile parse error on line 2: duplicate flag specified: --timeout\n"
+    },
+    {
+      "name": "bad_signal",
+      "dockerfile": "FROM scratch\nSTOPSIGNAL SIGBOGUS\n",
+      "success": false,
+      "error": "#0 building with \"default\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 70B done\n#1 DONE 0.0s\n\n#2 [internal] load .dockerignore\n#2 transferring context: 2B done\n#2 DONE 0.0s\nDockerfile:2\n--------------------\n   1 |     FROM scratch\n   2 | >>> STOPSIGNAL SIGBOGUS\n   3 |     \n--------------------\nERROR: failed to build: failed to solve: invalid signal: SIGBOGUS\n"
+    },
+    {
+      "name": "flags_none_divergence",
+      "dockerfile": "FROM scratch\nHEALTHCHECK --ignored=anything NONE\n",
+      "success": true,
+      "config": {
+        "Healthcheck": {
+          "Test": [
+            "NONE"
+          ]
+        }
+      }
+    }
+  ]
+}

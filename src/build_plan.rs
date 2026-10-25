@@ -14,7 +14,8 @@
 //!
 //! Deliberate limits: default backslash escape only, no parser directives,
 //! heredocs, dynamic COPY --from, flags except
-//! FROM --platform and COPY --from/--chmod/--chown, legacy ENV/LABEL, or other instructions.
+//! FROM --platform, COPY --from/--chmod/--chown and HEALTHCHECK options, legacy ENV/LABEL,
+//! or other instructions.
 //! Empty continuation lines, repeated trailing escapes and non-ASCII syntax
 //! whitespace are rejected rather than guessed. This is not full Dockerfile.
 //! WORKDIR paths containing spaces must be quoted. Any `<<` payload is rejected,
@@ -123,6 +124,8 @@ pub enum InstructionKind {
     },
     Workdir(Word),
     User(Word),
+    StopSignal(Word),
+    Healthcheck(Healthcheck),
     /// Each word is a modern key=value assignment; order is preserved.
     Env(Vec<Word>),
     /// Default is raw text, not shell-unquoted or expanded.
@@ -149,6 +152,169 @@ pub struct Port {
 pub enum Protocol {
     Tcp,
     Udp,
+}
+
+/// Docker image metadata; zero options are omitted and left to the runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Healthcheck {
+    pub test: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub interval: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub timeout: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub start_period: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub start_interval: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retries: i32,
+}
+
+fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+/// Match moby/sys/signal ParseSignal on Linux/amd64, preserving original spelling.
+pub(crate) fn validate_stop_signal(value: &str) -> std::result::Result<(), String> {
+    if value.parse::<i64>().is_ok_and(|n| n != 0) {
+        return Ok(());
+    }
+    let upper = value.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    if [
+        "ABRT", "ALRM", "BUS", "CHLD", "CLD", "CONT", "FPE", "HUP", "ILL", "INT", "IO", "IOT",
+        "KILL", "PIPE", "POLL", "PROF", "PWR", "QUIT", "SEGV", "STKFLT", "STOP", "SYS", "TERM",
+        "TRAP", "TSTP", "TTIN", "TTOU", "URG", "USR1", "USR2", "VTALRM", "WINCH", "XCPU", "XFSZ",
+        "RTMIN", "RTMAX",
+    ]
+    .contains(&name)
+        || (1..=15).any(|n| name == format!("RTMIN+{n}"))
+        || (1..=14).any(|n| name == format!("RTMAX-{n}"))
+    {
+        return Ok(());
+    }
+    Err("invalid STOPSIGNAL: expected a Linux signal name or nonzero signed 64-bit integer".into())
+}
+
+fn health_duration(value: &str) -> Option<i64> {
+    if value.is_empty() {
+        return Some(0);
+    }
+    let mut rest = value.strip_prefix('+').unwrap_or(value);
+    if rest.is_empty() {
+        return None;
+    }
+    if rest == "0" {
+        return Some(0);
+    }
+    let mut total = 0i64;
+    while !rest.is_empty() {
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        let number = &rest[..end];
+        rest = &rest[end..];
+        let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+        if whole.is_empty() && fraction.is_empty() || !fraction.bytes().all(|c| c.is_ascii_digit())
+        {
+            return None;
+        }
+        let (unit, scale) = [
+            ("ns", 1i64),
+            ("us", 1_000),
+            ("µs", 1_000),
+            ("μs", 1_000),
+            ("ms", 1_000_000),
+            ("s", 1_000_000_000),
+            ("m", 60_000_000_000),
+            ("h", 3_600_000_000_000),
+        ]
+        .into_iter()
+        .find(|(unit, _)| rest.starts_with(unit))?;
+        rest = &rest[unit.len()..];
+        let whole = if whole.is_empty() {
+            0
+        } else {
+            whole.parse::<i64>().ok()?
+        };
+        // Decimal arithmetic avoids floating point rounding at the i64 boundary.
+        let fraction = fraction
+            .bytes()
+            .rev()
+            .fold(0i64, |n, c| ((c - b'0') as i64 * scale + n) / 10);
+        total = total.checked_add(whole.checked_mul(scale)?.checked_add(fraction)?)?;
+    }
+    (total == 0 || total >= 1_000_000).then_some(total)
+}
+
+fn healthcheck(mut payload: &str, line: usize, tokens: &mut usize) -> Result<Healthcheck> {
+    let mut health = Healthcheck::default();
+    let mut seen = std::collections::BTreeSet::new();
+    while payload.starts_with("--") {
+        let end = payload.find([' ', '\t']).unwrap_or(payload.len());
+        let flag = &payload[..end];
+        let (name, value) = flag.split_once('=').ok_or_else(|| ParseError {
+            line,
+            message: "HEALTHCHECK flags require --name=value".into(),
+        })?;
+        if !seen.insert(name) {
+            return error(line, "duplicate HEALTHCHECK flag");
+        }
+        charge(tokens, 1, line)?;
+        if name == "--retries" {
+            health.retries = if value.is_empty() {
+                0
+            } else {
+                value
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|n| *n >= 0)
+                    .ok_or_else(|| ParseError {
+                        line,
+                        message: "HEALTHCHECK retries must be 0..2147483647".into(),
+                    })?
+            };
+        } else {
+            let dest = match name {
+                "--interval" => &mut health.interval,
+                "--timeout" => &mut health.timeout,
+                "--start-period" => &mut health.start_period,
+                "--start-interval" => &mut health.start_interval,
+                _ => return error(line, "unsupported HEALTHCHECK flag"),
+            };
+            *dest = health_duration(value).ok_or_else(|| ParseError {
+                line, message: format!("invalid HEALTHCHECK {name}: expected nonnegative duration, zero or >=1ms, within signed 64-bit nanoseconds"),
+            })?;
+        }
+        payload = payload[end..].trim_start_matches([' ', '\t']);
+    }
+    let end = payload.find([' ', '\t']).unwrap_or(payload.len());
+    let command = payload[end..].trim_start_matches([' ', '\t']);
+    match payload[..end].to_ascii_uppercase().as_str() {
+        "NONE" if command.is_empty() && seen.is_empty() => health.test = vec!["NONE".into()],
+        "NONE" => {
+            return error(
+                line,
+                "HEALTHCHECK NONE takes no arguments or flags in this subset",
+            );
+        }
+        "CMD" if !command.is_empty() => {
+            if command.starts_with('[') {
+                health.test = vec!["CMD".into()];
+                let values = argv(command, line, tokens, false)?;
+                if values.is_empty() {
+                    return error(line, "HEALTHCHECK CMD requires a command");
+                }
+                health.test.extend(values);
+            } else {
+                charge(tokens, 1, line)?;
+                health.test = vec!["CMD-SHELL".into(), command.into()];
+            }
+        }
+        _ => return error(line, "expected HEALTHCHECK CMD command or HEALTHCHECK NONE"),
+    }
+    Ok(health)
 }
 
 /// Parse and validate the complete source, returning no partial plan on error.
@@ -332,7 +498,7 @@ fn parse_instruction(
     {
         return error(line, "non-ASCII syntax whitespace is unsupported");
     }
-    if payload.starts_with("--") && !matches!(name.as_str(), "COPY" | "FROM") {
+    if payload.starts_with("--") && !matches!(name.as_str(), "COPY" | "FROM" | "HEALTHCHECK") {
         return error(line, "instruction flags are unsupported");
     }
     charge(tokens, 1, line)?;
@@ -469,13 +635,20 @@ fn parse_instruction(
                 chmod,
             }
         }
-        "WORKDIR" | "USER" => {
+        "HEALTHCHECK" => InstructionKind::Healthcheck(healthcheck(payload, line, tokens)?),
+        "WORKDIR" | "USER" | "STOPSIGNAL" => {
             let mut values = words(payload, line, tokens)?;
             if values.len() != 1 || values[0].value.is_empty() {
                 return error(line, format!("{name} requires one nonempty token"));
             }
             let word = values.remove(0);
-            if name == "USER" {
+            if name == "STOPSIGNAL" {
+                if !word.raw.contains('$') {
+                    validate_stop_signal(&word.value)
+                        .map_err(|message| ParseError { line, message })?;
+                }
+                InstructionKind::StopSignal(word)
+            } else if name == "USER" {
                 // Expansion is evaluated with the stage ARG/ENV scope later.
                 if !word.raw.contains('$') {
                     crate::user::validate_user_spec(&word.value)
