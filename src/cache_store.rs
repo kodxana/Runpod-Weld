@@ -13,13 +13,16 @@ use crate::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        },
     },
     path::{Path, PathBuf},
 };
@@ -28,6 +31,9 @@ type Result<T> = std::result::Result<T, Error>;
 const OWNER: &str = "weld-cache-owner.json";
 const ENTRY: &str = "weld-cache-entry.json";
 const RECORD_LIMIT: u64 = 16 * 1024;
+const LOCK: &str = "publication.lock";
+const BLOB_OWNER: &str = "weld-cache-blob.json";
+const MAX_SCAN_ENTRIES: usize = 100_000;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +45,19 @@ struct Namespace {
     content: Identity,
     blobs: Identity,
     sha256: Identity,
+    objects: Identity,
+    lock: Identity,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlobOwner {
+    version: u32,
+    namespace: Identity,
+    directory: Identity,
+    inode: Identity,
+    digest: String,
+    size: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,6 +76,9 @@ struct Entry {
 /// Explicit authority for `STORE/cache-v2`. Borrowing the lease prevents safe
 /// callers from dropping coordination while using this capability. Returned paths
 /// must also be consumed while the caller retains that lease.
+/// Cooperative operations serialize publication and alias accounting. As with
+/// BlobStore, an uncooperative same-user writer racing the final validation or
+/// modifying an inode after return remains outside the stable-store contract.
 pub struct ManagedCache<'a> {
     store: PathBuf,
     root: PathBuf,
@@ -87,11 +109,13 @@ impl<'a> ManagedCache<'a> {
                 "content",
                 "content/blobs",
                 "content/blobs/sha256",
+                "objects",
             ] {
                 fs::DirBuilder::new()
                     .mode(0o700)
                     .create(temp.path().join(name))?;
             }
+            write_new(&temp.path().join(LOCK), b"")?;
             let owner = namespace(&store, temp.path())?;
             write_new(&temp.path().join(OWNER), &serde_json::to_vec(&owner)?)?;
             sync_dirs(
@@ -101,6 +125,7 @@ impl<'a> ManagedCache<'a> {
                     "content/blobs",
                     "content",
                     "entries",
+                    "objects",
                     "",
                 ],
             )?;
@@ -142,6 +167,8 @@ impl<'a> ManagedCache<'a> {
         check_key(key)?;
         check(cancelled)?;
         self.validate()?;
+        let _lock = self.lock(cancelled)?;
+        self.audit_links(cancelled)?;
         let path = self.root.join("entries").join(key);
         if !exists(&path)? {
             return Ok(None);
@@ -154,6 +181,7 @@ impl<'a> ManagedCache<'a> {
             instructions,
             cancelled,
         )?;
+        self.audit_links(cancelled)?;
         Ok(Some(path))
     }
 
@@ -173,6 +201,8 @@ impl<'a> ManagedCache<'a> {
         check_key(key)?;
         check(cancelled)?;
         self.validate()?;
+        let _lock = self.lock(cancelled)?;
+        self.audit_links(cancelled)?;
         store_access::validate_path(source, Some(self.lease))?;
         let receipt = build_cache::receipt_bytes(targets, receipt_metadata_limit)?;
         let metadata = image::load_layout(source, None, limits, cancelled)?;
@@ -211,18 +241,7 @@ impl<'a> ManagedCache<'a> {
         let target = BlobStore::open(temp.path())?;
         for (descriptor, cap) in descriptors(&metadata, limits) {
             check(cancelled)?;
-            let digest = descriptor.digest.parse::<crate::oci::Sha256Digest>()?;
-            if exists(
-                &self
-                    .root
-                    .join("content/blobs/sha256")
-                    .join(digest.encoded()),
-            )? {
-                pool.open_verified(descriptor, cap, cancelled)?;
-            } else {
-                let bytes = source_store.open_verified(descriptor, cap, cancelled)?;
-                pool.ingest(bytes, descriptor, cap, cancelled)?;
-            }
+            self.ensure_blob(&source_store, &pool, descriptor, cap, cancelled)?;
             pool.link_verified(&target, descriptor, cap, cancelled)?;
         }
         // Selected-only layout: never copy unreferenced blobs or unrelated source files.
@@ -251,6 +270,7 @@ impl<'a> ManagedCache<'a> {
         )?;
         sync_dirs(temp.path(), &["blobs/sha256", "blobs", ""])?;
         self.validate()?;
+        self.audit_links(cancelled)?;
         check(cancelled)?;
         match rename_new(temp.path(), &destination) {
             Ok(()) => {
@@ -280,14 +300,195 @@ impl<'a> ManagedCache<'a> {
         let durable: Namespace = read_record(&self.root.join(OWNER))?;
         if durable != self.owner
             || durable != namespace(&self.store, &self.root)?
-            || durable.version != 1
+            || durable.version != 2
         {
             return Err("cache namespace identity mismatch".into());
         }
-        exact_names(&self.root, &[OWNER, "entries", "content"])?;
+        exact_names(&self.root, &[OWNER, LOCK, "entries", "content", "objects"])?;
         exact_names(&self.root.join("content"), &["blobs"])?;
         exact_names(&self.root.join("content/blobs"), &["sha256"])?;
         Ok(())
+    }
+
+    // Open a fresh file description per operation, including concurrent calls on
+    // the same capability. The store lease must always be acquired first.
+    fn lock(&self, cancelled: &impl Fn() -> bool) -> Result<File> {
+        let file = private_file(&self.root.join(LOCK))?;
+        if identity(&file.metadata()?) != self.owner.lock {
+            return Err("cache publication lock changed".into());
+        }
+        loop {
+            check(cancelled)?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::WouldBlock && e.kind() != io::ErrorKind::Interrupted {
+                return Err(e.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        self.validate()?;
+        check(cancelled)?;
+        Ok(file)
+    }
+
+    fn ensure_blob(
+        &self,
+        source: &BlobStore,
+        pool: &BlobStore,
+        descriptor: &Descriptor,
+        cap: u64,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<()> {
+        let digest = descriptor.digest.parse::<crate::oci::Sha256Digest>()?;
+        let object = self.root.join("objects").join(digest.encoded());
+        let pooled = self
+            .root
+            .join("content/blobs/sha256")
+            .join(digest.encoded());
+        if !exists(&object)? {
+            // An existing pool filename without provenance is never an ingest hit.
+            if exists(&pooled)? {
+                return Err("cache pool blob has no inode provenance".into());
+            }
+            let staging = tempfile::Builder::new()
+                .prefix(".ingest-")
+                .tempdir_in(self.root.join("objects"))?;
+            let fresh = BlobStore::open(staging.path())?;
+            fresh.ingest(
+                source.open_verified(descriptor, cap, cancelled)?,
+                descriptor,
+                cap,
+                cancelled,
+            )?;
+            let file = fresh.open_verified(descriptor, cap, cancelled)?;
+            let meta = file.metadata()?;
+            if meta.nlink() != 1 {
+                return Err("new cache blob has unexpected aliases".into());
+            }
+            let owner = BlobOwner {
+                version: 1,
+                namespace: self.owner.root,
+                directory: private_dir(staging.path())?,
+                inode: identity(&meta),
+                digest: descriptor.digest.clone(),
+                size: meta.len(),
+            };
+            write_new(
+                &staging.path().join(BLOB_OWNER),
+                &serde_json::to_vec(&owner)?,
+            )?;
+            sync_dirs(staging.path(), &["blobs/sha256", "blobs", ""])?;
+            check(cancelled)?;
+            rename_new(staging.path(), &object)?;
+            let _ = staging.keep();
+            File::open(self.root.join("objects"))?.sync_all()?;
+        }
+        self.blob_owner(&object, digest.encoded())?;
+        // The durable anchor is published before any pool/entry alias. A crash
+        // before this link leaves a reusable owned object, never an adopted inode.
+        BlobStore::open(&object)?.link_verified(pool, descriptor, cap, cancelled)?;
+        Ok(())
+    }
+
+    fn blob_owner(&self, object: &Path, digest: &str) -> Result<(Identity, fs::Metadata)> {
+        let directory = private_dir(object)?;
+        let owner: BlobOwner = read_record(&object.join(BLOB_OWNER))?;
+        if owner.version != 1
+            || owner.namespace != self.owner.root
+            || owner.directory != directory
+            || owner.digest != format!("sha256:{digest}")
+        {
+            return Err("cache blob provenance mismatch".into());
+        }
+        exact_names(object, &[BLOB_OWNER, "blobs"])?;
+        exact_names(&object.join("blobs"), &["sha256"])?;
+        exact_names(&object.join("blobs/sha256"), &[digest])?;
+        let meta = blob_metadata(&object.join("blobs/sha256").join(digest))?;
+        if identity(&meta) != owner.inode || meta.len() != owner.size {
+            return Err("cache blob inode provenance mismatch".into());
+        }
+        Ok((owner.inode, meta))
+    }
+
+    // Do not infer immutability from a digest or st_nlink alone. Count only links
+    // within durable blob objects and identity-validated cache entries. Anything
+    // else (including an external hardlink added after publication) fails closed.
+    // shortcut: bounded full scan under one lock; replace with a durable link
+    // ledger only if measured cache sizes make this scan a bottleneck.
+    fn audit_links(&self, cancelled: &impl Fn() -> bool) -> Result<()> {
+        let mut budget = MAX_SCAN_ENTRIES;
+        let mut blobs = BTreeMap::new();
+        let mut inodes = BTreeSet::new();
+        for name in scan_names(&self.root.join("objects"), &mut budget, cancelled)? {
+            // Interrupted ingests have never been linked into the pool. They are
+            // not counted, adopted or removed, even if a record was written.
+            if name.starts_with(".ingest-") {
+                continue;
+            }
+            check_key(&name)?;
+            let (id, meta) = self.blob_owner(&self.root.join("objects").join(&name), &name)?;
+            if !inodes.insert((id.device, id.inode)) {
+                return Err("cache blob objects alias each other".into());
+            }
+            blobs.insert(name, (id, meta.nlink(), 1u64));
+        }
+        for name in scan_names(
+            &self.root.join("content/blobs/sha256"),
+            &mut budget,
+            cancelled,
+        )? {
+            check_key(&name)?;
+            count_link(
+                &self.root.join("content/blobs/sha256").join(&name),
+                &name,
+                &mut blobs,
+                true,
+            )?;
+        }
+        for name in scan_names(&self.root.join("entries"), &mut budget, cancelled)? {
+            let pending = name.starts_with(".publish-");
+            if !pending {
+                check_key(&name)?;
+            }
+            let path = self.root.join("entries").join(&name);
+            let directory = private_dir(&path)?;
+            // A crash before the entry record cannot have published any links.
+            if pending && !exists(&path.join(ENTRY))? {
+                continue;
+            }
+            let owner: Entry = read_record(&path.join(ENTRY))?;
+            check_key(&owner.key)?;
+            if owner.version != 1
+                || owner.store != self.owner.store
+                || owner.namespace != self.owner.root
+                || owner.directory != directory
+                || (!pending && owner.key != name)
+            {
+                return Err("cache alias entry ownership mismatch".into());
+            }
+            let blobs_path = path.join("blobs");
+            if pending && !exists(&blobs_path)? {
+                continue;
+            }
+            private_dir(&blobs_path)?;
+            let sha_path = blobs_path.join("sha256");
+            if pending && !exists(&sha_path)? {
+                continue;
+            }
+            private_dir(&sha_path)?;
+            for digest in scan_names(&sha_path, &mut budget, cancelled)? {
+                check_key(&digest)?;
+                count_link(&sha_path.join(&digest), &digest, &mut blobs, false)?;
+            }
+        }
+        for (_, (_, actual, accounted)) in blobs {
+            if actual != accounted {
+                return Err("cache blob has unaccounted hardlink aliases".into());
+            }
+        }
+        check(cancelled)
     }
 
     fn verify_entry(
@@ -375,6 +576,7 @@ impl<'a> ManagedCache<'a> {
         if metadata.selected != *selected || actual != targets {
             return Err("cache publication winner differs from source".into());
         }
+        self.audit_links(cancelled)?;
         sync_dirs(
             &self.root,
             &["content/blobs/sha256", "content/blobs", "content"],
@@ -465,14 +667,74 @@ fn read_record<T: DeserializeOwned>(path: &Path) -> Result<T> {
 }
 fn namespace(store: &Path, root: &Path) -> Result<Namespace> {
     Ok(Namespace {
-        version: 1,
+        version: 2,
         store: private_dir(store)?,
         root: private_dir(root)?,
         entries: private_dir(&root.join("entries"))?,
         content: private_dir(&root.join("content"))?,
         blobs: private_dir(&root.join("content/blobs"))?,
         sha256: private_dir(&root.join("content/blobs/sha256"))?,
+        objects: private_dir(&root.join("objects"))?,
+        lock: identity(&private_file(&root.join(LOCK))?.metadata()?),
     })
+}
+
+fn blob_metadata(path: &Path) -> Result<fs::Metadata> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err("cache blob must be a private regular file".into());
+    }
+    Ok(meta)
+}
+
+fn count_link(
+    path: &Path,
+    digest: &str,
+    blobs: &mut BTreeMap<String, (Identity, u64, u64)>,
+    strict: bool,
+) -> Result<()> {
+    let meta = blob_metadata(path)?;
+    let Some((id, links, counted)) = blobs.get_mut(digest) else {
+        if strict {
+            return Err("cache pool blob has no inode provenance".into());
+        }
+        return Ok(());
+    };
+    if identity(&meta) != *id {
+        if strict {
+            return Err("cache pool inode differs from provenance".into());
+        }
+        // A detached corrupt entry is not an alias of this blob. Its own lookup
+        // fails content/identity validation without poisoning unrelated entries.
+        return Ok(());
+    }
+    if meta.nlink() != *links {
+        return Err("cache blob link count changed during audit".into());
+    }
+    *counted += 1;
+    Ok(())
+}
+
+fn scan_names(
+    path: &Path,
+    budget: &mut usize,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<String>> {
+    private_dir(path)?;
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path)? {
+        check(cancelled)?;
+        *budget = budget
+            .checked_sub(1)
+            .ok_or("cache alias scan exceeds entry budget")?;
+        names.push(
+            entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| "unexpected cache filename")?,
+        );
+    }
+    Ok(names)
 }
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()

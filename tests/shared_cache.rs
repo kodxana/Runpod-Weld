@@ -120,7 +120,7 @@ fn shares_only_verified_pool_inodes_and_never_adopts_mutable_source() {
     assert_eq!(inode(&pool), inode(&layer_path(&a, &layer)));
     assert_eq!(inode(&pool), inode(&layer_path(&b, &layer)));
     assert_ne!(inode(&pool), inode(&layer_path(&source, &layer)));
-    assert_eq!(fs::metadata(&pool).unwrap().nlink(), 3);
+    assert_eq!(fs::metadata(&pool).unwrap().nlink(), 4); // durable anchor, pool, two entries
     assert_eq!(
         fs::read_dir(t.path().join("cache-v2/content/blobs/sha256"))
             .unwrap()
@@ -139,6 +139,127 @@ fn shares_only_verified_pool_inodes_and_never_adopts_mutable_source() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn rejects_preseeded_pool_hardlink_without_touching_external_source() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let original = layer_path(&source, &layer);
+    let pooled = layer_path(&t.path().join("cache-v2/content"), &layer);
+    fs::hard_link(&original, &pooled).unwrap();
+    let before = inode(&original);
+    assert!(
+        cache
+            .publish(&source, &key(1), limits(), &[], 0, &|| false)
+            .is_err()
+    );
+    assert_eq!(inode(&original), before);
+    assert_eq!(inode(&pooled), before);
+    assert_eq!(fs::read(&original).unwrap(), vec![42; 4096]);
+    assert!(!t.path().join("cache-v2/entries").join(key(1)).exists());
+}
+
+#[test]
+fn rejects_external_alias_added_after_publication_without_touching_it() {
+    let t = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let entry = publish(&cache, &source, 1);
+    let alias = outside.path().join("mutable-alias");
+    fs::hard_link(layer_path(&entry, &layer), &alias).unwrap();
+    let before = inode(&alias);
+    assert!(cache.lookup(&key(1), limits(), 1024, 1, &|| false).is_err());
+    assert!(
+        cache
+            .publish(&source, &key(2), limits(), &[], 0, &|| false)
+            .is_err()
+    );
+    assert_eq!(inode(&alias), before);
+    assert_eq!(fs::read(&alias).unwrap(), vec![42; 4096]);
+}
+
+#[test]
+fn valid_single_link_blob_without_provenance_is_not_adopted() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let pooled = layer_path(&t.path().join("cache-v2/content"), &layer);
+    fs::copy(layer_path(&source, &layer), &pooled).unwrap();
+    assert_eq!(fs::metadata(&pooled).unwrap().nlink(), 1);
+    let before = inode(&pooled);
+    assert!(
+        cache
+            .publish(&source, &key(1), limits(), &[], 0, &|| false)
+            .is_err()
+    );
+    assert_eq!(inode(&pooled), before);
+    assert_eq!(fs::read(pooled).unwrap(), vec![42; 4096]);
+}
+
+#[test]
+fn durable_owned_object_can_restore_missing_pool_link_but_not_replace_one() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    publish(&cache, &source, 1);
+    let pooled = layer_path(&t.path().join("cache-v2/content"), &layer);
+    let original = inode(&pooled);
+    fs::remove_file(&pooled).unwrap();
+    publish(&cache, &source, 2);
+    assert_eq!(inode(&pooled), original);
+    fs::remove_file(&pooled).unwrap();
+    fs::hard_link(layer_path(&source, &layer), &pooled).unwrap();
+    let replacement = inode(&pooled);
+    assert_ne!(replacement, original);
+    assert!(
+        cache
+            .publish(&source, &key(3), limits(), &[], 0, &|| false)
+            .is_err()
+    );
+    assert_eq!(inode(&pooled), replacement);
+}
+
+#[test]
+fn lock_waiting_is_cancellable_and_legacy_namespace_is_not_upgraded() {
+    use std::os::fd::AsRawFd;
+    let t = tempfile::tempdir().unwrap();
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let lock = fs::File::open(t.path().join("cache-v2/publication.lock")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let checks = Cell::new(0);
+    assert!(
+        cache
+            .lookup(&key(1), limits(), 0, 0, &|| {
+                checks.set(checks.get() + 1);
+                checks.get() >= 4
+            })
+            .is_err()
+    );
+    drop(lock);
+    let owner = t.path().join("cache-v2/weld-cache-owner.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&owner).unwrap()).unwrap();
+    record["version"] = json!(1);
+    record.as_object_mut().unwrap().remove("objects");
+    record.as_object_mut().unwrap().remove("lock");
+    let bytes = serde_json::to_vec(&record).unwrap();
+    fs::write(&owner, &bytes).unwrap();
+    assert!(ManagedCache::open(t.path(), &lease, &|| false).is_err());
+    assert_eq!(fs::read(owner).unwrap(), bytes);
 }
 
 #[test]
