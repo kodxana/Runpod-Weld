@@ -28,3 +28,4 @@ pub mod store_access;
 pub mod store_inventory;
 pub mod store_lease;
 pub mod trace_worker;
+pub mod user;

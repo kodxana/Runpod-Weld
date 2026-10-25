@@ -1,4 +1,4 @@
-//! Experimental trusted-image runner, Linux x86_64, root only (no USER support).
+//! Experimental trusted-image runner, Linux x86_64, root supervisor with real USER credentials.
 //! Usage: trace_root ROOTFS STATE_DIR TIMEOUT_SECONDS SHELL_COMMAND
 //! Real chroot and real credentials; apt's sandbox is not disabled. The tracer
 //! restores PR_SET_DUMPABLE after credential changes/exec, changing introspection
@@ -25,6 +25,7 @@ pub struct WorkerOptions {
     pub command: OsString,
     pub working_directory: String,
     pub env: Vec<String>,
+    pub user: String,
 }
 
 impl WorkerOptions {
@@ -33,7 +34,7 @@ impl WorkerOptions {
     /// before --env entries when supplying the complete merged image environment.
     pub fn from_args(args: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
         let mut args = args.into_iter();
-        let usage = "usage: trace_root ROOTFS STATE_DIR TIMEOUT_SECONDS SHELL_COMMAND [--workdir DIR] [--clear-env] [--env NAME=value]...";
+        let usage = "usage: trace_root ROOTFS STATE_DIR TIMEOUT_SECONDS SHELL_COMMAND [--user SPEC] [--workdir DIR] [--clear-env] [--env NAME=value]...";
         let rootfs = args.next().ok_or(usage)?.into();
         let state_dir = args.next().ok_or(usage)?.into();
         let timeout_seconds = args
@@ -49,15 +50,29 @@ impl WorkerOptions {
             timeout_seconds,
             command,
             working_directory: "/".into(),
+            user: String::new(),
             env: vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-                "HOME=/root".into(),
                 "LC_ALL=C".into(),
             ],
         };
+        let mut legacy_home = true;
         while let Some(flag) = args.next() {
             match flag.to_str() {
-                Some("--clear-env") => options.env.clear(),
+                Some("--clear-env") => {
+                    options.env.clear();
+                    legacy_home = false;
+                }
+                Some("--user") => {
+                    options.user = args
+                        .next()
+                        .ok_or(usage)?
+                        .into_string()
+                        .map_err(|_| "USER must be UTF-8")?;
+                    if options.user.is_empty() {
+                        return Err("--user requires a nonempty specification".into());
+                    }
+                }
                 Some("--workdir") => {
                     options.working_directory = args
                         .next()
@@ -74,14 +89,21 @@ impl WorkerOptions {
                 _ => return Err(usage.into()),
             }
         }
+        if legacy_home
+            && options.user.is_empty()
+            && !options.env.iter().any(|e| e.starts_with("HOME="))
+        {
+            options.env.push("HOME=/root".into());
+        }
         options.validate()?;
         Ok(options)
     }
 
     /// Validate before any process-wide signal, subreaper or wait state changes.
-    /// Directory existence is checked by chdir in the chrooted child (exit 122).
+    /// Directory existence is checked by chdir in the chrooted child.
     /// Symlinks and `..` therefore use kernel chroot resolution, never host paths.
     pub fn validate(&self) -> Result<(), String> {
+        crate::user::validate_user_spec(&self.user)?;
         if !(1..=86400).contains(&self.timeout_seconds) {
             return Err("timeout must be 1..86400 seconds".into());
         }
@@ -582,7 +604,10 @@ mod linux {
             2 => {
                 if let Some(mut saved) = task.injection.take() {
                     if r.rax != 0 || r.rip != saved.rip {
-                        return Err("register-only dumpability injection failed".into());
+                        return Err(format!(
+                            "register-only dumpability injection failed (PR_SET_DUMPABLE policy; return {}); command cannot be safely traced",
+                            r.rax as i64
+                        ));
                     }
                     // Replay the displaced syscall instruction, with every original
                     // argument intact. Its next ENTRY is handled normally.
@@ -919,6 +944,90 @@ mod linux {
         }
         Ok(unsafe { File::from_raw_fd(fd) })
     }
+    // One atomic, bounded record. CLOEXEC closes this before any application runs.
+    fn setup_failure(fd: i32, operation: i32) -> ! {
+        let record = [operation, errno()];
+        unsafe {
+            write(fd, record.as_ptr().cast(), std::mem::size_of_val(&record));
+            _exit(1);
+        }
+    }
+    fn setup_identity(fd: i32, user: &crate::user::ResolvedUser, groups: &mut [gid_t]) {
+        unsafe {
+            let count = getgroups(groups.len() as i32, groups.as_mut_ptr());
+            if count < 0 {
+                setup_failure(fd, 5);
+            }
+            groups[..count as usize].sort_unstable();
+            if groups[..count as usize] != user.supplementary_gids
+                && setgroups(
+                    user.supplementary_gids.len(),
+                    user.supplementary_gids.as_ptr(),
+                ) != 0
+            {
+                setup_failure(fd, 6);
+            }
+            let (mut real, mut effective, mut saved) = (0, 0, 0);
+            if getresgid(&mut real, &mut effective, &mut saved) != 0 {
+                setup_failure(fd, 7);
+            }
+            if (real, effective, saved) != (user.gid, user.gid, user.gid)
+                && setresgid(user.gid, user.gid, user.gid) != 0
+            {
+                setup_failure(fd, 8);
+            }
+            if user.uid != 0
+                && (prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0
+                    || prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0)
+            {
+                setup_failure(fd, 9);
+            }
+            if getresuid(&mut real, &mut effective, &mut saved) != 0 {
+                setup_failure(fd, 10);
+            }
+            if (real, effective, saved) != (user.uid, user.uid, user.uid)
+                && setresuid(user.uid, user.uid, user.uid) != 0
+            {
+                setup_failure(fd, 11);
+            }
+            if user.uid != 0 {
+                // Clear inheritable capabilities too; UID transitions only clear P/E.
+                let mut header = [0x20080522u32, 0];
+                let mut caps = [0u32; 6];
+                if syscall(SYS_capset, header.as_ptr(), caps.as_ptr()) != 0
+                    || syscall(SYS_capget, header.as_mut_ptr(), caps.as_mut_ptr()) != 0
+                    || caps != [0; 6]
+                {
+                    setup_failure(fd, 9);
+                }
+            }
+            if getresuid(&mut real, &mut effective, &mut saved) != 0
+                || (real, effective, saved) != (user.uid, user.uid, user.uid)
+            {
+                setup_failure(fd, 12);
+            }
+            if getresgid(&mut real, &mut effective, &mut saved) != 0
+                || (real, effective, saved) != (user.gid, user.gid, user.gid)
+            {
+                setup_failure(fd, 12);
+            }
+            let count = getgroups(groups.len() as i32, groups.as_mut_ptr());
+            if count < 0 {
+                setup_failure(fd, 12);
+            }
+            groups[..count as usize].sort_unstable();
+            if groups[..count as usize] != user.supplementary_gids {
+                setup_failure(fd, 12);
+            }
+            // Query the filesystem IDs with the unrepresentable (reserved) ID.
+            if syscall(SYS_setfsuid, u32::MAX) as u32 != user.uid
+                || syscall(SYS_setfsgid, u32::MAX) as u32 != user.gid
+            {
+                *__errno_location() = EPERM;
+                setup_failure(fd, 12);
+            }
+        }
+    }
     pub(super) fn run(options: super::WorkerOptions) -> Result<i32> {
         options.validate()?;
         if unsafe { getuid() != 0 || geteuid() != 0 } {
@@ -941,6 +1050,7 @@ mod linux {
             return Err("refusing / or overlapping rootfs/state/cwd (state may equal cwd)".into());
         }
         let pinned = directory(&root)?;
+        let user = crate::user::resolve_pinned(&pinned, &options.user)?;
         let meta = pinned.metadata().map_err(|e| e.to_string())?;
         let before = fs::metadata(&root).map_err(|e| e.to_string())?;
         let outer = fs::metadata("/").map_err(|e| e.to_string())?;
@@ -962,13 +1072,34 @@ mod linux {
         ];
         let working_directory =
             CString::new(options.working_directory.as_bytes()).map_err(|e| e.to_string())?;
-        let environment: Vec<CString> = options
+        let mut entries: Vec<String> = options
             .environment()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if !entries
+            .iter()
+            .any(|entry| entry.starts_with("HOME=") && entry.len() > 5)
+        {
+            entries.retain(|entry| !entry.starts_with("HOME="));
+            entries.push(format!("HOME={}", user.home));
+        }
+        let environment: Vec<CString> = entries
             .into_iter()
             .map(|entry| CString::new(entry).expect("validated environment"))
             .collect();
         let mut env: Vec<_> = environment.iter().map(|entry| entry.as_ptr()).collect();
         env.push(ptr::null());
+        let mut group_buffer = vec![0; 65536];
+        let mut errors = [0; 2];
+        if unsafe { pipe2(errors.as_mut_ptr(), O_CLOEXEC | O_NONBLOCK) } != 0 {
+            return Err(format!(
+                "USER setup error pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let error_reader = unsafe { File::from_raw_fd(errors[0]) };
+        let error_writer = unsafe { File::from_raw_fd(errors[1]) };
         unsafe {
             let mut action: sigaction = zeroed();
             sigemptyset(&mut action.sa_mask);
@@ -1001,9 +1132,11 @@ mod linux {
                 return Err(std::io::Error::last_os_error().to_string());
             }
             if pid == 0 {
+                close(error_reader.as_raw_fd());
+                let error_fd = error_writer.as_raw_fd();
                 sigemptyset(&mut mask);
                 if sigprocmask(SIG_SETMASK, &mask, ptr::null_mut()) != 0 {
-                    _exit(119);
+                    setup_failure(error_fd, 1);
                 }
                 for signal in [SIGINT, SIGTERM, SIGHUP] {
                     libc::signal(signal, SIG_DFL);
@@ -1015,36 +1148,73 @@ mod linux {
                     ptr::null_mut::<c_void>(),
                 ) != 0
                 {
-                    _exit(120);
+                    setup_failure(error_fd, 2);
                 }
                 if raise(SIGSTOP) != 0 {
-                    _exit(121);
+                    setup_failure(error_fd, 2);
                 }
                 if fchdir(pinned.as_raw_fd()) != 0
                     || chroot(c".".as_ptr()) != 0
                     || chdir(c"/".as_ptr()) != 0
                     || chdir(working_directory.as_ptr()) != 0
                 {
-                    _exit(122);
+                    setup_failure(error_fd, 3);
                 }
                 close(pinned.as_raw_fd());
                 for fd in dirs {
                     if fcntl(fd, F_SETFD, 0) != 0 {
-                        _exit(123);
+                        setup_failure(error_fd, 4);
                     }
                 }
-                if setgroups(0, ptr::null()) != 0 || setgid(0) != 0 {
-                    _exit(125);
+                setup_identity(error_fd, &user, &mut group_buffer);
+                // Exercise the existing memory-read gate after the initial UID drop,
+                // before application exec; policy denial must not run the command.
+                if access(c"/".as_ptr(), F_OK) != 0 {
+                    setup_failure(error_fd, 14);
                 }
                 execve(argv[0], argv.as_ptr(), env.as_ptr());
-                _exit(126);
+                setup_failure(error_fd, 13);
             }
+            drop(error_writer);
             if std::env::var_os("RPWELD_BUILD_WORKER").is_none() {
                 eprintln!(
                     "Note: Weld runs trusted commands only; commands can access host devices and process information."
                 );
             }
-            supervise(pid, dirs, Duration::from_secs(seconds))
+            let result = supervise(pid, dirs, Duration::from_secs(seconds));
+            let mut record = [0i32; 2];
+            let count = read(
+                error_reader.as_raw_fd(),
+                record.as_mut_ptr().cast(),
+                std::mem::size_of_val(&record),
+            );
+            if count == std::mem::size_of_val(&record) as isize {
+                let operation = match record[0] {
+                    1 => "signal setup",
+                    2 => "PTRACE_TRACEME/initial stop (ptrace policy)",
+                    3 => "chroot/workdir (CAP_SYS_CHROOT and directory access)",
+                    4 => "descriptor setup",
+                    5 => "getgroups",
+                    6 => "setgroups (CAP_SETGID)",
+                    7 => "getresgid",
+                    8 => "setresgid (CAP_SETGID)",
+                    9 => "clear/verify nonroot capabilities",
+                    10 => "getresuid",
+                    11 => "setresuid (CAP_SETUID)",
+                    12 => "verify IDs/groups",
+                    13 => "exec /bin/sh",
+                    14 => "initial USER pathname/dumpability gate",
+                    _ => "unknown setup operation",
+                };
+                return Err(format!(
+                    "USER {:?} (uid={}, gid={}): {operation} failed: {}",
+                    options.user,
+                    user.uid,
+                    user.gid,
+                    std::io::Error::from_raw_os_error(record[1])
+                ));
+            }
+            result
         }
     }
     #[cfg(test)]
@@ -1396,6 +1566,21 @@ mod option_tests {
         .unwrap();
         assert_eq!(options.working_directory, "/app");
         assert_eq!(options.environment(), vec!["BASE=new=tail", "EMPTY="]);
+        let user = parse(&["root", "state", "30", "true", "--user", "app"]).unwrap();
+        assert_eq!(user.user, "app");
+        assert!(!user.env.iter().any(|e| e.starts_with("HOME=")));
+        let explicit = parse(&[
+            "root",
+            "state",
+            "30",
+            "true",
+            "--env",
+            "HOME=/chosen",
+            "--user",
+            "app",
+        ])
+        .unwrap();
+        assert!(explicit.env.contains(&"HOME=/chosen".into()));
     }
 
     #[test]
@@ -1406,6 +1591,9 @@ mod option_tests {
         for args in [
             vec!["--env"],
             vec!["--workdir"],
+            vec!["--user"],
+            vec!["--user", ""],
+            vec!["--user", "app:"],
             vec!["--unknown"],
             vec!["--env", "MISSING"],
             vec!["--env", "=value"],

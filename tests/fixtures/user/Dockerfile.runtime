@@ -1,0 +1,26 @@
+FROM alpine AS accounts
+COPY passwd /etc/passwd
+COPY group /etc/group
+RUN mkdir -p /qa /existing /root-only && chmod 1777 /qa && chmod 700 /root-only && chmod 755 /existing && touch /root-only/original && test "$(id -u)" = 0
+USER alice
+RUN test "$(id -u)" = 12001 && test "$(id -g)" = 12002 && test "$HOME" = /home/alice && id -G | tr ' ' '\n' | grep -qx 12005 && touch /qa/alice && ! touch /root-only/forbidden
+WORKDIR /created-by-alice
+RUN test "$(stat -c %u:%g .)" = 12001:12002 && touch owned
+WORKDIR /existing
+RUN test "$(stat -c %u:%g .)" = 0:0 && ! touch forbidden
+USER 12001
+RUN test "$(id -u)" = 12001 && test "$(id -g)" = 12002 && test "$HOME" = /home/alice && id -G | tr ' ' '\n' | grep -qx 12005
+USER alice:chosen
+RUN test "$(id -u)" = 12001 && test "$(id -g)" = 12006 && test "$(id -G)" = 12006 && touch /qa/explicit
+USER 23456
+RUN test "$(id -u)" = 23456 && test "$(id -g)" = 0 && test "$(id -G)" = 0 && test "$HOME" = / && touch /qa/numeric
+COPY --chown=23456 payload /qa/copied
+RUN test "$(stat -c %u:%g /qa/copied)" = 23456:23456
+ENV HOME=/explicit-home
+USER bob
+RUN test "$(id -u)" = 12003 && test "$(id -g)" = 12004 && test "$HOME" = /explicit-home && touch /qa/bob
+USER root
+RUN test "$(id -u)" = 0 && touch /root-only/after && test "$(stat -c %u:%g /qa/alice)" = 12001:12002 && test "$(stat -c %u:%g /qa/explicit)" = 12001:12006 && test "$(stat -c %u:%g /qa/numeric)" = 23456:0 && test ! -e /root-only/forbidden
+USER alice:chosen
+FROM accounts AS inherited
+RUN test "$(id -u)" = 12001 && test "$(id -g)" = 12006 && test "$(id -G)" = 12006 && test "$HOME" = /explicit-home && touch /qa/inherited

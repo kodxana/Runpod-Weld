@@ -57,7 +57,7 @@ pub fn scan(source: &str) -> Report {
         tool_version: env!("CARGO_PKG_VERSION"),
         profile: "initial-planned",
         builder_ready: false,
-        checks: "partial lexical checks only; build execution and full Dockerfile validation are not implemented",
+        checks: "partial lexical checks only; image account lookup and full Dockerfile validation are not performed",
         scan_complete: true,
         policy_status: "no_known_policy_issues",
         diagnostics: Vec::new(),
@@ -214,8 +214,12 @@ fn split_instruction(text: &str) -> (&str, &str) {
 
 fn inspect(report: &mut Report, line: usize, name: &str, arguments: &str) {
     if name == "USER" {
-        report.diagnostic(line, "error", "user_excluded",
-            "Every explicit USER (including root) is excluded from the initial planned profile. Preserve application-required identity and permissions; use a builder that supports them or review the application requirements before changing USER.", Some(name));
+        match crate::build_plan::parse(&format!("FROM scratch\nUSER {arguments}")) {
+            Err(error) => report.diagnostic(line, "error", "invalid_user", &error.message, Some(name)),
+            Ok(_) if arguments.contains('$') => report.diagnostic(line, "review", "user_expansion",
+                "USER supports basic ARG/ENV expansion; the evaluated identity requires build-time validation. Named accounts are resolved from the current image filesystem when needed.", Some(name)),
+            Ok(_) => (),
+        }
         return;
     }
     if ![
@@ -337,12 +341,13 @@ mod tests {
     }
 
     #[test]
-    fn explicit_users_are_excluded_with_physical_lines() {
+    fn explicit_users_are_supported_with_physical_lines() {
         let report = scan("# comment\r\nFROM alpine\r\n\r\nuser root\r\nUSER app\r\n");
-        assert!(has(&report, "user_excluded", 4));
-        assert!(has(&report, "user_excluded", 5));
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.instructions[1].line, 4);
+        assert_eq!(report.instructions[2].line, 5);
         assert!(!report.builder_ready);
-        assert_eq!(report.policy_status, "excluded_or_invalid");
+        assert_eq!(report.policy_status, "no_known_policy_issues");
     }
 
     #[test]
@@ -351,7 +356,8 @@ mod tests {
             "FROM alpine\nRUN echo USER \\\n  && echo 'USER root'\n# USER app\nUSER \\\n root\n",
         );
         assert_eq!(report.instructions.len(), 3);
-        assert!(has(&report, "user_excluded", 5));
+        assert_eq!(report.instructions[2].line, 5);
+        assert!(report.diagnostics.is_empty());
         assert_eq!(report.instructions[1].end_line, 3);
     }
 
@@ -361,8 +367,13 @@ mod tests {
             "# syntax=docker/dockerfile:1\n# escape=`\nFROM alpine\nRUN echo `\nUSER root\nUSER app\n",
         );
         assert!(has(&report, "external_frontend", 1));
-        assert!(!has(&report, "user_excluded", 5));
-        assert!(has(&report, "user_excluded", 6));
+        assert!(
+            !report
+                .instructions
+                .iter()
+                .any(|i| i.name == "USER" && i.line == 5)
+        );
+        assert_eq!(report.instructions.last().unwrap().line, 6);
         assert!(has(
             &scan("# escape=x\nFROM alpine"),
             "invalid_escape_directive",
@@ -373,11 +384,16 @@ mod tests {
     #[test]
     fn late_directives_are_comments_and_continued_comments_are_skipped() {
         let report = scan("\n# escape=`\nFROM alpine\nRUN echo `\nUSER root\n");
-        assert!(has(&report, "user_excluded", 5));
+        assert_eq!(report.instructions.last().unwrap().line, 5);
         let report = scan("FROM alpine\nRUN echo \\\n# USER fake\n USER text\nUSER app");
         assert_eq!(report.instructions.len(), 3);
-        assert!(!has(&report, "user_excluded", 4));
-        assert!(has(&report, "user_excluded", 5));
+        assert!(
+            !report
+                .instructions
+                .iter()
+                .any(|i| i.name == "USER" && i.line == 4)
+        );
+        assert_eq!(report.instructions.last().unwrap().line, 5);
     }
 
     #[test]
@@ -399,7 +415,7 @@ mod tests {
             "unterminated_continuation",
             2
         ));
-        assert!(has(&scan("FROM alpine\nUSER \\"), "user_excluded", 2));
+        assert!(has(&scan("FROM alpine\nUSER \\"), "invalid_user", 2));
     }
 
     #[test]
@@ -425,7 +441,7 @@ mod tests {
         ));
         assert!(has(
             &scan("FROM alpine\nONBUILD USER root"),
-            "user_excluded",
+            "onbuild_partial",
             2
         ));
     }
@@ -437,7 +453,37 @@ mod tests {
         assert_eq!(report.policy_status, "review_required");
         assert_eq!(report.instructions.len(), 2);
         assert!(has(&report, "heredoc_scan_stopped", 2));
-        assert!(!report.diagnostics.iter().any(|d| d.code == "user_excluded"));
+        assert!(!report.instructions.iter().any(|i| i.name == "USER"));
+    }
+
+    #[test]
+    fn user_validation_matches_parser_and_defers_expansion() {
+        for spec in ["app", "123", "app:team", "123:456", "app:456", "123:team"] {
+            assert!(
+                scan(&format!("FROM scratch\nUSER {spec}"))
+                    .diagnostics
+                    .is_empty()
+            );
+        }
+        for spec in [
+            "",
+            "app:",
+            ":team",
+            "app:team:extra",
+            "app team",
+            "2147483648",
+        ] {
+            assert!(has(
+                &scan(&format!("FROM scratch\nUSER {spec}")),
+                "invalid_user",
+                2
+            ));
+        }
+        assert!(has(
+            &scan("FROM scratch\nARG WHO=app\nUSER $WHO"),
+            "user_expansion",
+            3
+        ));
     }
 
     #[test]

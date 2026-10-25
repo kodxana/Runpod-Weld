@@ -55,6 +55,10 @@ COPY --chmod accepts octal modes; --chown resolves image users/groups. Both supp
 .dockerignore filters local COPY sources. COPY --from accepts literal prior stages.
 Global ARG expands FROM; stage ARG redeclares globals. SHELL JSON overrides subsequent
 shell RUN/CMD/ENTRYPOINT. LABEL and shell/JSON CMD/ENTRYPOINT inherit from bases.
+USER accepts user/uid with optional group/gid and basic ARG/ENV expansion.
+Names remain in image config; RUN resolves accounts in the current image and uses
+real kernel credentials. WORKDIR gives only newly created directories that owner.
+Inherited User is supported; missing names fail when needed, with no root fallback.
 --target selects a named stage and its dependencies. Managed builds cache completed
 instructions and stages locally; --no-cache bypasses their reads/writes only (not base caching). No container run command yet. COPY bytes/entries/metadata accumulate across steps
 under the rootfs/layer limits; rootfs is also checked after each step.
@@ -1355,12 +1359,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_reports_user_with_line_and_nonzero_result() {
+    fn scan_reports_invalid_user_with_line_and_nonzero_result() {
         let mut out = Vec::new();
         assert!(
             render_scan(
                 "Dockerfile",
-                "FROM ubuntu:24.04\nUSER 1234\n",
+                "FROM ubuntu:24.04\nUSER 1234:bad:extra\n",
                 true,
                 &mut out
             )

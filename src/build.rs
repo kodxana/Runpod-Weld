@@ -1,7 +1,7 @@
 //! Minimal, trusted/stable Linux amd64 builds from local OCI bindings or scratch.
 //! Supports dependency-selected stages: FROM, RUN, local/stage COPY, ARG, ENV, WORKDIR,
-//! SHELL, LABEL, shell/JSON CMD/ENTRYPOINT, EXPOSE.
-//! COPY supports bounded patterns and --chown/--chmod. USER/OnBuild and complex
+//! SHELL, USER, LABEL, shell/JSON CMD/ENTRYPOINT, EXPOSE.
+//! COPY supports bounded patterns and --chown/--chmod. OnBuild and complex
 //! expansion fail closed. RUN exec and custom shell argv
 //! form uses `/bin/sh -c 'exec ...'` with every argv element literally quoted.
 //! This is not a sandbox. Caller owns stable ancestors and trusted image/commands;
@@ -109,7 +109,11 @@ pub struct BuildResult {
 
 #[derive(Debug)]
 enum Step {
-    Directory(String),
+    Directory {
+        path: String,
+        // Inherited initial WorkingDir is not an explicit USER-owned mkdir.
+        user: Option<String>,
+    },
     Copy {
         from: Option<usize>,
         sources: Vec<String>,
@@ -121,6 +125,7 @@ enum Step {
         command: String,
         workdir: String,
         env: Vec<String>,
+        user: String,
     },
 }
 
@@ -434,11 +439,12 @@ fn preflight_checkpoints(
     if !cfg.is_object() {
         return Err("invalid base config object".into());
     }
-    match cfg.get("User") {
-        None | Some(Value::Null) => (),
-        Some(Value::String(s)) if s.is_empty() => (),
-        _ => return Err("base User unsupported".into()),
-    }
+    let mut user = match cfg.get("User") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        _ => return Err("invalid base User: expected a string".into()),
+    };
+    crate::user::validate_user_spec(&user)?;
     if !array(cfg, "OnBuild")?.is_empty() {
         return Err("base OnBuild unsupported".into());
     }
@@ -499,7 +505,10 @@ fn preflight_checkpoints(
     }
     let globals = global_args(plan, &options.args, cap)?;
     let mut args = inherited_args;
-    let mut steps = vec![Step::Directory(wd.clone())];
+    let mut steps = vec![Step::Directory {
+        path: wd.clone(),
+        user: None,
+    }];
     let mut charge = supplied_bytes + wd.len() + map_bytes(&globals, cap)?;
     let mut cmd_set = false;
     let mut checkpoint_bytes = 0usize;
@@ -599,7 +608,18 @@ fn preflight_checkpoints(
             }
             I::Workdir(word) => {
                 wd = path(&wd, &expand(&word.raw, &vars, cap)?)?;
-                steps.push(Step::Directory(wd.clone()));
+                steps.push(Step::Directory {
+                    path: wd.clone(),
+                    user: Some(user.clone()),
+                });
+            }
+            I::User(word) => {
+                user = expand(&word.raw, &vars, cap)?;
+                if user.is_empty() {
+                    return Err("USER must evaluate to a nonempty identity".into());
+                }
+                crate::user::validate_user_spec(&user)?;
+                cfg["User"] = json!(user);
             }
             I::Cmd(argv) => {
                 cfg["Cmd"] = json!(argv);
@@ -641,19 +661,24 @@ fn preflight_checkpoints(
                 let entries: Vec<_> = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 charge = charge
                     .checked_add(
-                        command.len() + wd.len() + entries.iter().map(String::len).sum::<usize>(),
+                        command.len()
+                            + wd.len()
+                            + user.len()
+                            + entries.iter().map(String::len).sum::<usize>(),
                     )
                     .ok_or("plan budget overflow")?;
                 steps.push(Step::Run {
                     command,
                     workdir: wd.clone(),
                     env: entries,
+                    user: user.clone(),
                 });
             }
         }
         charge = charge
             .checked_add(
                 wd.len()
+                    + user.len()
                     + env
                         .iter()
                         .chain(args.iter())
@@ -733,8 +758,9 @@ fn disjoint(paths: &[PathBuf]) -> Result<()> {
 }
 
 // Caller guarantees no concurrent mutation: lstat each ancestor before joining.
-fn directory(root: &Path, image_path: &str) -> Result<PathBuf> {
+fn directory(root: &Path, image_path: &str, user: Option<&str>) -> Result<PathBuf> {
     let mut target = root.to_path_buf();
+    let mut owner = None;
     for part in image_path.split('/').filter(|p| !p.is_empty()) {
         if matches!(part, "." | "..") {
             return Err("invalid directory component".into());
@@ -743,7 +769,25 @@ fn directory(root: &Path, image_path: &str) -> Result<PathBuf> {
         match fs::symlink_metadata(&target) {
             Ok(m) if m.is_dir() && !m.file_type().is_symlink() => (),
             Ok(_) => return Err("WORKDIR/DNS path traverses symlink or nondirectory".into()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&target)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Resolve only when this instruction actually needs to create a directory.
+                if owner.is_none()
+                    && let Some(user) = user
+                {
+                    owner = Some(crate::user::resolve_user(root, user)?);
+                }
+                fs::create_dir(&target)?;
+                if let Some(owner) = &owner {
+                    #[cfg(target_os = "linux")]
+                    std::os::unix::fs::chown(&target, Some(owner.uid), Some(owner.gid))?;
+                    #[cfg(not(target_os = "linux"))]
+                    return Err(format!(
+                        "WORKDIR ownership requires Linux: {}:{}",
+                        owner.uid, owner.gid
+                    )
+                    .into());
+                }
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -850,13 +894,24 @@ fn restore_checkpoint(
     cancelled: &impl Fn() -> bool,
 ) -> Result<Descriptor> {
     let replacement = work.join(format!("checkpoint-{retained}"));
-    fs::create_dir(&replacement)?;
+    create_image_root(&replacement)?;
     let manifest = verify_checkpoint(layout, config, Some(&replacement), spool, limits, cancelled)?;
     check(cancelled)?;
     let root = work.join("rootfs");
     fs::rename(&root, work.join(retained))?;
     fs::rename(&replacement, &root)?;
     Ok(manifest)
+}
+
+fn create_image_root(path: &Path) -> Result<()> {
+    fs::create_dir(path)?;
+    // This is image '/', not private host state. Replay may override this baseline.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
 }
 
 /// Select the target and only its transitive FROM/COPY dependencies.
@@ -1102,7 +1157,7 @@ fn build_stage(
             } => {
                 expand(s, &empty, options.limits.max_plan_bytes)?;
             }
-            I::Workdir(w) => {
+            I::Workdir(w) | I::User(w) => {
                 expand(&w.raw, &empty, options.limits.max_plan_bytes)?;
             }
             I::Env(words) => {
@@ -1284,7 +1339,8 @@ fn build_stage(
     let root = work.join("rootfs");
     let spool = work.join("spool");
     let state = work.join("state");
-    for p in [&root, &spool, &state] {
+    create_image_root(&root)?;
+    for p in [&spool, &state] {
         fs::create_dir(p)?;
     }
     if let (Some(m), Some(p)) = (&metadata, &base_path) {
@@ -1411,7 +1467,7 @@ fn build_stage(
             )?;
             materialized |= instruction_steps
                 .iter()
-                .any(|step| !matches!(step, Step::Directory(p) if p == "/"));
+                .any(|step| !matches!(step, Step::Directory { path, .. } if path == "/"));
             prior_identity = Some(manifest.digest.to_string());
             last_checkpoint = Some((entry.clone(), manifest, boundary.config.clone()));
             eprintln!(
@@ -1463,13 +1519,14 @@ fn build_stage(
                     copied.metadata_bytes += summary.metadata_bytes;
                     copy_targets.push(summary.targets);
                 }
-                Step::Directory(p) => {
-                    directory(&root, p)?;
+                Step::Directory { path, user } => {
+                    directory(&root, path, user.as_deref())?;
                 }
                 Step::Run {
                     command,
                     workdir,
                     env,
+                    user,
                 } => {
                     let run_state = state.join(index.to_string());
                     fs::create_dir(&run_state)?;
@@ -1479,7 +1536,7 @@ fn build_stage(
                         None
                     };
                     let result = worker(
-                        &root, &run_state, command, workdir, env, options, lease, &cancelled,
+                        &root, &run_state, command, workdir, env, user, options, lease, &cancelled,
                     );
                     // Restore even on failed/cancelled RUN; restoration errors are fatal.
                     if let Some(dns) = dns {
@@ -1489,7 +1546,7 @@ fn build_stage(
                 }
             }
             // Preflight inserts an initial root WORKDIR step even for untouched scratch.
-            materialized |= !matches!(step, Step::Directory(p) if p == "/");
+            materialized |= !matches!(step, Step::Directory { path, .. } if path == "/");
             root_budget(&root, options.limits, &cancelled)?;
         }
         if builder_identity.is_some() {
@@ -1699,6 +1756,7 @@ fn worker(
     command: &str,
     wd: &str,
     env: &[String],
+    user: &str,
     options: &BuildOptions,
     lease: Option<&crate::store_lease::StoreLease>,
     c: &impl Fn() -> bool,
@@ -1726,6 +1784,9 @@ fn worker(
         // The worker rejects a cwd above rootfs; state is a disjoint sibling.
         .current_dir(state)
         .stdin(Stdio::null());
+    if !user.is_empty() {
+        cmd.arg("--user").arg(user);
+    }
     for e in env {
         cmd.arg("--env").arg(e);
     }
@@ -2099,7 +2160,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let o = options(t.path());
         for config in [
-            json!({"User":"root"}),
+            json!({"User":42}),
             json!({"OnBuild":["RUN true"]}),
             json!({"Shell":[42]}),
             json!({"Cmd":[1]}),
@@ -2119,6 +2180,7 @@ mod tests {
                 command,
                 env,
                 workdir,
+                ..
             } => {
                 assert_eq!(command, "exec 'echo' '$LOCAL' 'it'\\''s'");
                 assert_eq!(workdir, "/home");
@@ -2137,8 +2199,42 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         symlink(&outside, root.join("link")).unwrap();
-        assert!(directory(&root, "/link/escaped").is_err());
+        assert!(directory(&root, "/link/escaped", Some("0:0")).is_err());
         assert!(!outside.join("escaped").exists());
+    }
+    #[test]
+    fn user_snapshots_follow_instruction_order_without_account_lookup() {
+        let t = tempfile::tempdir().unwrap();
+        let o = options(t.path());
+        let (cfg, steps) = preflight(
+            "FROM scratch\nARG WHO=first\nUSER $WHO\nWORKDIR /one\nRUN first\nENV WHO=second\nUSER ${WHO}:123\nSHELL [\"/custom\",\"-c\"]\nRUN second\nUSER absent-final\n",
+            &o,
+            json!({"config":{"User":"inherited","WorkingDir":"/inherited"}}),
+        ).unwrap();
+        assert_eq!(cfg["config"]["User"], "absent-final");
+        assert!(matches!(&steps[0], Step::Directory { path, user: None } if path == "/inherited"));
+        assert!(
+            matches!(&steps[1], Step::Directory { path, user: Some(user) } if path == "/one" && user == "first")
+        );
+        let runs: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run {
+                    user,
+                    workdir,
+                    env,
+                    command,
+                } => Some((user.as_str(), workdir.as_str(), env, command.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs[0].0, "first");
+        assert_eq!(runs[1].0, "second:123");
+        assert_eq!(runs[0].1, "/one");
+        assert!(runs[0].2.contains(&"WHO=first".into()));
+        assert!(runs[1].2.contains(&"WHO=second".into()));
+        assert_eq!(runs[0].3, "exec '/bin/sh' '-c' 'first'");
+        assert_eq!(runs[1].3, "exec '/custom' '-c' 'second'");
     }
     #[test]
     fn temporary_dns_restores_empty_file_and_rejects_links() {

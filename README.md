@@ -64,7 +64,11 @@ Resource inspection reads cgroup v1/v2 membership, visible ancestor limits and u
 
 ## Experimental image build
 
-Supported instructions: FROM, RUN (shell or JSON), local/stage COPY (plain or JSON), ARG, ENV, WORKDIR, SHELL, LABEL, shell or JSON CMD/ENTRYPOINT and EXPOSE. Base images are pulled from registries automatically or supplied as local OCI layouts with --base; explicit USER and inherited nonempty User/OnBuild are rejected. WORKDIR traversal through symlinks is currently unsupported.
+Supported instructions: FROM, RUN (shell or JSON), local/stage COPY (plain or JSON), ARG, ENV, USER, WORKDIR, SHELL, LABEL, shell or JSON CMD/ENTRYPOINT and EXPOSE. Base images are pulled from registries automatically or supplied as local OCI layouts with --base; inherited User is supported, while inherited nonempty OnBuild remains unsupported. WORKDIR traversal through symlinks is currently unsupported.
+
+USER accepts `user`, `uid`, `user:group`, `uid:gid`, `user:gid` and `uid:group`, with basic ARG/ENV expansion. Names use ASCII letters, digits, `_`, `.` and `-` (no leading `-`); decimal IDs are limited to 0..2147483647. Empty components, extra colons and whitespace are rejected. The evaluated string is preserved in exported `config.User`, including names. A final metadata-only USER need not exist in the image. Each RUN resolves its captured USER against the image's current account files, so an earlier RUN or COPY can create accounts. RUN applies actual kernel UID, GID and supplementary groups in a fresh worker; lookup or credential failures never fall back to root. Numeric UIDs use the passwd primary group when found, otherwise GID 0; an explicit group suppresses supplementary groups. Empty inherited User defaults to root. The worker preserves a nonempty explicit HOME, otherwise uses the resolved home or `/`, without adding it to image config.
+
+Explicit WORKDIR resolves the current USER when it must create directories, and assigns that UID/GID only to newly created components. Existing directories retain ownership and permissions. The inherited initial WorkingDir is handled separately and does not trigger USER lookup. Account lookup occurs at execution time, never during whole-stage preflight; cached steps include the evaluated USER and preceding filesystem identity.
 
 Global ARG values and `--build-arg` overrides can select FROM images before pulls and cache lookup. Redeclare a global ARG inside a stage to use it there. Expansion supports basic `$NAME` and `${NAME}` forms, not shell expressions. Dynamic COPY `--from` and dynamic forward/self stage references remain unsupported. Explicit `--base` bindings use the resolved image reference.
 
@@ -94,7 +98,7 @@ rpweld scan Dockerfile
 rpweld scan path/to/Dockerfile --json
 ```
 
-The initial planned profile excludes explicit `USER` instructions, including `USER root`. The scanner reports physical line numbers and detects features needing review, such as instruction flags, external frontends, remote ADD and multistage syntax. Possible heredocs stop scanning and mark the remainder uninspected. It does not rewrite Dockerfiles.
+The scanner accepts supported static `USER` syntax and reports invalid identities. USER with ARG/ENV expansion requires build-time validation; the scanner does not inspect image account files. It reports physical line numbers and detects features needing review, such as instruction flags, external frontends, remote ADD and multistage syntax. Possible heredocs stop scanning and mark the remainder uninspected. It does not rewrite Dockerfiles.
 
 Exit 0 means no known issues were found by these partial static checks. Exit 2 means errors, required review, incomplete scanning, or an input error. Neither outcome establishes build support: the builder is still under development, and base-image configuration and package-manager behavior are not inspected. Inputs must be regular UTF-8 files no larger than 1 MiB.
 

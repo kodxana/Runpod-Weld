@@ -13,7 +13,7 @@
 //! are validated by the evaluator before dependency selection or image lookup.
 //!
 //! Deliberate limits: default backslash escape only, no parser directives,
-//! heredocs, USER, external COPY images, dynamic COPY --from, flags except
+//! heredocs, external COPY images, dynamic COPY --from, flags except
 //! COPY --from/--chmod/--chown, legacy ENV/LABEL, or other instructions.
 //! Empty continuation lines, repeated trailing escapes and non-ASCII syntax
 //! whitespace are rejected rather than guessed. This is not full Dockerfile.
@@ -114,6 +114,7 @@ pub enum InstructionKind {
         chmod: Option<String>,
     },
     Workdir(Word),
+    User(Word),
     /// Each word is a modern key=value assignment; order is preserved.
     Env(Vec<Word>),
     /// Default is raw text, not shell-unquoted or expanded.
@@ -296,12 +297,6 @@ fn parse_instruction(
     let split = text.find([' ', '\t']).unwrap_or(text.len());
     let name = text[..split].to_ascii_uppercase();
     let payload = text[split..].trim_start_matches([' ', '\t']);
-    if name == "USER" {
-        return error(
-            line,
-            "USER is explicitly unsupported by the initial builder",
-        );
-    }
     if payload.is_empty() {
         return error(line, format!("{name} requires a payload"));
     }
@@ -435,12 +430,22 @@ fn parse_instruction(
                 chmod,
             }
         }
-        "WORKDIR" => {
+        "WORKDIR" | "USER" => {
             let mut values = words(payload, line, tokens)?;
             if values.len() != 1 || values[0].value.is_empty() {
-                return error(line, "WORKDIR requires one nonempty path token");
+                return error(line, format!("{name} requires one nonempty token"));
             }
-            InstructionKind::Workdir(values.remove(0))
+            let word = values.remove(0);
+            if name == "USER" {
+                // Expansion is evaluated with the stage ARG/ENV scope later.
+                if !word.raw.contains('$') {
+                    crate::user::validate_user_spec(&word.value)
+                        .map_err(|message| ParseError { line, message })?;
+                }
+                InstructionKind::User(word)
+            } else {
+                InstructionKind::Workdir(word)
+            }
         }
         "ENV" | "LABEL" => {
             let values = words(payload, line, tokens)?;
@@ -679,20 +684,21 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
     fn folding_comments_and_inline_hash() {
         let plan =
             parse("FROM alpine\r\nRUN echo ab\\\r\n# comment\\\r\ncd # literal\r\nUSER root\r\n");
-        let err = plan.unwrap_err();
-        assert_eq!(err.line, 5);
-        assert!(err.message.contains("USER"));
+        let plan = plan.unwrap();
+        assert_eq!(plan.stages[0].instructions[2].line, 5);
+        assert!(matches!(
+            plan.stages[0].instructions[2].kind,
+            InstructionKind::User(_)
+        ));
         let plan = parse("FROM alpine\nRUN echo ab\\\n# comment\ncd # literal\n").unwrap();
         assert_eq!(
             plan.stages[0].instructions[1].kind,
             InstructionKind::Run(Run::Shell("echo abcd # literal".into()))
         );
-        assert!(
-            parse("FROM alpine\nUS\\\nER root")
-                .unwrap_err()
-                .message
-                .contains("USER")
-        );
+        assert!(matches!(
+            parse("FROM alpine\nUS\\\nER root").unwrap().stages[0].instructions[1].kind,
+            InstructionKind::User(_)
+        ));
     }
 
     #[test]
@@ -704,7 +710,7 @@ CMD ["/app/main.py", "--listen", "0.0.0.0"]
             "# escape=`\nFROM alpine",
             "# syntax=docker/dockerfile:1\nFROM alpine",
             "RUN hi",
-            "FROM alpine\nUSER root",
+            "FROM alpine\nUSER root:group:extra",
             "FROM alpine\nADD a b",
             "FROM alpine\nRUN --mount=type=cache echo hi",
             "FROM alpine\nRUN <<EOF\nhi\nEOF",
