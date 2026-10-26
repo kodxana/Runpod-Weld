@@ -37,12 +37,14 @@ Usage:
   rpweld build -f DOCKERFILE [--base NAME=LAYOUT] [--base-ref NAME=REFERENCE]
     --output NEWDIR --work-dir NEWDIR [--build-arg KEY=VALUE] [--host-dns] [--verbose]
     [--progress auto|plain|quiet] [--target STAGE] [--no-cache] [--pull] [--platform linux/amd64]
-    [--export-mode flattened|layered]
+    [--export-mode layered|flattened]
     [--max-rootfs-bytes N] [--max-layer-bytes N] [--metadata-budget N] [--max-entries N]
     [--run-timeout-seconds N] CONTEXT
 
 Experimental build: Linux amd64, multi-stage, registry/local OCI bases or scratch.
 Default Dockerfile: CONTEXT/Dockerfile. Verified cached bases are reused offline.
+Layered export is the default: preserve base layers and append a cumulative delta per stage.
+--export-mode flattened writes one full-filesystem layer instead.
 --pull refreshes base tags using verified TLS; digest references remain reusable.
 Failed refreshes fail the build and preserve the previous base cache.
 Managed builds create private state under RPWELD_HOME (default ~/.local/share/rpweld).
@@ -1485,14 +1487,14 @@ mod tests {
     }
 
     #[test]
-    fn export_mode_is_explicit_and_validated() {
+    fn export_mode_defaults_to_layered_and_accepts_explicit_overrides() {
         use rpweld::build::ExportMode;
         assert_eq!(
             parse_build_args(&build_args(&[]))
                 .unwrap()
                 .options
                 .export_mode,
-            ExportMode::Flattened
+            ExportMode::Layered
         );
         for (value, expected) in [
             ("flattened", ExportMode::Flattened),

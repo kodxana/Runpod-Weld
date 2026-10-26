@@ -189,7 +189,7 @@ rpweld build -f context/Dockerfile --base alpine=./base-layout \
   --output ./new-image --work-dir ./new-work ./context
 ```
 
-Output is an OCI layout with a flattened, uncompressed layer. Work/output paths must be new and disjoint from the context and bases. Failed builds retain partial directories; do not reuse them. Optional `--host-dns` supplies temporary resolver configuration and restores it before export. Run `rpweld build --help` for base reference selection and budget controls.
+Output is a layered OCI layout that preserves base layers and appends an uncompressed cumulative delta per stage. Use `--export-mode flattened` for one full-filesystem layer. Work/output paths must be new and disjoint from the context and bases. Failed builds retain partial directories; do not reuse them. Optional `--host-dns` supplies temporary resolver configuration and restores it before export. Run `rpweld build --help` for base reference selection and budget controls.
 
 Local COPY supports directory merges, `COPY .`, WORKDIR-relative destinations, and bounded source wildcard selection (`*`, `?`, and bracket classes) with cumulative budgets. Wildcards do not provide recursive `**` traversal. Following the recorded Docker 29.7.2 behavior, unmatched or entirely ignored patterns are successful no-ops; missing or ignored literal sources still fail. Multiple matches from one wildcard overwrite a file destination in sorted match order. New selected directory destinations default to 0755; nested directories retain source modes. `--chmod` overrides these modes with octal values, including expanded ARG values; symbolic modes are unsupported. `--chown` accepts numeric IDs or names resolved from the destination image's `/etc/passwd` and `/etc/group`, never the host; `root` means zero. On a materialized filesystem, missing account files or names retain resolver defaults (unknown user: 0:0; unknown group: the user's default GID). Named lookup on untouched scratch still fails. Account lookup remains bounded and confined; malformed/nonregular databases and dangling account-file symlinks fail. Actual ownership changes require filesystem permission and fail explicitly when denied. Explicit source symlinks and source symlink traversal remain unsupported.
 
@@ -385,11 +385,13 @@ Re-executing such a COPY can change directory or symlink timestamps. Downstream
 instructions reuse cache only when the resulting verified filesystem identity
 matches; identical file contents alone do not guarantee a hit.
 
-`--export-mode flattened` is the default. Opt in to `--export-mode layered` to
-preserve the immediate base image's layer descriptors and append one cumulative
+`--export-mode layered` is the default. Builds preserve the immediate base
+image's layer descriptors and append one cumulative
 filesystem delta per stage. An inherited stage preserves its parent's complete
 layer chain. Deletions, replacements, hardlinks and preserved metadata participate
 in the delta; runtime configuration still comes from the evaluated Dockerfile.
+Use `--export-mode flattened` to write one full-filesystem layer. Layered output
+does not yet produce a separate delivered layer for each RUN or COPY instruction.
 Layered capture verifies and temporarily replays the base under owned work and
 requires permission to use `O_NOATIME` for inventory reads. It can therefore use
 additional temporary disk space and fail where a flattened export succeeds.

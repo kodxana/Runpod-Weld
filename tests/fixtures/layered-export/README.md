@@ -1,5 +1,9 @@
 # Layered export acceptance
 
+Acceptance uses the default layered mode for its build/cache/replay scenarios,
+checks equality with explicit `--export-mode layered`, and separately verifies
+`--export-mode flattened` and cache isolation between the two formats.
+
 These fixtures use native Linux paths, root, Python's standard library, GNU tar,
 and an existing local Alpine OCI layout. Docker checks also require a local C
 compiler with static libc available (`cc -static`). No pull or package installation occurs.

@@ -95,7 +95,8 @@ def main():
         dockerfile = context / 'Dockerfile'
         dockerfile.write_text('FROM alpine\nRUN ' + command + '\n')
         work, output = case / 'work', case / 'output'
-        argv = [str(binary), 'build', '-f', str(dockerfile), '--base', f'alpine={layout}', '--work-dir', str(work), '--output', str(output), '--run-timeout-seconds', '4' if stopping == 'timeout' else '25']
+        # Keep this single-layer resolver inspection as explicit flattened coverage.
+        argv = [str(binary), 'build', '--export-mode', 'flattened', '-f', str(dockerfile), '--base', f'alpine={layout}', '--work-dir', str(work), '--output', str(output), '--run-timeout-seconds', '4' if stopping == 'timeout' else '25']
         if dns:
             argv.append('--host-dns')
         argv.append(str(context))

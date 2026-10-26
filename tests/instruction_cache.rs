@@ -892,7 +892,7 @@ fn stage_copy_preserves_exported_directory_atime_with_and_without_cache() {
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(blob(&index["manifests"][0])).unwrap()).unwrap();
         let layers = manifest["layers"].as_array().unwrap();
-        assert_eq!(layers.len(), 1, "expected flattened output");
+        assert_eq!(layers.len(), 1, "scratch final stage needs one layer");
         let bytes = fs::read(blob(&layers[0])).unwrap();
         let reader: Box<dyn std::io::Read> = if bytes.starts_with(&[0x1f, 0x8b]) {
             Box::new(flate2::read::GzDecoder::new(std::io::Cursor::new(bytes)))

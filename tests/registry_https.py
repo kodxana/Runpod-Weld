@@ -144,13 +144,17 @@ auth:
             manifest = json.loads(blob(index['manifests'][0]).read_text())
             cfg = json.loads(blob(manifest['config']).read_text())
             assert 'ROUNDTRIP=ok' in cfg['config']['Env']
-            with tarfile.open(blob(manifest['layers'][0])) as archive:
-                payload = next(m for m in archive if m.name.lstrip('./') == 'payload')
-                assert archive.extractfile(payload).read() == b'registry-roundtrip\n'
-                for member in archive.getmembers():
-                    if member.isfile():
-                        data = archive.extractfile(member).read()
-                        assert password.encode() not in data and auth_encoded.encode() not in data
+            payload_seen = False
+            for layer in manifest['layers']:
+                with tarfile.open(blob(layer)) as archive:
+                    for member in archive.getmembers():
+                        if member.isfile():
+                            data = archive.extractfile(member).read()
+                            assert password.encode() not in data and auth_encoded.encode() not in data
+                            if member.name.lstrip('./') == 'payload':
+                                assert data == b'registry-roundtrip\n'
+                                payload_seen = True
+            assert payload_seen
             run(['push', f'{host}/private/child:v1', '--cert-dir', str(certs)])
             print('PASS private FROM pull, independent payload/config verification, push retry', flush=True)
             # Both pull and push must retain the backend's terminal layer bars.

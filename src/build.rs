@@ -78,8 +78,8 @@ pub struct Limits {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExportMode {
-    #[default]
     Flattened,
+    #[default]
     Layered,
 }
 

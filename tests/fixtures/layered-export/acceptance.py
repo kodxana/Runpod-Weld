@@ -160,11 +160,12 @@ def main():
     flat, _ = build("flat-noop", "flattened", noop)
     layered, _ = build("layered-noop", "layered", noop)
     flat_return, _ = build("flat-after-layered", "flattened", noop)
+    preserved(default)
     preserved(layered)
     assert len(load(flat)[0]["layers"]) == 1
     assert len(load(flat_return)[0]["layers"]) == 1
     assert load(flat_return) == load(flat)
-    assert load(default) == load(flat), "default export differs from explicit flattened"
+    assert load(default) == load(layered), "default export differs from explicit layered"
     original = a.evidence / "original-replay"
     replay(base, original)
     restored = a.evidence / "noop-replay"
@@ -224,7 +225,7 @@ def main():
                                   ("copy-no-cache", b"application-v2\n", ("--no-cache",))]:
         if name in {"copy-cold", "copy-app-edit"}:
             (context / "app").write_bytes(payload)
-        output, log = build(name, "layered", copy_file, extra, copy_store)
+        output, log = build(name, None, copy_file, extra, copy_store)
         manifest, config = preserved(output)
         assert config["config"] == base_config["config"]
         if name == "copy-warm":
@@ -265,7 +266,7 @@ def main():
     assert copy_trees["copy-cold"] == copy_trees["copy-warm"], "warm COPY metadata changed"
     (a.evidence / "delta-sizes.json").write_text(json.dumps(sizes, indent=2))
     # Minimal COPY versus RUN regression: actual executions, no synthetic timing.
-    minimal, _ = build("copy-run-true", "layered", copy_file + "RUN true\n", ["--no-cache"], copy_store)
+    minimal, _ = build("copy-run-true", None, copy_file + "RUN true\n", ["--no-cache"], copy_store)
     preserved(minimal)
     minimal_root = a.evidence / "copy-run-true-replay"
     replay(minimal, minimal_root)
@@ -290,13 +291,13 @@ def main():
                   "chmod 640 /probe/keep && chown 234:567 /probe/keep && "
                   "touch -h -t 202001010000 / /probe /probe/app /probe/keep /probe/to-dir /probe/to-file /probe/split-main /probe/xattr-dir\n"
                   "ENV CHILD=value\nCMD [\"/bin/sh\",\"-c\",\"cat /probe/app\"]\n")
-    first, _ = build("first", "layered", dockerfile)
+    first, _ = build("first", None, dockerfile)
     first_manifest, _ = preserved(first)
-    warm, warm_log = build("warm", "layered", dockerfile)
+    warm, warm_log = build("warm", None, dockerfile)
     assert b"CACHED" in warm_log
     preserved(warm)
     uncached_store = a.evidence / "uncached-store"
-    uncached, uncached_log = build("no-cache", "layered", dockerfile, ["--no-cache"], uncached_store)
+    uncached, uncached_log = build("no-cache", None, dockerfile, ["--no-cache"], uncached_store)
     assert b"CACHED instruction" not in uncached_log
     for namespace in ["cache-v1", "cache-v2"]:
         assert not (uncached_store / namespace).exists(), "no-cache created " + namespace
@@ -306,7 +307,7 @@ def main():
     # Bypass a populated cache, and prove no checkpoint content was changed.
     cached_before = {name: snapshot(store / name) for name in ["cache-v1", "cache-v2"] if (store / name).exists()}
     assert cached_before, "managed cache was never populated"
-    bypassed, bypass_log = build("populated-no-cache", "layered", dockerfile, ["--no-cache"])
+    bypassed, bypass_log = build("populated-no-cache", None, dockerfile, ["--no-cache"])
     assert b"CACHED" not in bypass_log, "no-cache read a populated cache"
     assert cached_before == {name: snapshot(store / name) for name in cached_before}, "no-cache mutated checkpoints"
     preserved(bypassed)
@@ -374,9 +375,9 @@ def main():
             damaged = bytearray(saved)
             damaged[len(damaged) // 2] ^= 1
             path.write_bytes(damaged)
-        build("warm-checkpoint-corruption", "layered", dockerfile, expect=False)
+        build("warm-checkpoint-corruption", None, dockerfile, expect=False)
         # A separate no-cache build must ignore the corrupted checkpoint namespace.
-        bypass, bypass_log = build("corrupt-cache-bypass", "layered", dockerfile, ["--no-cache"])
+        bypass, bypass_log = build("corrupt-cache-bypass", None, dockerfile, ["--no-cache"])
         assert b"CACHED" not in bypass_log
     finally:
         for path, saved in cache_layers.values():
@@ -388,8 +389,8 @@ def main():
     rich_size("corrupt-cache-bypass", bypass, bypass_snapshot)
     assert {k: v for k, v in bypass_snapshot.items() if k == "." or k.startswith("probe")} == trees[0]
     inherited_file = dockerfile + "FROM parent\nENV INHERITED=yes\n"
-    parent, _ = build("parent-target", "layered", inherited_file, ["--target", "parent"])
-    child, _ = build("inherited-child", "layered", inherited_file)
+    parent, _ = build("parent-target", None, inherited_file, ["--target", "parent"])
+    child, _ = build("inherited-child", None, inherited_file)
     child_manifest, child_config = preserved(child, parent)
     assert "INHERITED=yes" in child_config["config"]["Env"]
     for desc in child_manifest["layers"][len(load(parent)[0]["layers"]):]:
@@ -405,8 +406,8 @@ def main():
     assert snapshot(parent_tree) == snapshot(child_tree), "metadata-only inherited stage changed filesystem"
     mutating_file = dockerfile + ("FROM parent\nRUN printf child > /probe/child && "
                                  "chmod 600 /probe/child && touch -t 202001010000 / /probe /probe/child\n")
-    mutating_parent, _ = build("mutating-parent-target", "layered", mutating_file, ["--target", "parent"])
-    mutating_child, _ = build("mutating-child", "layered", mutating_file)
+    mutating_parent, _ = build("mutating-parent-target", None, mutating_file, ["--target", "parent"])
+    mutating_child, _ = build("mutating-child", None, mutating_file)
     preserved(mutating_child, mutating_parent)
     mutating_root = a.evidence / "mutating-replay"
     replay(mutating_child, mutating_root)
@@ -416,7 +417,7 @@ def main():
     assert mutated["probe/child"]["uid"] == mutated["probe/child"]["gid"] == 0
     assert mutated["probe/child"]["mtime_ns"] == mutated["probe/child"]["atime_ns"] == 1577836800000000000
     (context / "app").write_text("application-v2\n")
-    edited, _ = build("app-edit", "layered", dockerfile)
+    edited, _ = build("app-edit", None, dockerfile)
     edited_manifest, _ = preserved(edited)
     assert edited_manifest["layers"][-1]["digest"] != first_manifest["layers"][-1]["digest"]
     edited_root = a.evidence / "app-edit-replay"
@@ -427,8 +428,8 @@ def main():
     expected_edit["probe/app"]["sha256"] = hashlib.sha256(b"application-v2\n").hexdigest()
     assert {k: v for k, v in edited_tree.items() if k == "." or k.startswith("probe")} == expected_edit
     rich_size("app-edit", edited, edited_tree)
-    build("budget", "layered", dockerfile, ["--max-layer-bytes", "1024"], expect=False)
-    build("metadata-budget", "layered", dockerfile, ["--metadata-budget", "128"], expect=False)
+    build("budget", None, dockerfile, ["--max-layer-bytes", "1024"], expect=False)
+    build("metadata-budget", None, dockerfile, ["--metadata-budget", "128"], expect=False)
     # Corrupt a private base only; the original offline Alpine remains untouched.
     damaged = base / "blobs/sha256" / base_manifest["layers"][0]["digest"].split(":")[1]
     saved = damaged.read_bytes()
@@ -436,8 +437,8 @@ def main():
     corrupt[len(corrupt) // 2] ^= 1
     damaged.write_bytes(corrupt)
     try:
-        build("warm-base-corruption", "layered", noop, expect=False)
-        build("corruption", "layered", noop, ["--no-cache"], a.evidence / "corrupt-store", expect=False)
+        build("warm-base-corruption", None, noop, expect=False)
+        build("corruption", None, noop, ["--no-cache"], a.evidence / "corrupt-store", expect=False)
     finally:
         damaged.write_bytes(saved)
     (context / "Dockerfile").write_text("FROM fixture\nRUN touch /cancel-ready; sleep 90\n")

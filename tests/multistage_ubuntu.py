@@ -43,7 +43,8 @@ print(json.dumps(dict(cwd=os.getcwd(),hello=subprocess.check_output(['hello'],te
 (context/'app.py').write_text(app.replace('REVISION', '1'))
 print('CORPUS '+str(root), flush=True)
 def build(name, extra=(), success=True):
-    command = [a.binary, 'build', '-t', 'local/multistage:test', '--base', 'ubuntu:24.04='+a.layout,
+    # This fixture independently unpacks one full-tree layer below.
+    command = [a.binary, 'build', '--export-mode', 'flattened', '-t', 'local/multistage:test', '--base', 'ubuntu:24.04='+a.layout,
                '--output', str(root/(name+'-image')), '--work-dir', str(root/(name+'-work')),
                '--run-timeout-seconds', '180', *extra, str(context)]
     r = subprocess.run(command, env=env, capture_output=True, text=True, timeout=240, cwd='/')
