@@ -2017,7 +2017,7 @@ mod tests {
             Err(Error::Invalid("fixture admission refused"))
         ));
         let (bytes, inodes) = observed.get().unwrap();
-        assert!(bytes >= 7 * 4096 && bytes < 100_000);
+        assert!((7 * 4096..100_000).contains(&bytes));
         assert_eq!(inodes, 3);
         assert!(!image.path().join("existing/new").exists());
         let after = fs::metadata(image.path().join("existing")).unwrap();

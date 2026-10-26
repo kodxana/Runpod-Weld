@@ -1078,6 +1078,7 @@ struct RootUsage {
 }
 
 fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<RootUsage> {
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::only_used_in_recursion))]
     fn walk(
         p: &Path,
         usage: &mut RootUsage,
