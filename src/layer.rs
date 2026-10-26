@@ -25,7 +25,7 @@
 //! Each member costs at least ten header bytes, bounding empty-member floods too.
 //! The decoder may preallocate an extra field of at most 65,535 bytes before reading it.
 //! The decoder also limits each gzip name/comment field to 65,535 bytes.
-//! Reference: https://github.com/opencontainers/image-spec/blob/v1.1.1/layer.md
+//! Reference: <https://github.com/opencontainers/image-spec/blob/v1.1.1/layer.md>
 //! Dependency API/source review: flate2 1.1.10 (MSRV 1.67), tar 0.4.46 and
 //! tempfile 3.27.0 (MSRV 1.63), all MIT OR Apache-2.0; SHA-256 uses existing sha2.
 //! No tar unpack API is used. This is not a claim of an independent security audit.
