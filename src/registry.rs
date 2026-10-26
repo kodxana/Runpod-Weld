@@ -105,6 +105,8 @@ pub use linux::*;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use serde::Deserialize;
+    use serde_json::Value;
     use sha2::{Digest, Sha256};
     use std::{
         fs::{self, File, OpenOptions},
@@ -112,7 +114,7 @@ mod linux {
         os::{
             fd::{AsFd, AsRawFd},
             unix::{
-                fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+                fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
                 process::CommandExt,
             },
         },
@@ -131,10 +133,216 @@ mod linux {
     const INDEX: &str = "application/vnd.oci.image.index.v1+json";
     const DOCKER_INDEX: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
 
+    /// Validated manifest declarations only; never an expanded/rootfs measurement.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct ManifestSummary {
+        pub declared_compressed_bytes: u64,
+        pub layer_count: usize,
+    }
+
+    // Preserve duplicate keys until they can be rejected, unlike serde_json::Value.
+    struct UniqueJson(Value);
+    impl<'de> Deserialize<'de> for UniqueJson {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = UniqueJson;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("JSON without duplicate fields")
+                }
+                fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                    Ok(UniqueJson(Value::Null))
+                }
+                fn visit_bool<E: serde::de::Error>(
+                    self,
+                    v: bool,
+                ) -> std::result::Result<Self::Value, E> {
+                    Ok(UniqueJson(Value::Bool(v)))
+                }
+                fn visit_i64<E: serde::de::Error>(
+                    self,
+                    v: i64,
+                ) -> std::result::Result<Self::Value, E> {
+                    Ok(UniqueJson(v.into()))
+                }
+                fn visit_u64<E: serde::de::Error>(
+                    self,
+                    v: u64,
+                ) -> std::result::Result<Self::Value, E> {
+                    Ok(UniqueJson(v.into()))
+                }
+                fn visit_f64<E: serde::de::Error>(
+                    self,
+                    v: f64,
+                ) -> std::result::Result<Self::Value, E> {
+                    Ok(UniqueJson(v.into()))
+                }
+                fn visit_str<E: serde::de::Error>(
+                    self,
+                    v: &str,
+                ) -> std::result::Result<Self::Value, E> {
+                    Ok(UniqueJson(v.into()))
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut a: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut values = Vec::new();
+                    while let Some(UniqueJson(v)) = a.next_element()? {
+                        values.push(v);
+                    }
+                    Ok(UniqueJson(Value::Array(values)))
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut a: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut values = serde_json::Map::new();
+                    while let Some(key) = a.next_key::<String>()? {
+                        if values.contains_key(&key) {
+                            return Err(serde::de::Error::custom("duplicate JSON field"));
+                        }
+                        let UniqueJson(v) = a.next_value()?;
+                        values.insert(key, v);
+                    }
+                    Ok(UniqueJson(Value::Object(values)))
+                }
+            }
+            d.deserialize_any(Visitor)
+        }
+    }
+    fn unique_json(bytes: &[u8]) -> Result<Value> {
+        serde_json::from_slice::<UniqueJson>(bytes)
+            .map(|v| v.0)
+            .map_err(|_| "invalid registry JSON or duplicate field".into())
+    }
+    fn canonical_fields(value: &Value, fields: &[&str]) -> Result<()> {
+        let object = value.as_object().ok_or("invalid registry JSON object")?;
+        // Go also folds non-ASCII aliases (e.g. long-s). Opaque labels/values are exempt.
+        if object.keys().any(|key| {
+            !key.is_ascii()
+                || fields
+                    .iter()
+                    .any(|field| key.eq_ignore_ascii_case(field) && key != field)
+        }) {
+            return Err("noncanonical registry structural field".into());
+        }
+        Ok(())
+    }
+    const PLATFORM_FIELDS: &[&str] = &[
+        "architecture",
+        "os",
+        "os.version",
+        "os.features",
+        "variant",
+        "features",
+    ];
+    fn descriptor_fields(value: &Value) -> Result<()> {
+        canonical_fields(
+            value,
+            &[
+                "mediaType",
+                "digest",
+                "size",
+                "urls",
+                "data",
+                "platform",
+                "annotations",
+                "artifactType",
+            ],
+        )?;
+        if let Some(platform) = value.get("platform") {
+            canonical_fields(platform, PLATFORM_FIELDS)?;
+        }
+        Ok(())
+    }
+    fn config_json(bytes: &[u8]) -> Result<Value> {
+        let config = unique_json(bytes)?;
+        canonical_fields(
+            &config,
+            &[
+                "architecture",
+                "os",
+                "os.version",
+                "os.features",
+                "variant",
+                "features",
+                "created",
+                "author",
+                "config",
+                "rootfs",
+                "history",
+                "container",
+                "container_config",
+                "docker_version",
+            ],
+        )?;
+        if let Some(rootfs) = config.get("rootfs") {
+            canonical_fields(rootfs, &["type", "diff_ids"])?;
+        }
+        if let Some(history) = config.get("history").and_then(Value::as_array) {
+            for entry in history {
+                canonical_fields(
+                    entry,
+                    &["created", "author", "created_by", "comment", "empty_layer"],
+                )?;
+            }
+        }
+        for key in ["config", "container_config"] {
+            if let Some(runtime) = config.get(key).filter(|v| !v.is_null()) {
+                canonical_fields(
+                    runtime,
+                    &[
+                        "User",
+                        "Env",
+                        "Entrypoint",
+                        "Cmd",
+                        "Volumes",
+                        "WorkingDir",
+                        "Labels",
+                        "ExposedPorts",
+                        "StopSignal",
+                        "ArgsEscaped",
+                        "OnBuild",
+                        "Shell",
+                        "Healthcheck",
+                        "Hostname",
+                        "Domainname",
+                        "AttachStdin",
+                        "AttachStdout",
+                        "AttachStderr",
+                        "Tty",
+                        "OpenStdin",
+                        "StdinOnce",
+                        "Image",
+                        "NetworkDisabled",
+                        "MacAddress",
+                        "StopTimeout",
+                    ],
+                )?;
+                if let Some(health) = runtime.get("Healthcheck").filter(|v| !v.is_null()) {
+                    canonical_fields(
+                        health,
+                        &[
+                            "Test",
+                            "Interval",
+                            "Timeout",
+                            "StartPeriod",
+                            "StartInterval",
+                            "Retries",
+                        ],
+                    )?;
+                }
+            }
+        }
+        Ok(config)
+    }
+
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct ManifestDocument {
         schema_version: u32,
+        #[serde(default)]
         media_type: String,
         manifests: Option<Vec<crate::oci::Descriptor>>,
         config: Option<crate::oci::Descriptor>,
@@ -143,10 +351,54 @@ mod linux {
         subject: Option<serde_json::Value>,
     }
     fn document(bytes: &[u8]) -> Result<ManifestDocument> {
-        let doc: ManifestDocument =
-            serde_json::from_slice(bytes).map_err(|_| "invalid registry manifest JSON")?;
+        let value = unique_json(bytes)?;
+        canonical_fields(
+            &value,
+            &[
+                "schemaVersion",
+                "mediaType",
+                "manifests",
+                "config",
+                "layers",
+                "artifactType",
+                "subject",
+                "annotations",
+            ],
+        )?;
+        for key in ["manifests", "layers"] {
+            if let Some(entries) = value.get(key).and_then(Value::as_array) {
+                for entry in entries {
+                    descriptor_fields(entry)?;
+                }
+            }
+        }
+        for key in ["config", "subject"] {
+            if let Some(entry) = value.get(key) {
+                descriptor_fields(entry)?;
+            }
+        }
+        let absent_media = value.get("mediaType").is_none();
+        let mut doc: ManifestDocument =
+            serde_json::from_value(value).map_err(|_| "invalid registry manifest JSON")?;
         if doc.schema_version != 2 || doc.artifact_type.is_some() || doc.subject.is_some() {
             return Err("unsupported registry manifest schema or artifact".into());
+        }
+        let inferred = match (&doc.manifests, &doc.config, &doc.layers) {
+            (Some(_), None, None) => Some(INDEX),
+            (None, Some(config), Some(_)) => match config.media_type.as_str() {
+                "application/vnd.oci.image.config.v1+json" => Some(MANIFEST),
+                "application/vnd.docker.container.image.v1+json" => Some(DOCKER_MANIFEST),
+                _ => None,
+            },
+            _ => None,
+        }
+        .ok_or("unsupported registry manifest shape or config media type")?;
+        if absent_media {
+            doc.media_type = inferred.into();
+        } else if doc.media_type != inferred
+            && !(inferred == INDEX && doc.media_type == DOCKER_INDEX)
+        {
+            return Err("registry manifest media type mismatch".into());
         }
         Ok(doc)
     }
@@ -203,6 +455,112 @@ mod linux {
             }
         }
         Ok(total)
+    }
+
+    fn repository(reference: &str) -> &str {
+        reference
+            .split_once('@')
+            .map(|(repo, _)| repo)
+            .unwrap_or_else(|| reference.rsplit_once(':').unwrap().0)
+    }
+    fn read_system_policy() -> Result<Vec<u8>> {
+        // command() gives Skopeo an empty private HOME, so DefaultPolicy falls back here.
+        // Packaged backend lookup: containers/image signature/policy_config.go,
+        // defaultPolicyPathWithHomeDir (no caller HOME policy or permissive fallback).
+        // https://github.com/containers/image/blob/v5.26.0/signature/policy_config.go
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/etc/containers/policy.json")
+            .map_err(|_| "cannot read registry signature policy")?;
+        if !file.metadata().map_err(err)?.is_file() {
+            return Err("registry signature policy must be a regular file".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(AUTH_CAP + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "cannot read registry signature policy")?;
+        if bytes.len() as u64 > AUTH_CAP {
+            return Err("registry signature policy exceeds byte limit".into());
+        }
+        Ok(bytes)
+    }
+    fn policy_for_pin(bytes: &[u8], original: &str, pinned: &str) -> Result<Vec<u8>> {
+        let mut policy =
+            unique_json(bytes).map_err(|_| "invalid registry signature policy JSON")?;
+        if original != pinned {
+            let transports = policy
+                .get("transports")
+                .map(|v| v.as_object().ok_or("invalid signature policy transports"))
+                .transpose()?;
+            let scopes = transports
+                .and_then(|t| t.get("docker"))
+                .map(|v| {
+                    v.as_object()
+                        .ok_or("invalid Docker signature policy scopes")
+                })
+                .transpose()?;
+            let mut selected = scopes.and_then(|s| s.get(original));
+            // Match containers/image docker/policyconfiguration.DockerReferenceNamespaces order:
+            // https://github.com/containers/image/blob/v5.26.0/docker/policyconfiguration/naming.go
+            let mut namespace = repository(original);
+            loop {
+                selected = selected.or_else(|| scopes.and_then(|s| s.get(namespace)));
+                match namespace.rsplit_once('/') {
+                    Some((parent, _)) => namespace = parent,
+                    None => break,
+                }
+            }
+            namespace = namespace
+                .split_once(':')
+                .map_or(namespace, |(host, _)| host);
+            while let Some((_, parent)) = namespace.split_once('.') {
+                namespace = parent;
+                selected =
+                    selected.or_else(|| scopes.and_then(|s| s.get(&format!("*.{namespace}"))));
+            }
+            let requirements = selected
+                .or_else(|| scopes.and_then(|s| s.get("")))
+                .or_else(|| policy.get("default"))
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty())
+                .ok_or("missing or invalid original registry signature policy")?;
+            if requirements
+                .iter()
+                .any(|r| r.get("type").and_then(Value::as_str) == Some("reject"))
+            {
+                return Err(
+                    "original image reference is rejected by registry signature policy".into(),
+                );
+            }
+            if !requirements.iter().all(|r| {
+                r.as_object().is_some_and(|o| o.len() == 1)
+                    && r.get("type").and_then(Value::as_str) == Some("insecureAcceptAnything")
+            }) {
+                // Skopeo has no independent source identity; index signatures also bind the original index.
+                return Err("cannot preserve original signing identity with digest pinning: signed tag/index policies are unsupported".into());
+            }
+            let requirements = Value::Array(requirements.clone());
+            let transports = policy
+                .as_object_mut()
+                .ok_or("invalid signature policy")?
+                .entry("transports")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or("invalid signature policy transports")?;
+            transports
+                .entry("docker")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or("invalid Docker signature policy scopes")?
+                .insert(pinned.into(), requirements);
+        }
+        // Retain the entire policy: Skopeo must still reject invalid/unrecognized policy elsewhere.
+        let bytes = serde_json::to_vec(&policy).map_err(|_| "invalid registry signature policy")?;
+        if bytes.len() as u64 > AUTH_CAP {
+            return Err("registry signature policy snapshot exceeds byte limit".into());
+        }
+        Ok(bytes)
     }
 
     fn err(e: impl std::fmt::Display) -> String {
@@ -611,6 +969,7 @@ mod linux {
             }
             let temp = tempfile::Builder::new()
                 .prefix(".rpweld-registry-")
+                .permissions(fs::Permissions::from_mode(0o700))
                 .tempdir_in(source.parent().ok_or("missing auth parent")?)
                 .map_err(err)?;
             let auth = temp.path().join("auth.json");
@@ -851,6 +1210,9 @@ mod linux {
         /// Check declared compressed sizes before any layer copy; no expanded/rootfs estimate.
         /// Metadata stdout has fixed structural caps even when resource limits are automatic.
         /// Cache callers must invoke this only on a miss, after verifying cached content.
+        /// The original reference's policy scope is preserved via a bounded private snapshot.
+        /// Signed tag/index pulls are unsupported when pinning changes the signing identity;
+        /// unchanged direct manifest digests retain full backend policy/signature enforcement.
         pub fn pull_checked(
             &self,
             lease: &crate::store_lease::StoreLease,
@@ -859,13 +1221,36 @@ mod linux {
             limits: crate::image::Limits,
             cancelled: &impl Fn() -> bool,
         ) -> Result<()> {
+            self.pull_checked_with_pre_copy(
+                lease,
+                reference,
+                destination,
+                limits,
+                cancelled,
+                |_| Ok(()),
+            )
+        }
+
+        /// The callback runs once after metadata validation and before any layer GET.
+        /// Its error aborts the pull; cancellation is checked again after it returns.
+        /// Signed tag/index policies fail closed when pinning changes policy/signing identity.
+        /// A successful preflight/callback does not claim signature verification: the backend
+        /// enforces the snapshot during copy. Summary sizes are compressed declarations only.
+        #[allow(clippy::too_many_arguments)]
+        pub fn pull_checked_with_pre_copy(
+            &self,
+            lease: &crate::store_lease::StoreLease,
+            reference: &str,
+            destination: &Path,
+            limits: crate::image::Limits,
+            cancelled: &impl Fn() -> bool,
+            before_copy: impl FnOnce(ManifestSummary) -> Result<()>,
+        ) -> Result<()> {
             crate::store_access::validate_path(destination, Some(lease)).map_err(err)?;
             let reference = super::reference(reference, true)?;
-            let repository = reference
-                .split_once('@')
-                .map(|(repo, _)| repo)
-                .unwrap_or_else(|| reference.rsplit_once(':').unwrap().0);
+            let repository = repository(&reference);
             let deadline = Instant::now() + Duration::from_secs(910);
+            let policy = read_system_policy()?;
             let mut remaining = limits.max_total_metadata_bytes.min(TOTAL_METADATA_CAP);
             let cap = limits.max_metadata_bytes.min(METADATA_CAP);
             let mut read = |reference: &str, config, expected: Option<&crate::oci::Descriptor>| {
@@ -937,7 +1322,7 @@ mod linux {
             {
                 return Err("registry descriptor count exceeds preflight limit".into());
             }
-            layer_sizes(layers, limits)?;
+            let declared_compressed_bytes = layer_sizes(layers, limits)?;
             let config = doc.config.as_ref().ok_or("missing registry config")?;
             descriptor(config)?;
             if !matches!(
@@ -950,15 +1335,31 @@ mod linux {
             let pinned = format!("{repository}@sha256:{:x}", Sha256::digest(&raw));
             // --raw --config internally reopens the manifest: only pass the verified digest.
             let bytes = read(&pinned, true, Some(config))?;
-            let config: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(|_| "invalid registry config JSON")?;
+            let config = config_json(&bytes)?;
             if !native_platform(&config, true) {
                 return Err("registry config platform is not supported linux/amd64".into());
             }
             if cancelled() || Instant::now() >= deadline {
                 return Err("registry preflight cancelled or timed out".into());
             }
-            self.pull(lease, &pinned, destination, cancelled)
+            let policy = policy_for_pin(&policy, &reference, &pinned)?;
+            let mut snapshot = tempfile::NamedTempFile::new_in(self.temp.path()).map_err(err)?;
+            snapshot.write_all(&policy).map_err(err)?;
+            snapshot.as_file().sync_all().map_err(err)?;
+            before_copy(ManifestSummary {
+                declared_compressed_bytes,
+                layer_count: layers.len(),
+            })?;
+            if cancelled() || Instant::now() >= deadline {
+                return Err("registry preflight cancelled or timed out".into());
+            }
+            self.pull_with_policy(
+                lease,
+                &pinned,
+                destination,
+                Some(snapshot.path()),
+                cancelled,
+            )
         }
         pub fn pull(
             &self,
@@ -967,8 +1368,21 @@ mod linux {
             destination: &Path,
             cancelled: &impl Fn() -> bool,
         ) -> Result<()> {
+            self.pull_with_policy(lease, reference, destination, None, cancelled)
+        }
+        fn pull_with_policy(
+            &self,
+            lease: &crate::store_lease::StoreLease,
+            reference: &str,
+            destination: &Path,
+            policy: Option<&Path>,
+            cancelled: &impl Fn() -> bool,
+        ) -> Result<()> {
             crate::store_access::validate_path(destination, Some(lease)).map_err(err)?;
             let mut cmd = self.command(Some(lease))?;
+            if let Some(policy) = policy {
+                cmd.arg("--policy").arg(policy);
+            }
             cmd.args([
                 "copy",
                 "--src-tls-verify=true",
@@ -1354,7 +1768,94 @@ mod linux {
                 document(b"{\"secret-password\":")
                     .err()
                     .unwrap()
-                    .contains("invalid registry manifest JSON")
+                    .contains("invalid registry JSON")
+            );
+        }
+        #[test]
+        fn strict_metadata_rejects_aliases_and_duplicates_but_keeps_unicode_values() {
+            for raw in [
+                br#"{"schemaVersion":2,"schemaVersion":2}"#.as_slice(),
+                br#"{"schemaVersion":2,"SchemaVersion":1}"#,
+                br#"{"schemaVersion":2,"layers":[{"size":1,"Size":5000000}]}"#,
+                br#"{"schemaVersion":2,"layers":[{"size":1,"\u017fize":5000000}]}"#,
+                br#"{"schemaVersion":2,"manifests":[{"platform":{"os":"linux","OS":"windows"}}]}"#,
+            ] {
+                assert!(document(raw).is_err());
+            }
+            assert!(config_json(br#"{"architecture":"amd64","Architecture":"arm64"}"#).is_err());
+            assert!(config_json(br#"{"config":{"User":"0","user":"1000"}}"#).is_err());
+            assert!(config_json(br#"{"rootfs":{"type":"layers","Type":"other"}}"#).is_err());
+            let value = config_json(
+                "{\"config\":{\"Env\":[\"VALUE=雪\"],\"Labels\":{\"ſize\":\"大\"}}}".as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(value["config"]["Env"][0], "VALUE=雪");
+            assert_eq!(value["config"]["Labels"]["ſize"], "大");
+        }
+        #[test]
+        fn policy_scope_uses_original_reference_and_never_weakens_signing() {
+            let pin = format!("example.com/ns/repo@sha256:{}", "a".repeat(64));
+            let accept = serde_json::json!([{"type":"insecureAcceptAnything"}]);
+            let reject = serde_json::json!([{"type":"reject"}]);
+            let policy = serde_json::json!({"default":reject, "transports":{"docker":{
+                "example.com/ns/repo":accept,
+                "example.com/ns/repo:blocked":reject,
+                "example.com/ns/repo:signed":[{"type":"signedBy","keyType":"GPGKeys","keyPath":"/key"}]
+            }}});
+            let bytes = serde_json::to_vec(&policy).unwrap();
+            assert!(
+                policy_for_pin(&bytes, "example.com/ns/repo:blocked", &pin)
+                    .unwrap_err()
+                    .contains("rejected")
+            );
+            assert!(
+                policy_for_pin(&bytes, "example.com/ns/repo:signed", &pin)
+                    .unwrap_err()
+                    .contains("signing identity")
+            );
+            let adapted = policy_for_pin(&bytes, "example.com/ns/repo:allowed", &pin).unwrap();
+            let adapted: Value = serde_json::from_slice(&adapted).unwrap();
+            assert_eq!(adapted["transports"]["docker"][&pin], accept);
+            assert_eq!(adapted["default"], reject);
+            assert_eq!(
+                adapted["transports"]["docker"]["example.com/ns/repo:signed"],
+                policy["transports"]["docker"]["example.com/ns/repo:signed"]
+            );
+            let signed =
+                br#"{"default":[{"type":"signedBy","keyType":"GPGKeys","keyPath":"/key"}]}"#;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&policy_for_pin(signed, &pin, &pin).unwrap())
+                    .unwrap(),
+                serde_json::from_slice::<Value>(signed).unwrap()
+            );
+            for scope in ["example.com/ns", "example.com", "*.com", ""] {
+                let policy =
+                    serde_json::json!({"default":reject, "transports":{"docker":{scope:accept}}});
+                assert!(
+                    policy_for_pin(
+                        &serde_json::to_vec(&policy).unwrap(),
+                        "example.com/ns/repo:tag",
+                        &pin
+                    )
+                    .is_ok()
+                );
+            }
+            let policy = serde_json::json!({"default":accept, "transports":{"docker":{"example.com/ns/repo":reject, "*.com":accept}}});
+            assert!(
+                policy_for_pin(
+                    &serde_json::to_vec(&policy).unwrap(),
+                    "example.com/ns/repo:tag",
+                    &pin
+                )
+                .is_err()
+            );
+            assert!(
+                policy_for_pin(
+                    br#"{"default":[],"default":[{"type":"insecureAcceptAnything"}]}"#,
+                    "example.com/ns/repo:tag",
+                    &pin
+                )
+                .is_err()
             );
         }
         #[test]

@@ -3,6 +3,8 @@
 
 python3 tests/registry_preflight_https.py --weld /absolute/rpweld
 Requires Linux, packaged Skopeo, openssl and Python's standard library.
+Policy tests require a private mount namespace (root); no host policy is modified.
+Optional --transport-driver runs callback/legacy API checks using the Rust fixture driver.
 """
 import argparse
 import base64
@@ -18,6 +20,7 @@ import secrets
 import signal
 import ssl
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -44,7 +47,10 @@ def descriptor(data, media_type):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--weld', required=True)
-    weld = str(Path(parser.parse_args().weld).resolve())
+    parser.add_argument('--transport-driver')
+    options = parser.parse_args()
+    weld = str(Path(options.weld).resolve())
+    driver = str(Path(options.transport_driver).resolve()) if options.transport_driver else None
     with tempfile.TemporaryDirectory(prefix='weld-preflight-') as directory:
         root = Path(directory)
         home = root/'home'
@@ -128,11 +134,11 @@ def main():
         env = dict(os.environ, HOME=str(home), RPWELD_HOME=str(home/'store'),
                    NO_PROXY='localhost,127.0.0.1', no_proxy='localhost,127.0.0.1')
 
-        def publish(tag, value):
+        def publish(tag, value, media=MANIFEST):
             data = encode(value)
             manifests[tag] = data
             manifests[digest(data)] = data
-            return descriptor(data, value['mediaType'])
+            return descriptor(data, value.get('mediaType', media))
 
         def image(payload, arch='amd64'):
             stream = io.BytesIO()
@@ -170,8 +176,13 @@ def main():
                 args += ['--cert-dir', str(certs)]
             return [*args, *flags, str(context)], output
 
-        def run(tag, *flags, success=True, trusted=True, authfile=auth):
+        def run(tag, *flags, success=True, trusted=True, authfile=auth, policy=None):
             args, output = arguments(tag, flags, trusted, authfile)
+            if policy is not None:
+                policy_path = root/f'policy-{counter}.json'
+                policy_path.write_bytes(encode(policy))
+                args = ['unshare', '--mount', '--propagation', 'private', 'python3',
+                        str(Path(__file__).resolve()), '--policy-exec', str(policy_path), *args]
             result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=40)
             combined = result.stdout + result.stderr
             assert secret not in combined and encoded_auth not in combined, 'credential disclosure'
@@ -181,6 +192,24 @@ def main():
         def layer_gets():
             return [path for method, path in requests if method == 'GET'
                     and '/blobs/' in path and path.rsplit('/', 1)[1] in layer_digests]
+
+        def drive(mode, tag, *, policy=None, success=False):
+            nonlocal counter
+            counter += 1
+            output = root/f'driver-output-{counter}'
+            reference = f'{host}/fixture:{tag}' if not tag.startswith('sha256:') else f'{host}/fixture@{tag}'
+            args = [driver, mode, reference, str(auth), str(certs), str(output),
+                    str(original['layers'][0]['size']), '1']
+            if policy is not None:
+                policy_path = root/f'driver-policy-{counter}.json'
+                policy_path.write_bytes(encode(policy))
+                args = ['unshare', '--mount', '--propagation', 'private', 'python3',
+                        str(Path(__file__).resolve()), '--policy-exec', str(policy_path), *args]
+            result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=40)
+            assert (result.returncode == 0) == success, result.stdout + result.stderr
+            assert secret not in result.stdout + result.stderr
+            assert not list(root.rglob('.rpweld-registry-*')), 'transport files survived return'
+            return result
 
         def reject(tag, value, expected, *flags):
             publish(tag, value)
@@ -201,6 +230,104 @@ def main():
                 return archive.extractfile('payload').read()
 
         try:
+            # Go's JSON decoder folds struct keys and accepts last-wins collisions.
+            for case, key in enumerate(['Size', 'SIZE', '\u017fize']):
+                collision = copy.deepcopy(original)
+                collision['layers'][0]['size'] = 1
+                collision['layers'][0][key] = 5000000
+                reject('size-alias-' + str(case), collision, 'noncanonical', '--max-layer-bytes', '1024')
+            collision = copy.deepcopy(original)
+            collision['layers'] = []
+            collision['Layers'] = [dict(original['layers'][0], size=5000000)]
+            reject('layers-alias', collision, 'noncanonical', '--max-layer-bytes', '1024')
+            duplicate = encode(original).replace(b'"size":', b'"size":1,"size":', 1)
+            manifests['exact-duplicate'] = duplicate
+            before = len(layer_gets())
+            result, _ = run('exact-duplicate', success=False)
+            assert 'duplicate field' in result.stderr and len(layer_gets()) == before
+            duplicate = encode(original).replace(b'"layers":', b'"layers":[],"layers":', 1)
+            manifests['duplicate-layers'] = duplicate
+            result, _ = run('duplicate-layers', success=False)
+            assert 'duplicate field' in result.stderr and len(layer_gets()) == before
+            reject('platform-alias', dict(schemaVersion=2, mediaType=INDEX, manifests=[
+                dict(original_desc, platform=dict(os='linux', architecture='amd64', Architecture='arm64'))]),
+                'noncanonical')
+            for key, value in [('Architecture', 'arm64'), ('Rootfs', {'type': 'layers', 'diff_ids': []})]:
+                config = json.loads(blobs[original['config']['digest']])
+                config[key] = value
+                raw_config = encode(config)
+                blobs[digest(raw_config)] = raw_config
+                reject('config-alias-' + key, dict(original, config=descriptor(raw_config, CONFIG)), 'noncanonical')
+            medialess = copy.deepcopy(original)
+            del medialess['mediaType']
+            medialess_desc = publish('no-media-type', medialess)
+            _, output = run('no-media-type')
+            assert payload(output) == b'original\n'
+            publish('selected-no-media', dict(schemaVersion=2, mediaType=INDEX, manifests=[
+                dict(medialess_desc, platform=dict(os='linux', architecture='amd64'))]))
+            _, output = run('selected-no-media')
+            assert payload(output) == b'original\n'
+            reject('explicit-type-mismatch', dict(original, mediaType=INDEX), 'media type mismatch')
+            config = json.loads(blobs[original['config']['digest']])
+            config['config'] = {'Env': ['UNICODE=zażółć'], 'Labels': {'ſize': '雪'}}
+            raw_config = encode(config)
+            blobs[digest(raw_config)] = raw_config
+            publish('unicode-values', dict(original, config=descriptor(raw_config, CONFIG)))
+            _, output = run('unicode-values')
+            assert payload(output) == b'original\n'
+            print('PASS canonical structural fields, exact duplicates, optional mediaType, Unicode values', flush=True)
+            accept, deny = [{'type': 'insecureAcceptAnything'}], [{'type': 'reject'}]
+            block_tag = {'default': accept, 'transports': {'docker': {
+                f'{host}/fixture': accept, f'{host}/fixture:policy-blocked': deny}}}
+            publish('policy-blocked', original)
+            before = len(layer_gets())
+            result, _ = run('policy-blocked', policy=block_tag, success=False)
+            assert 'rejected by registry signature policy' in result.stderr and len(layer_gets()) == before
+            allow_tag = {'default': deny, 'transports': {'docker': {
+                f'{host}/fixture': deny, f'{host}/fixture:policy-allowed': accept}}}
+            publish('policy-allowed', original)
+            _, output = run('policy-allowed', policy=allow_tag)
+            assert payload(output) == b'original\n'
+            signed = {'default': accept, 'transports': {'docker': {f'{host}/fixture:policy-signed': [{
+                'type': 'signedBy', 'keyType': 'GPGKeys', 'keyPath': '/nonexistent-fixture-key'}]}}}
+            publish('policy-signed', original)
+            before = len(layer_gets())
+            result, _ = run('policy-signed', policy=signed, success=False)
+            assert 'signed tag/index policies are unsupported' in result.stderr and len(layer_gets()) == before
+            signed_index = publish('signed-index', dict(schemaVersion=2, mediaType=INDEX, manifests=[
+                dict(original_desc, platform=dict(os='linux', architecture='amd64'))]))
+            for ref in ['signed-index', signed_index['digest']]:
+                result, _ = run(ref, policy={'default': signed['transports']['docker'][f'{host}/fixture:policy-signed']},
+                                success=False)
+                assert 'signed tag/index policies are unsupported' in result.stderr and len(layer_gets()) == before
+            publish('policy-large', original)
+            result, _ = run('policy-large', policy={'default': accept, 'padding': 'x' * 1024**2}, success=False)
+            assert 'signature policy exceeds byte limit' in result.stderr and len(layer_gets()) == before
+            publish('policy-invalid', original)
+            result, _ = run('policy-invalid', policy={'default': accept, 'unknown': True}, success=False)
+            assert len(layer_gets()) == before
+            print('PASS original tag reject/allow scopes and unsupported signing policy: zero rejected layer GET', flush=True)
+            if driver:
+                for mode, expected in [('abort', 'fixture pre-copy rejected'), ('cancel', 'cancelled')]:
+                    before = len(layer_gets())
+                    result = drive(mode, 'original')
+                    assert expected in result.stderr and len(layer_gets()) == before, result.stderr
+                # Both APIs hide caller HOME policy and use the system policy in their private HOME.
+                caller_policy = home/'.config/containers/policy.json'
+                caller_policy.parent.mkdir(parents=True, exist_ok=True)
+                caller_policy.write_bytes(encode({'default': deny}))
+                drive('old', 'original', success=True)
+                drive('checked', 'original', success=True)
+                before = len(layer_gets())
+                drive('old', 'policy-blocked', policy=block_tag)
+                assert len(layer_gets()) == before
+                drive('old', 'policy-allowed', policy=allow_tag, success=True)
+                signed_digest = {'default': [{'type': 'signedBy', 'keyType': 'GPGKeys',
+                                              'keyPath': '/nonexistent-fixture-key'}]}
+                before = len(layer_gets())
+                result = drive('checked', original_desc['digest'], policy=signed_digest)
+                assert 'unsupported' not in result.stderr and len(layer_gets()) == before
+                print('PASS pre-copy callback abort/cancel, private snapshot cleanup, old/new HOME lookup, unchanged digest signature enforcement', flush=True)
             huge = copy.deepcopy(original)
             huge['layers'][0]['size'] = 10 * 1024**3
             reject('per-layer', huge, 'manifest compressed layer bytes', '--max-layer-bytes', '1024')
@@ -291,6 +418,24 @@ def main():
             _, output = run('moving', '--pull')
             assert payload(output) == b'changed!\n'
             print('PASS moving tag pins original digest; explicit refresh selects new content', flush=True)
+            # A malicious digest endpoint must not substitute a same-sized manifest
+            # during --raw --config or the later copy's independent reopen.
+            replacement = copy.deepcopy(original)
+            replacement['layers'][0]['digest'] = changed['layers'][0]['digest']
+            replacement = encode(replacement)
+            assert len(replacement) == original_desc['size']
+            for phase in ['config', 'copy']:
+                publish('immutable-race-' + phase, original)
+                if phase == 'config':
+                    manifests[original_desc['digest']] = replacement
+                else:
+                    moving[original_desc['digest']] = replacement
+                before = len(layer_gets())
+                result, _ = run('immutable-race-' + phase, success=False)
+                assert len(layer_gets()) == before, f'{phase} digest reopen fetched a substituted layer: {result.stderr}'
+                manifests[original_desc['digest']] = encode(original)
+                moving.pop(original_desc['digest'], None)
+            print('PASS same-sized manifest substitution at config/copy digest reopen: zero layer GET', flush=True)
             publish('tls-fail', original)
             before = len(layer_gets())
             result, _ = run('tls-fail', success=False, trusted=False)
@@ -345,4 +490,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == '--policy-exec':
+        # Only inside a private mount namespace: never replace the host policy.
+        subprocess.run(['mount', '--bind', sys.argv[2], '/etc/containers/policy.json'], check=True)
+        os.execv(sys.argv[3], sys.argv[3:])
+    else:
+        main()
