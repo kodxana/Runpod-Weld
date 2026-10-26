@@ -417,6 +417,14 @@ verification. The confined copier reads that filesystem directly under the exist
 COPY and rootfs limits. Selected targets and stages used by a selected `FROM` still
 export images; cached builds keep their image identities and verification paths.
 
+In layered no-cache builds, the last selected `FROM` consumer can take ownership
+of its parent's filesystem without unpacking that image again. Earlier consumers
+still replay, and parents used by `COPY --from` are excluded. The parent image
+remains independently stored and verified. A bounded receipt pins the root and
+its exported identity; filesystem or bind-mount boundaries and insufficient
+receipt metadata fall back to verified replay. No files are shared with mutable
+output images. See [measured performance](docs/performance.md).
+
 `--no-cache` bypasses stage and instruction cache reads and writes. Cache hits verify OCI digests and
 replay layers under the requested limits before reuse. Corrupt entries fail
 closed; use `--no-cache` to bypass them. Credentials are not cache inputs and

@@ -311,6 +311,84 @@ mod tests {
     fn config() -> Value {
         json!({"os":"linux","architecture":"amd64","config":{"Env":["A=B"],"Cmd":["/bin/app"],"User":"123:456","OnBuild":["RUN true"]},"future":{"keep":true},"rootfs":{"diff_ids":["stale"]},"history":[{"created_by":"stale"}]})
     }
+
+    #[test]
+    fn exported_root_receipt_is_bounded_pinned_and_keeps_symlink_metadata() {
+        let f = Fixture::new();
+        let baseline = Baseline::scratch(&f.root, LIMITS, || false).unwrap();
+        fs::write(f.root.join("file"), b"payload").unwrap();
+        symlink("file", f.root.join("link")).unwrap();
+        fs::hard_link(f.root.join("link"), f.root.join("alias")).unwrap();
+        let mut receipt = None;
+        export_created_with_resources(
+            &f.root,
+            &f.dest,
+            &config(),
+            Some(&baseline),
+            LIMITS,
+            None,
+            Some((&mut receipt, LIMITS.max_metadata_bytes)),
+            || false,
+            || Ok(()),
+        )
+        .unwrap();
+        let receipt = receipt.unwrap();
+        let metadata = f.load();
+        receipt.validate(&f.root, &metadata.diff_ids).unwrap();
+        assert!(receipt.validate(&f.root, &[]).is_err());
+        let moved = f.temp.path().join("moved");
+        fs::rename(&f.root, &moved).unwrap();
+        fs::create_dir(&f.root).unwrap();
+        assert!(receipt.validate(&f.root, &metadata.diff_ids).is_err());
+        receipt.validate(&moved, &metadata.diff_ids).unwrap();
+        let before = fs::symlink_metadata(moved.join("link")).unwrap();
+        let inherited = Baseline::capture_replayed(
+            &moved,
+            &f.dest,
+            &metadata,
+            receipt,
+            LIMITS,
+            LIMITS.max_layer_bytes,
+            || false,
+        )
+        .unwrap();
+        let after = fs::symlink_metadata(moved.join("alias")).unwrap();
+        assert_eq!(
+            (
+                before.atime(),
+                before.atime_nsec(),
+                before.ctime(),
+                before.ctime_nsec()
+            ),
+            (
+                after.atime(),
+                after.atime_nsec(),
+                after.ctime(),
+                after.ctime_nsec()
+            )
+        );
+        let child = f.temp.path().join("child");
+        export_delta_layout(&moved, &child, &config(), &inherited, LIMITS, || false).unwrap();
+        let f = Fixture::new();
+        let baseline = Baseline::scratch(&f.root, LIMITS, || false).unwrap();
+        let mut receipt = None;
+        export_created_with_resources(
+            &f.root,
+            &f.dest,
+            &config(),
+            Some(&baseline),
+            LIMITS,
+            None,
+            Some((&mut receipt, 1)),
+            || false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(receipt.is_none());
+        assert!(f.dest.join("index.json").exists());
+        f.load();
+    }
+
     #[test]
     fn measured_resource_exports_preserve_flattened_and_layered_results() {
         for layered in [false, true] {
@@ -339,6 +417,7 @@ mod tests {
                 baseline.as_ref(),
                 LIMITS,
                 Some(&policy),
+                None,
                 || false,
                 || Ok(()),
             )
@@ -916,6 +995,7 @@ pub(crate) fn export_created_with_resources(
     baseline: Option<&Baseline>,
     limits: Limits,
     resources: Option<&crate::build_resources::Policy>,
+    receipt: Option<(&mut Option<crate::rootfs::ReplayReceipt>, u64)>,
     cancelled: impl Fn() -> bool,
     created: impl FnOnce() -> io::Result<()>,
 ) -> Result<Descriptor, Error> {
@@ -930,7 +1010,7 @@ pub(crate) fn export_created_with_resources(
             created,
             baseline,
             resources,
-            linux::SourceState::Archived,
+            linux::SourceState::Archived(receipt),
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -942,6 +1022,7 @@ pub(crate) fn export_created_with_resources(
             baseline,
             limits,
             resources,
+            receipt,
             cancelled,
             created,
         );
@@ -1534,9 +1615,9 @@ mod linux {
         store.ingest(bytes, &d, bytes.len() as u64, c)?;
         Ok(d)
     }
-    pub(super) enum SourceState {
+    pub(super) enum SourceState<'a> {
         Observed,
-        Archived,
+        Archived(Option<(&'a mut Option<crate::rootfs::ReplayReceipt>, u64)>),
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1549,7 +1630,7 @@ mod linux {
         created: impl FnOnce() -> std::io::Result<()>,
         baseline: Option<&Baseline>,
         resources: Option<&crate::build_resources::Policy>,
-        source_state: SourceState,
+        source_state: SourceState<'_>,
     ) -> Result<Descriptor, Error> {
         check(c)?;
         // Our writer emits at most PAX + GNU long path + GNU long link + entry
@@ -1757,7 +1838,7 @@ mod linux {
             output["history"] = json!([{"created_by":"Weld flattened rootfs export", "comment":"Full filesystem snapshot; original layer history replaced."}]);
             vec![layer]
         };
-        if let (SourceState::Archived, Some(plan)) = (source_state, &plan) {
+        if let (SourceState::Archived(_), Some(plan)) = (&source_state, &plan) {
             delta::restore_observed_links(root, &plan.inventory, c)?;
         }
         let config = blob(&store, CONFIG, &json_bytes(&output, &mut remaining)?, c)?;
@@ -1775,6 +1856,14 @@ mod linux {
             &json!({"schemaVersion":2,"mediaType":INDEX,"manifests":[manifest]}),
             &mut remaining,
         )?;
+        let receipt = if let SourceState::Archived(Some((_, limit))) = &source_state {
+            let plan = plan
+                .as_ref()
+                .ok_or(Error::Invalid("root handoff requires layered export"))?;
+            delta::exported_receipt(root, &plan.inventory, &output, &mut remaining, *limit, c)?
+        } else {
+            None
+        };
         check(c)?;
         OpenOptions::new()
             .write(true)
@@ -1788,6 +1877,9 @@ mod linux {
         pending
             .persist_noclobber(dest.join("index.json"))
             .map_err(|e| Error::Io(e.error))?;
+        if let SourceState::Archived(Some((slot, _))) = source_state {
+            *slot = receipt;
+        }
         Ok(manifest)
     }
 }

@@ -1416,6 +1416,39 @@ struct StageResult {
     work: PathBuf,
     image: Option<BuildResult>,
     args: BTreeMap<String, String>,
+    prepared: Option<PreparedStage>,
+}
+
+struct PreparedStage {
+    receipt: rootfs::ReplayReceipt,
+    manifest: Descriptor,
+    replay_usage: (u64, usize),
+}
+
+/// COPY may observe symlinks and change source atimes, so only FROM-only parents
+/// are eligible. Their last selected reader can consume the exclusively owned root.
+fn root_handoffs(plan: &build_plan::BuildPlan, selected: &[usize]) -> BTreeMap<usize, usize> {
+    let mut last_from = BTreeMap::new();
+    let mut copied = std::collections::BTreeSet::new();
+    for &n in selected {
+        if let Base::Stage(base) = plan.stages[n].base {
+            last_from.insert(base, n);
+        }
+        for instruction in &plan.stages[n].instructions {
+            if let I::Copy {
+                from: Some(CopySource::Stage(base)),
+                ..
+            } = instruction.kind
+            {
+                copied.insert(base);
+            }
+        }
+    }
+    last_from
+        .into_iter()
+        .filter(|(base, _)| !copied.contains(base))
+        .map(|(base, child)| (child, base))
+        .collect()
 }
 
 fn copy_input(
@@ -1495,7 +1528,7 @@ fn verify_fresh_checkpoint(
     limits: Limits,
     resources: Option<&crate::build_resources::Policy>,
     cancelled: &impl Fn() -> bool,
-) -> Result<Descriptor> {
+) -> Result<(Descriptor, (u64, usize))> {
     let metadata = image::load_layout(layout, None, limits.image, cancelled)?;
     let base_layers = base.map_or(&[][..], |m| m.layers.as_slice());
     let base_ids = base.map_or(&[][..], |m| m.diff_ids.as_slice());
@@ -1521,7 +1554,7 @@ fn verify_fresh_checkpoint(
     );
     let descriptor = metadata.layers.last().unwrap();
     check_spool_space(resources, spool, descriptor)?;
-    layer::verify(
+    let verified = layer::verify(
         &BlobStore::open(layout)?,
         descriptor,
         metadata.diff_ids.last().unwrap(),
@@ -1529,7 +1562,19 @@ fn verify_fresh_checkpoint(
         budget,
         cancelled,
     )?;
-    Ok(metadata.selected)
+    Ok((
+        metadata.selected,
+        (
+            base_usage
+                .0
+                .checked_add(verified.size())
+                .ok_or("replay byte count overflow")?,
+            base_usage
+                .1
+                .checked_add(verified.physical_header_count())
+                .ok_or("replay entry count overflow")?,
+        ),
+    ))
 }
 
 struct StageCache<'a> {
@@ -1630,6 +1675,7 @@ fn export_stage(
     baseline: Option<&export::Baseline>,
     limits: export::Limits,
     resources: Option<&crate::build_resources::Policy>,
+    receipt: Option<(&mut Option<rootfs::ReplayReceipt>, u64)>,
     cancelled: &impl Fn() -> bool,
     created: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<Descriptor> {
@@ -1640,6 +1686,7 @@ fn export_stage(
         baseline,
         limits,
         resources,
+        receipt,
         cancelled,
         created,
     )?)
@@ -2094,6 +2141,12 @@ fn build_inner_checked(
             Base::Image(_) => None,
         })
         .collect();
+    let handoffs = if options.no_cache && options.export_mode == ExportMode::Layered {
+        root_handoffs(&plan, &selected)
+    } else {
+        BTreeMap::new()
+    };
+    let mut receipts_remaining = options.limits.export.max_metadata_bytes;
     for n in selected {
         let mut stage_options = options.clone();
         if n != target {
@@ -2105,6 +2158,18 @@ fn build_inner_checked(
             options.progress,
             format!("Stage {}/{}", n + 1, plan.stages.len()),
         );
+        let prepared_base = handoffs.get(&n).and_then(|base| {
+            let parent: &mut StageResult = previous.get_mut(base)?;
+            parent
+                .prepared
+                .take()
+                .map(|prepared| (parent.work.join("rootfs"), prepared))
+        });
+        if let Some((_, prepared)) = &prepared_base {
+            receipts_remaining = receipts_remaining
+                .checked_add(prepared.receipt.metadata_bytes())
+                .ok_or("root receipt metadata overflow")?;
+        }
         let result = build_stage(
             &plan,
             n,
@@ -2116,6 +2181,11 @@ fn build_inner_checked(
             record.as_deref_mut(),
             n == target,
             !options.no_cache || n == target || inherited_stages.contains(&n),
+            prepared_base,
+            handoffs
+                .values()
+                .any(|&parent| parent == n)
+                .then_some(receipts_remaining),
             lease,
             resources,
             || {
@@ -2123,7 +2193,13 @@ fn build_inner_checked(
                 cancelled()
             },
         );
-        previous.insert(n, result?);
+        let result = result?;
+        if let Some(prepared) = &result.prepared {
+            receipts_remaining = receipts_remaining
+                .checked_sub(prepared.receipt.metadata_bytes())
+                .ok_or("retained root receipts exceed metadata budget")?;
+        }
+        previous.insert(n, result);
         phase.finish();
     }
     previous
@@ -2146,6 +2222,8 @@ fn build_stage(
     mut record: Option<&mut crate::build_record::BuildRecord>,
     final_stage: bool,
     export_image: bool,
+    prepared_base: Option<(PathBuf, PreparedStage)>,
+    prepare_handoff: Option<u64>,
     lease: Option<&crate::store_lease::StoreLease>,
     resources: Option<&crate::build_resources::Policy>,
     cancelled: impl Fn() -> bool,
@@ -2442,24 +2520,63 @@ fn build_stage(
     let root = work.join("rootfs");
     let spool = work.join("spool");
     let state = work.join("state");
-    create_image_root(&root)?;
     for p in [&spool, &state] {
         fs::create_dir(p)?;
     }
     let mut base_replay_usage = (0u64, 0usize);
-    let mut replay_receipt = if export_image
+    let mut transferred = false;
+    let mut replay_receipt = None;
+    if let Some((source, prepared)) = prepared_base {
+        let m = metadata
+            .as_ref()
+            .ok_or("prepared root base metadata missing")?;
+        if prepared.manifest != m.selected
+            || prepared.replay_usage.0 > options.limits.max_replay_bytes
+            || prepared.replay_usage.1 > options.limits.max_replay_entries
+        {
+            return Err("prepared root image identity or replay limits changed".into());
+        }
+        prepared.receipt.validate(&source, &m.diff_ids)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if fs::metadata(&source)?.dev() == fs::metadata(&work)?.dev() {
+                check(&cancelled)?;
+                match fs::rename(&source, &root) {
+                    Ok(()) => {
+                        prepared.receipt.validate(&root, &m.diff_ids)?;
+                        root_budget(&root, options.limits, &cancelled)?;
+                        base_replay_usage = prepared.replay_usage;
+                        replay_receipt = Some(prepared.receipt);
+                        transferred = true;
+                        if options.progress {
+                            eprintln!(
+                                "[weld]   Reusing owned parent filesystem at its last FROM use (no replay)"
+                            );
+                        }
+                    }
+                    // Separate bind mounts can share st_dev while refusing rename.
+                    Err(error) if error.raw_os_error() == Some(libc::EXDEV) => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    if !transferred {
+        create_image_root(&root)?;
+    }
+    if !transferred
+        && export_image
         && options.export_mode == ExportMode::Layered
         && !cache_hit
         && metadata.is_some()
     {
-        Some(rootfs::ReplayReceipt::new(
+        replay_receipt = Some(rootfs::ReplayReceipt::new(
             &root,
             options.limits.export.max_metadata_bytes,
-        )?)
-    } else {
-        None
-    };
-    if let (Some(m), Some(p)) = (&metadata, &base_path) {
+        )?);
+    }
+    if !transferred && let (Some(m), Some(p)) = (&metadata, &base_path) {
         let store = BlobStore::open(p)?;
         let mut bytes = 0u64;
         let mut entries = 0usize;
@@ -2854,6 +2971,7 @@ fn build_stage(
                 baseline.as_ref(),
                 options.limits.export,
                 resources,
+                None,
                 &|| {
                     phase.tick();
                     cancelled()
@@ -2886,6 +3004,7 @@ fn build_stage(
                     resources,
                     &verifying,
                 )?
+                .0
             } else {
                 restore_checkpoint(
                     &snapshot,
@@ -2945,9 +3064,12 @@ fn build_stage(
             work,
             image: None,
             args,
+            prepared: None,
         });
     }
     let mut output_reuses_checkpoint = false;
+    let mut exported_receipt = None;
+    let mut verified_replay_usage = None;
     let output_phase = crate::progress::Phase::start(
         options.progress,
         "  Publishing stage image (export or verified cache reuse)",
@@ -3017,6 +3139,7 @@ fn build_stage(
             baseline.as_ref(),
             options.limits.export,
             resources,
+            prepare_handoff.map(|limit| (&mut exported_receipt, limit)),
             &output_cancelled,
             || {
                 #[cfg(target_os = "linux")]
@@ -3044,7 +3167,7 @@ fn build_stage(
             cancelled()
         };
         let verified = if baseline.is_some() {
-            verify_fresh_checkpoint(
+            let (verified, usage) = verify_fresh_checkpoint(
                 &output,
                 &config["config"],
                 metadata.as_ref(),
@@ -3053,7 +3176,9 @@ fn build_stage(
                 options.limits,
                 resources,
                 &verification_cancelled,
-            )?
+            )?;
+            verified_replay_usage = Some(usage);
+            verified
         } else if output_reuses_checkpoint {
             // The last instruction already restored this exact snapshot. Copying
             // its OCI blobs does not touch rootfs; verify the output without
@@ -3102,6 +3227,15 @@ fn build_stage(
             &cancelled,
         )?;
     }
+    let prepared = if let Some(receipt) = exported_receipt {
+        Some(PreparedStage {
+            receipt,
+            manifest: manifest.clone(),
+            replay_usage: verified_replay_usage.ok_or("exported root verification missing")?,
+        })
+    } else {
+        None
+    };
     Ok(StageResult {
         work: work.clone(),
         image: Some(BuildResult {
@@ -3110,6 +3244,7 @@ fn build_stage(
             work,
         }),
         args,
+        prepared,
     })
 }
 

@@ -277,6 +277,49 @@ fn log(output: &Output) -> String {
 }
 
 #[test]
+#[ignore = "requires root and CAP_SYS_ADMIN; separate tmpfs work filesystem"]
+fn inherited_root_on_another_filesystem_falls_back_to_verified_replay() {
+    let fixture = Fixture::new(16384);
+    fs::write(fixture.path("context/payload"), b"original").unwrap();
+    let output = fixture.build(
+        "FROM scratch AS parent\nCOPY payload /payload\nFROM parent\nLABEL child=yes\n",
+        64 << 20,
+    );
+    assert!(output.status.success(), "{}", log(&output));
+    assert!(
+        !log(&output).contains("Reusing owned parent filesystem"),
+        "{}",
+        log(&output)
+    );
+    assert_eq!(
+        fs::read(fixture.path("limited/work/rootfs/payload")).unwrap(),
+        b"original"
+    );
+    let runs: Vec<_> = fs::read_dir(fixture.path("store"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("build-")
+        })
+        .collect();
+    assert_eq!(runs.len(), 1);
+    let parent = runs[0].join("stages/stage-0-work/rootfs");
+    assert!(
+        parent.is_dir(),
+        "cross-filesystem fallback must retain original root"
+    );
+    assert_ne!(
+        fs::metadata(parent).unwrap().dev(),
+        fs::metadata(fixture.path("limited/work/rootfs"))
+            .unwrap()
+            .dev()
+    );
+}
+
+#[test]
 #[ignore = "requires root and CAP_SYS_ADMIN; disposable 512 MiB tmpfs"]
 fn copy_reserves_prepared_allocation_before_creating_destination() {
     let fixture = Fixture::new(16384);
@@ -301,6 +344,64 @@ fn copy_reserves_prepared_allocation_before_creating_destination() {
         log(&output)
     );
     assert!(!fixture.path("output").exists());
+}
+
+#[test]
+#[ignore = "requires root and CAP_SYS_ADMIN; separate bind mount on the same device"]
+fn inherited_root_across_bind_mounts_falls_back_to_verified_replay() {
+    struct Bind(CString);
+    impl Drop for Bind {
+        fn drop(&mut self) {
+            assert_eq!(
+                unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) },
+                0
+            );
+        }
+    }
+    let fixture = Fixture::new(16384);
+    for path in ["destination", "bound"] {
+        fs::create_dir(fixture.path(path)).unwrap();
+    }
+    let source = CString::new(fixture.path("destination").as_os_str().as_bytes()).unwrap();
+    let target = CString::new(fixture.path("bound").as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let _bind = Bind(target);
+    fs::write(fixture.path("context/payload"), b"original").unwrap();
+    let output = fixture.build_at(
+        "FROM scratch AS parent\nCOPY payload /payload\nFROM parent\nLABEL child=yes\n",
+        64 << 20,
+        "bound/work",
+        "output",
+        || {},
+    );
+    assert!(output.status.success(), "{}", log(&output));
+    assert!(!log(&output).contains("Reusing owned parent filesystem"));
+    assert_eq!(
+        fs::read(fixture.path("bound/work/rootfs/payload")).unwrap(),
+        b"original"
+    );
+    let parent = fs::read_dir(fixture.path("store"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("stages/stage-0-work/rootfs"))
+        .find(|path| path.is_dir())
+        .unwrap();
+    assert_eq!(
+        fs::metadata(parent).unwrap().dev(),
+        fs::metadata(fixture.path("bound/work/rootfs"))
+            .unwrap()
+            .dev()
+    );
 }
 
 #[test]

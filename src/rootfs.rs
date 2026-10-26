@@ -66,8 +66,8 @@ pub fn apply_layer(
     }
 }
 
-/// Build-private evidence from applying verified layers to a fresh, owned root.
-/// Symlink targets are recorded at creation, without reading the resulting links.
+/// Build-private evidence from verified replay or an engine export of an owned root.
+/// Symlink targets come from creation or the export inventory, without rereading links.
 pub(crate) struct ReplayReceipt {
     #[cfg(target_os = "linux")]
     root: std::fs::File,
@@ -80,6 +80,52 @@ pub(crate) struct ReplayReceipt {
 }
 
 impl ReplayReceipt {
+    /// Export-private evidence for a stable root whose complete layered snapshot
+    /// was just written. Targets come from that snapshot, never a second readlink.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_export<'a>(
+        root: &Path,
+        diff_ids: &[crate::oci::Sha256Digest],
+        targets: impl IntoIterator<Item = ((u64, u64), &'a Path)>,
+        metadata_limit: u64,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self, Error> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root)?;
+        let mut receipt = Self {
+            root: file,
+            targets: Default::default(),
+            diff_ids: Vec::new(),
+            remaining: metadata_limit,
+            charged: 0,
+            valid: true,
+        };
+        for diff in diff_ids {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            receipt.charge(128)?;
+            receipt.diff_ids.push(diff.clone());
+        }
+        for (identity, target) in targets {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            receipt.charge(target.as_os_str().len() as u64 + 128)?;
+            if receipt
+                .targets
+                .insert(identity, target.to_owned())
+                .is_some()
+            {
+                return Err(Error::Invalid("duplicate exported symlink identity"));
+            }
+        }
+        Ok(receipt)
+    }
+
     pub(crate) fn new(root: &Path, metadata_limit: u64) -> Result<Self, Error> {
         #[cfg(target_os = "linux")]
         {
@@ -166,7 +212,6 @@ impl ReplayReceipt {
         self.targets.get(&identity).map(std::path::PathBuf::as_path)
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn metadata_bytes(&self) -> u64 {
         self.charged
     }

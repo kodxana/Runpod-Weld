@@ -64,6 +64,52 @@ pub(super) struct Inventory {
     pub(super) entries: BTreeMap<PathBuf, Node>,
 }
 
+pub(super) fn exported_receipt(
+    root: &Path,
+    inventory: &Inventory,
+    config: &Value,
+    remaining: &mut u64,
+    receipt_limit: u64,
+    c: &impl Fn() -> bool,
+) -> Result<Option<crate::rootfs::ReplayReceipt>, Error> {
+    let diff_ids = config["rootfs"]["diff_ids"].as_array()
+        .ok_or(Error::Invalid("exported diff IDs missing"))?;
+    let ids_bytes = (diff_ids.len() as u64).checked_mul(128)
+        .ok_or(Error::Limit("root receipt metadata"))?;
+    let mut receipt_bytes = ids_bytes;
+    for (path, node) in &inventory.entries {
+        check(c)?;
+        if node.anchor == *path && let Some(target) = &node.target {
+            receipt_bytes = receipt_bytes.checked_add(target.as_os_str().len() as u64)
+                .and_then(|n| n.checked_add(128))
+                .ok_or(Error::Limit("root receipt metadata"))?;
+        }
+    }
+    // Handoff is optional. Preserve a valid export when retaining its receipt
+    // would exceed either the export budget or the budget shared by stages.
+    if receipt_bytes > receipt_limit
+        || receipt_bytes.checked_add(ids_bytes).is_none_or(|n| n > *remaining) {
+        return Ok(None);
+    }
+    let mut ids = Vec::new();
+    for value in diff_ids {
+        check(c)?;
+        charge(remaining, 128)?;
+        ids.push(value.as_str().ok_or(Error::Invalid("invalid exported diff ID"))?
+            .parse().map_err(Error::Blob)?);
+    }
+    let receipt = crate::rootfs::ReplayReceipt::from_export(
+        root, &ids,
+        inventory.entries.iter().filter_map(|(path, node)| {
+            (node.anchor == *path).then_some(node.target.as_deref()).flatten()
+                .map(|target| (identity(&node.metadata), target))
+        }),
+        (*remaining).min(receipt_limit), c,
+    ).map_err(Error::Replay)?;
+    charge(remaining, receipt.metadata_bytes())?;
+    Ok(Some(receipt))
+}
+
 /// Repair only readlink-induced atime changes at an engine checkpoint.
 /// Checkpoints never promise ctime preservation; standalone capture does.
 pub(super) fn restore_observed_links(root: &Path, inventory: &Inventory, c: &impl Fn() -> bool) -> Result<(), Error> {

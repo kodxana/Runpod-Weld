@@ -29,6 +29,219 @@ fn stages(root: &Path) -> PathBuf {
 }
 
 #[test]
+fn no_cache_last_from_consumer_takes_owned_root_without_changing_parent_image() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    let t = tempfile::tempdir().unwrap();
+    let mut o = options(t.path());
+    o.no_cache = true;
+    o.export_mode = build::ExportMode::Layered;
+    fs::create_dir(o.context.join("tree")).unwrap();
+    write(&o.context.join("tree/file"), "original");
+    fs::set_permissions(
+        o.context.join("tree/file"),
+        fs::Permissions::from_mode(0o440),
+    )
+    .unwrap();
+    symlink("file", o.context.join("tree/link")).unwrap();
+    write(&o.context.join("replacement"), "child-only");
+    let source = "FROM scratch AS parent\nCOPY --chown=123:456 tree /tree\nENV INHERITED=yes\nFROM parent AS earlier\nCOPY replacement /earlier\nFROM parent\nCOPY replacement /tree/file\nCOPY --from=earlier /earlier /earlier\n";
+    build::build(source, &o, never_cancel).unwrap();
+    let intermediate = stages(t.path());
+    assert!(
+        !intermediate.join("stage-0-work/rootfs").exists(),
+        "last FROM consumer must take the parent root"
+    );
+    assert!(
+        intermediate.join("stage-1-work/rootfs").exists(),
+        "COPY source remains available"
+    );
+    assert_eq!(
+        fs::read(o.work.join("rootfs/tree/file")).unwrap(),
+        b"child-only"
+    );
+    assert_eq!(
+        fs::read(o.work.join("rootfs/earlier")).unwrap(),
+        b"child-only"
+    );
+    let original = fs::metadata(intermediate.join("stage-1-work/rootfs/tree/file")).unwrap();
+    assert_eq!(
+        (original.uid(), original.gid(), original.mode() & 0o777),
+        (123, 456, 0o440)
+    );
+    assert_eq!(
+        fs::read(intermediate.join("stage-1-work/rootfs/tree/file")).unwrap(),
+        b"original"
+    );
+    assert_eq!(
+        fs::read_link(o.work.join("rootfs/tree/link")).unwrap(),
+        Path::new("file")
+    );
+    let parent = image::load_layout(
+        intermediate.join("stage-0-image"),
+        None,
+        o.limits.image,
+        never_cancel,
+    )
+    .unwrap();
+    let child = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+    assert!(child.layers.starts_with(&parent.layers));
+    assert!(child.diff_ids.starts_with(&parent.diff_ids));
+    assert_eq!(child.layers.len(), parent.layers.len() + 1);
+    assert!(
+        child.config["config"]["Env"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("INHERITED=yes"))
+    );
+    let store = rpweld::oci::BlobStore::open(intermediate.join("stage-0-image")).unwrap();
+    let spool = t.path().join("parent-check");
+    fs::create_dir(&spool).unwrap();
+    let mut verified = layer::verify(
+        &store,
+        &parent.layers[0],
+        &parent.diff_ids[0],
+        &spool,
+        o.limits.layer,
+        never_cancel,
+    )
+    .unwrap();
+    let restored = t.path().join("parent-root");
+    fs::create_dir(&restored).unwrap();
+    rpweld::rootfs::apply_layer(&restored, &mut verified, never_cancel).unwrap();
+    assert_eq!(fs::read(restored.join("tree/file")).unwrap(), b"original");
+}
+
+#[test]
+fn root_handoff_preserves_link_topology_metadata_and_empty_children() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    let t = tempfile::tempdir().unwrap();
+    let mut o = options(t.path());
+    o.no_cache = true;
+    o.export_mode = build::ExportMode::Layered;
+    local_base(&mut o, t.path(), |root| {
+        fs::write(root.join("file"), b"shared payload").unwrap();
+        fs::set_permissions(root.join("file"), fs::Permissions::from_mode(0o450)).unwrap();
+        std::os::unix::fs::chown(root.join("file"), Some(123), Some(456)).unwrap();
+        fs::hard_link(root.join("file"), root.join("alias")).unwrap();
+        symlink("/file", root.join("link")).unwrap();
+        fs::hard_link(root.join("link"), root.join("link-alias")).unwrap();
+    });
+    build::build("FROM local AS first\nENV VALUE=first\nFROM first AS second\nENV VALUE=second\nFROM second\nLABEL done=yes\n", &o, never_cancel).unwrap();
+    let intermediate = stages(t.path());
+    for n in [0, 1] {
+        assert!(!intermediate.join(format!("stage-{n}-work/rootfs")).exists());
+        assert!(
+            intermediate
+                .join(format!("stage-{n}-image/index.json"))
+                .is_file()
+        );
+    }
+    let root = o.work.join("rootfs");
+    let file = fs::symlink_metadata(root.join("file")).unwrap();
+    assert_eq!(
+        file.ino(),
+        fs::symlink_metadata(root.join("alias")).unwrap().ino()
+    );
+    assert_eq!(
+        (file.uid(), file.gid(), file.mode() & 0o777),
+        (123, 456, 0o450)
+    );
+    let link = fs::symlink_metadata(root.join("link")).unwrap();
+    assert_eq!(
+        link.ino(),
+        fs::symlink_metadata(root.join("link-alias")).unwrap().ino()
+    );
+    let output = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+    let layout = o.bases["local"].layout.clone();
+    let base = image::load_layout(&layout, None, o.limits.image, never_cancel).unwrap();
+    assert!(output.layers.starts_with(&base.layers));
+    assert_eq!(output.layers.len(), base.layers.len() + 3);
+    for layer in &output.layers[base.layers.len()..] {
+        let archive = fs::File::open(
+            o.output
+                .join("blobs/sha256")
+                .join(layer.digest.split(':').nth(1).unwrap()),
+        )
+        .unwrap();
+        let names: Vec<_> = tar::Archive::new(archive)
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![PathBuf::from(".")],
+            "metadata-only children must not re-emit untouched files"
+        );
+    }
+    assert_eq!(
+        output.config["config"]["Env"],
+        serde_json::json!(["VALUE=second"])
+    );
+}
+
+#[test]
+fn copied_parents_and_flattened_or_cached_builds_keep_separate_roots() {
+    for (mode, no_cache, copy) in [
+        (build::ExportMode::Layered, true, true),
+        (build::ExportMode::Flattened, true, false),
+        (build::ExportMode::Layered, false, false),
+    ] {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        o.no_cache = no_cache;
+        o.export_mode = mode;
+        write(&o.context.join("payload"), "original");
+        let source = format!(
+            "FROM scratch AS parent\nCOPY payload /payload\nFROM parent\n{}",
+            if copy {
+                "COPY --from=parent /payload /copy\n"
+            } else {
+                "LABEL child=yes\n"
+            }
+        );
+        build::build(&source, &o, never_cancel).unwrap();
+        assert!(
+            stages(t.path())
+                .join("stage-0-work/rootfs/payload")
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(o.work.join("rootfs/payload")).unwrap(),
+            b"original"
+        );
+    }
+}
+
+#[test]
+fn handoff_cancellation_retains_owned_child_root_without_publishing() {
+    let t = tempfile::tempdir().unwrap();
+    let mut o = options(t.path());
+    o.no_cache = true;
+    o.export_mode = build::ExportMode::Layered;
+    write(&o.context.join("payload"), "original");
+    let cancelled: &dyn Fn() -> bool = &|| o.work.join("rootfs").exists();
+    let error = build::build(
+        "FROM scratch AS parent\nCOPY payload /payload\nFROM parent\nLABEL child=yes\n",
+        &o,
+        cancelled,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().to_lowercase().contains("cancel"),
+        "{error}"
+    );
+    assert!(!o.output.exists());
+    assert_eq!(
+        fs::read(o.work.join("rootfs/payload")).unwrap(),
+        b"original"
+    );
+    let intermediate = stages(t.path());
+    assert!(!intermediate.join("stage-0-work/rootfs").exists());
+    assert!(intermediate.join("stage-0-image/index.json").is_file());
+}
+
+#[test]
 fn no_cache_copy_only_stages_keep_filesystems_without_images() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     for mode in [build::ExportMode::Layered, build::ExportMode::Flattened] {
@@ -97,9 +310,8 @@ fn no_cache_copy_only_cancellation_and_budget_failure_publish_nothing() {
         if !cancel {
             o.limits.max_rootfs_bytes = 1;
         }
-        let error = build::build(source, &o, || cancel && o.work.join("rootfs").exists())
-            .unwrap_err()
-            .to_string();
+        let cancelled: &dyn Fn() -> bool = &|| cancel && o.work.join("rootfs").exists();
+        let error = build::build(source, &o, cancelled).unwrap_err().to_string();
         assert!(
             error
                 .to_lowercase()
