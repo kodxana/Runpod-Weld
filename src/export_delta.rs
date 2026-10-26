@@ -164,8 +164,7 @@ fn inventory(
     )?;
     // All aliases' metadata is captured before any readlink can touch atime.
     type LinkGroup = (PathBuf, u64, u64, Option<[u8; 32]>, Option<PathBuf>);
-    let mut groups: HashMap<(u64, u64), LinkGroup> =
-        HashMap::new();
+    let mut groups: HashMap<(u64, u64), LinkGroup> = HashMap::new();
     let mut bytes = 0u64;
     for (path, node) in &mut entries {
         check(c)?;
@@ -275,6 +274,7 @@ pub(crate) fn capture(
     image_limits: crate::image::Limits,
     layer_limits: crate::layer::Limits,
     replay_limits: ReplayLimits,
+    admit: &impl Fn(CaptureAllocation<'_>) -> Result<(), Error>,
     c: &impl Fn() -> bool,
 ) -> Result<Baseline, Error> {
     check(c)?;
@@ -324,6 +324,10 @@ pub(crate) fn capture(
             bounded.max_entries = bounded
                 .max_entries
                 .min(replay_limits.max_entries.saturating_sub(entries));
+            admit(CaptureAllocation::Spool {
+                path: temp.path(),
+                descriptor,
+            })?;
             let mut layer =
                 crate::layer::verify(&store, descriptor, diff_id, temp.path(), bounded, c)
                     .map_err(Error::Layer)?;
@@ -333,6 +337,10 @@ pub(crate) fn capture(
             entries = entries
                 .checked_add(layer.physical_header_count())
                 .ok_or(Error::Limit("replay entries"))?;
+            admit(CaptureAllocation::Replay {
+                root: &replay,
+                layer: &layer,
+            })?;
             crate::rootfs::apply_layer(&replay, &mut layer, c).map_err(Error::Replay)?;
         }
         let mut remaining = limits.max_metadata_bytes;
@@ -653,7 +661,17 @@ pub(super) fn inherit(
             check(c)?;
             // Public output is mutable; only ManagedCache may share blob inodes.
             let file = source.open_verified(descriptor, state.blob_limit, c)?;
-            store.ingest(file, descriptor, state.blob_limit, c)?;
+            // Repeated descriptors retain their order but need only one payload.
+            match store.open_verified(descriptor, state.blob_limit, c) {
+                Ok(_) => (),
+                Err(crate::oci::Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                    store.ingest(file, descriptor, state.blob_limit, c)?;
+                }
+                Err(crate::oci::Error::Cancelled) => {
+                    return Err(Error::Blob(crate::oci::Error::Cancelled));
+                }
+                Err(e) => return Err(Error::Blob(crate::oci::Error::ExistingInvalid(Box::new(e)))),
+            }
         }
     }
     let mut ids: Vec<Value> = state
@@ -1298,6 +1316,158 @@ mod tests {
         assert_eq!(fs::read(&first_blob).unwrap(), mutated_output);
         assert_eq!(fs::read(&second_blob).unwrap(), original);
         load(&second); // Independent exported bytes still verify after both writes.
+    }
+
+    #[test]
+    fn inherited_existing_blobs_verify_both_stores_without_writing() {
+        for corrupt in [None, Some("base"), Some("output")] {
+            let temp = tempfile::tempdir_in("/tmp").unwrap();
+            let work = temp.path();
+            let root = work.join("root");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("app"), b"app").unwrap();
+            let base = work.join("base");
+            export_layout(&root, &base, &config(), LIMITS, || false).unwrap();
+            let current = work.join("current");
+            let image = replay(&base, &current, work);
+            let mut baseline = capture(&current, &base, work);
+            baseline.state.layers.push(image.layers[0].clone());
+            baseline.state.diff_ids.push(image.diff_ids[0].clone());
+            let history = json!([{"created_by":"first"}, {"created_by":"metadata", "empty_layer":true},
+                {"created_by":"repeated"}]);
+            baseline.state.history = Some(history.clone());
+            baseline.state.layers[1]
+                .annotations
+                .insert("fixture".into(), "second occurrence".into());
+            let descriptor = &image.layers[0];
+            let output = work.join("output");
+            fs::create_dir(&output).unwrap();
+            let store = BlobStore::open(&output).unwrap();
+            let relative =
+                Path::new("blobs/sha256").join(descriptor.digest.strip_prefix("sha256:").unwrap());
+            fs::copy(base.join(&relative), output.join(&relative)).unwrap();
+            if let Some(corrupt) = corrupt {
+                OpenOptions::new()
+                    .write(true)
+                    .open(work.join(corrupt).join(&relative))
+                    .unwrap()
+                    .write_all(b"corrupt")
+                    .unwrap();
+            }
+            let source_before = fs::read(base.join(&relative)).unwrap();
+            let output_before = fs::read(output.join(&relative)).unwrap();
+            let mut config = config();
+            let mut remaining = LIMITS.max_metadata_bytes;
+            let result = inherit(
+                &baseline,
+                &store,
+                descriptor,
+                &mut config,
+                &mut remaining,
+                &|| {
+                    assert_eq!(
+                        fs::read_dir(output.join("blobs/sha256")).unwrap().count(),
+                        1,
+                        "verified existing blobs must not allocate an ingestion spool"
+                    );
+                    false
+                },
+            );
+            match corrupt {
+                None => {
+                    let layers = result.unwrap();
+                    assert_eq!(&layers[..2], baseline.state.layers);
+                    assert_eq!(
+                        config["rootfs"]["diff_ids"],
+                        json!([descriptor.digest, descriptor.digest, descriptor.digest])
+                    );
+                    assert_eq!(
+                        &config["history"].as_array().unwrap()[..3],
+                        history.as_array().unwrap()
+                    );
+                }
+                Some("base") => assert!(matches!(
+                    result,
+                    Err(Error::Blob(crate::oci::Error::DigestMismatch))
+                )),
+                Some("output") => assert!(matches!(
+                    result,
+                    Err(Error::Blob(crate::oci::Error::ExistingInvalid(_)))
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(fs::read(base.join(&relative)).unwrap(), source_before);
+            assert_eq!(fs::read(output.join(&relative)).unwrap(), output_before);
+        }
+    }
+
+    #[test]
+    fn capture_admission_precedes_spool_and_apply_and_preserves_failure() {
+        use std::cell::Cell;
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let work = temp.path();
+        let root = work.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("app"), b"app").unwrap();
+        let base = work.join("base");
+        export_layout(&root, &base, &config(), LIMITS, || false).unwrap();
+        let current = work.join("current");
+        replay(&base, &current, work);
+        let workspace = work.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        for refuse_at in [0, 1] {
+            let calls = Cell::new(0);
+            let result = Baseline::capture_with_admission(
+                &current,
+                &base,
+                None,
+                &workspace,
+                LIMITS,
+                image_limits(),
+                layer_limits(),
+                ReplayLimits {
+                    max_bytes: LIMITS.max_layer_bytes,
+                    max_entries: LIMITS.max_entries,
+                },
+                |allocation| {
+                    match allocation {
+                        CaptureAllocation::Spool { path, descriptor } => {
+                            assert_eq!(calls.get(), 0);
+                            assert_eq!(descriptor.media_type, LAYER);
+                            assert_eq!(
+                                fs::read_dir(path).unwrap().count(),
+                                1,
+                                "spool already allocated"
+                            );
+                        }
+                        CaptureAllocation::Replay { root, layer } => {
+                            assert_eq!(calls.get(), 1);
+                            assert!(!layer.entries().is_empty());
+                            assert!(
+                                fs::read_dir(root).unwrap().next().is_none(),
+                                "layer already applied"
+                            );
+                        }
+                    }
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    if call == refuse_at {
+                        Err(Error::Io(io::Error::other("primary capacity refusal")))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || false,
+            );
+            assert!(
+                matches!(result, Err(Error::Io(e)) if e.to_string() == "primary capacity refusal")
+            );
+            assert_eq!(calls.get(), refuse_at + 1);
+            assert!(fs::read_dir(&workspace).unwrap().next().is_none());
+            assert_eq!(fs::read(current.join("app")).unwrap(), b"app");
+        }
+        // Public capture retains its logical-budget-only behavior.
+        capture(&current, &base, &workspace);
     }
 
     #[test]

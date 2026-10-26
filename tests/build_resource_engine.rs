@@ -57,6 +57,17 @@ impl Fixture {
     }
 
     fn build(&self, source: &str, root_limit: u64) -> Output {
+        self.build_at(source, root_limit, "limited/work", "output", || {})
+    }
+
+    fn build_at(
+        &self,
+        source: &str,
+        root_limit: u64,
+        work: &str,
+        output: &str,
+        mut observe: impl FnMut(),
+    ) -> Output {
         fs::write(self.path("context/Dockerfile"), source).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_rpweld"));
         command
@@ -80,9 +91,9 @@ impl Fixture {
             ])
             .arg(root_limit.to_string())
             .arg("--work-dir")
-            .arg(self.path("limited/work"))
+            .arg(self.path(work))
             .arg("--output")
-            .arg(self.path("output"));
+            .arg(self.path(output));
         if self.path("base").exists() {
             command
                 .arg("--base")
@@ -98,6 +109,7 @@ impl Fixture {
             .unwrap();
         let start = Instant::now();
         let status = loop {
+            observe();
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
@@ -173,6 +185,73 @@ impl Fixture {
         fs::create_dir_all(self.path("base/blobs/sha256")).unwrap();
         fs::write(self.path("base/blobs/sha256").join(&digest), bytes).unwrap();
         serde_json::json!({"mediaType":media,"digest":format!("sha256:{digest}"),"size":bytes.len()})
+    }
+
+    fn plain_layer(&self, entries: &[(&str, u8, u64, Option<&str>)]) -> serde_json::Value {
+        let mut tar = tar::Builder::new(tempfile::NamedTempFile::new_in(self.temp.path()).unwrap());
+        for &(path, kind, size, link) in entries {
+            let mut header = tar::Header::new_ustar();
+            header.set_path(path).unwrap();
+            header.set_entry_type(tar::EntryType::new(kind));
+            header.set_size(size);
+            header.set_mode(0o755);
+            if let Some(link) = link {
+                header.set_link_name(link).unwrap();
+            }
+            header.set_cksum();
+            tar.append(&header, std::io::repeat(0).take(size)).unwrap();
+        }
+        let mut tar = tar.into_inner().unwrap();
+        tar.seek(SeekFrom::Start(0)).unwrap();
+        let mut digest = Sha256::new();
+        let size = std::io::copy(&mut tar, &mut digest).unwrap();
+        let digest = format!("{:x}", digest.finalize());
+        fs::create_dir_all(self.path("base/blobs/sha256")).unwrap();
+        tar.persist(self.path("base/blobs/sha256").join(&digest))
+            .unwrap();
+        serde_json::json!({"mediaType":"application/vnd.oci.image.layer.v1.tar",
+            "digest":format!("sha256:{digest}"),"size":size})
+    }
+
+    fn plain_base(&self, layers: &[serde_json::Value]) {
+        let ids: Vec<_> = layers.iter().map(|layer| layer["digest"].clone()).collect();
+        let history: Vec<_> = (0..layers.len())
+            .map(|i| serde_json::json!({"created_by":format!("fixture layer {i}")}))
+            .collect();
+        let config = self.blob(
+            "application/vnd.oci.image.config.v1+json",
+            &serde_json::to_vec(
+                &serde_json::json!({"architecture":"amd64","os":"linux","config":{},
+                "rootfs":{"type":"layers","diff_ids":ids},"history":history}),
+            )
+            .unwrap(),
+        );
+        let manifest = self.blob("application/vnd.oci.image.manifest.v1+json", &serde_json::to_vec(
+            &serde_json::json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
+                "config":config,"layers":layers})).unwrap());
+        fs::write(
+            self.path("base/oci-layout"),
+            br#"{"imageLayoutVersion":"1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            self.path("base/index.json"),
+            serde_json::to_vec(&serde_json::json!({"schemaVersion":2,"manifests":[manifest]}))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn available(&self) -> u64 {
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: mount is a valid C path and stat points to writable storage.
+        assert_eq!(
+            unsafe { libc::statvfs(self.mount.as_ptr(), stat.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: successful statvfs initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        stat.f_bavail * stat.f_frsize
     }
 }
 
@@ -259,4 +338,118 @@ fn replay_reserves_shared_implicit_parents_once() {
             .count(),
         200
     );
+}
+
+#[test]
+#[ignore = "requires root and CAP_SYS_ADMIN; disposable 512 MiB tmpfs"]
+fn regression_baseline_admits_each_intermediate_replay_allocation() {
+    let fixture = Fixture::new(16384);
+    let first = fixture.plain_layer(&[("old", b'0', 120 << 20, None)]);
+    let second = fixture.plain_layer(&[
+        (".wh.old", b'0', 0, None),
+        ("payload", b'0', 60 << 20, None),
+        ("alias1", b'1', 0, Some("payload")),
+        ("alias2", b'1', 0, Some("payload")),
+        ("alias3", b'1', 0, Some("payload")),
+    ]);
+    fixture.plain_base(&[first, second]);
+    let mut minimum = fixture.available();
+    let output = fixture.build_at(
+        "FROM local\nLABEL changed=yes\n",
+        400 << 20,
+        "limited/work",
+        "output",
+        || minimum = minimum.min(fixture.available()),
+    );
+    eprintln!(
+        "baseline minimum free bytes: {minimum}; reserve: {}",
+        256 << 20
+    );
+    let root = fixture.path("limited/work/rootfs");
+    assert!(!root.join("old").exists());
+    let payload = fs::metadata(root.join("payload")).unwrap();
+    assert_eq!(payload.len(), 60 << 20, "initial replay must complete");
+    for name in ["alias1", "alias2", "alias3"] {
+        assert_eq!(fs::metadata(root.join(name)).unwrap().ino(), payload.ino());
+    }
+    assert!(!output.status.success(), "{}", log(&output));
+    assert!(minimum >= 256 << 20, "baseline crossed reserve: {minimum}");
+    assert!(
+        log(&output).contains("replaying verified layer")
+            && log(&output).contains("additional/reserved bytes"),
+        "{}",
+        log(&output)
+    );
+    assert!(!fixture.path("output").exists());
+    let mut remaining: Vec<_> = fs::read_dir(fixture.path("limited/work"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        ["rootfs", "spool", "state"],
+        "capture must clean its replay"
+    );
+}
+
+#[test]
+#[ignore = "requires root and CAP_SYS_ADMIN; disposable 512 MiB tmpfs"]
+fn regression_export_inherits_duplicate_blobs_without_temporary_copy() {
+    let fixture = Fixture::new(16384);
+    let layer = fixture.plain_layer(&[("base", b'0', 60 << 20, None)]);
+    fixture.plain_base(&[layer.clone(), layer.clone()]);
+    let mut filler = fs::File::create(fixture.path("limited/filler")).unwrap();
+    std::io::copy(&mut std::io::repeat(0).take(112 << 20), &mut filler).unwrap();
+    assert_eq!(fixture.available(), 400 << 20);
+    fs::File::create(fixture.path("context/delta"))
+        .unwrap()
+        .set_len(60 << 20)
+        .unwrap();
+    let mut minimum = fixture.available();
+    let output = fixture.build_at(
+        "FROM local\nCOPY delta /delta\n",
+        400 << 20,
+        "work",
+        "limited/output",
+        || minimum = minimum.min(fixture.available()),
+    );
+    eprintln!(
+        "duplicate export minimum free bytes: {minimum}; reserve: {}",
+        256 << 20
+    );
+    assert!(output.status.success(), "{}", log(&output));
+    assert!(
+        minimum >= 256 << 20,
+        "duplicate inheritance crossed reserve: {minimum}"
+    );
+    let read_blob = |descriptor: &serde_json::Value| {
+        let encoded = descriptor["digest"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(fixture.path("limited/output/blobs/sha256").join(encoded)).unwrap(),
+        )
+        .unwrap()
+    };
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.path("limited/output/index.json")).unwrap())
+            .unwrap();
+    let manifest = read_blob(&index["manifests"][0]);
+    assert_eq!(manifest["layers"].as_array().unwrap().len(), 3);
+    assert_eq!(manifest["layers"][0], layer);
+    assert_eq!(manifest["layers"][1], layer);
+    let config = read_blob(&manifest["config"]);
+    assert_eq!(config["rootfs"]["diff_ids"].as_array().unwrap().len(), 3);
+    assert_eq!(config["rootfs"]["diff_ids"][0], layer["digest"]);
+    assert_eq!(config["rootfs"]["diff_ids"][1], layer["digest"]);
+    assert_eq!(config["history"].as_array().unwrap().len(), 3);
+    for i in 0..2 {
+        assert_eq!(
+            config["history"][i],
+            serde_json::json!({"created_by":format!("fixture layer {i}")})
+        );
+    }
 }

@@ -43,6 +43,19 @@ pub struct Baseline {
     #[cfg(target_os = "linux")]
     state: linux::delta::State,
 }
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum CaptureAllocation<'a> {
+    Spool {
+        path: &'a Path,
+        descriptor: &'a Descriptor,
+    },
+    Replay {
+        root: &'a Path,
+        layer: &'a crate::layer::VerifiedLayer,
+    },
+}
+
 impl Baseline {
     /// Capture BEFORE any build instruction. `workspace` is an owned canonical
     /// directory for a bounded temporary replay, removed on return. Keep the
@@ -63,6 +76,33 @@ impl Baseline {
         replay_limits: ReplayLimits,
         cancelled: impl Fn() -> bool,
     ) -> Result<Self, Error> {
+        Self::capture_with_admission(
+            root,
+            layout,
+            reference,
+            workspace,
+            limits,
+            image_limits,
+            layer_limits,
+            replay_limits,
+            |_| Ok(()),
+            cancelled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_with_admission(
+        root: &Path,
+        layout: &Path,
+        reference: Option<&str>,
+        workspace: &Path,
+        limits: Limits,
+        image_limits: crate::image::Limits,
+        layer_limits: crate::layer::Limits,
+        replay_limits: ReplayLimits,
+        admit: impl Fn(CaptureAllocation<'_>) -> Result<(), Error>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Self, Error> {
         #[cfg(target_os = "linux")]
         {
             linux::delta::capture(
@@ -74,6 +114,7 @@ impl Baseline {
                 image_limits,
                 layer_limits,
                 replay_limits,
+                &admit,
                 &cancelled,
             )
         }
@@ -88,6 +129,7 @@ impl Baseline {
                 image_limits,
                 layer_limits,
                 replay_limits,
+                admit,
                 cancelled,
             );
             Err(Error::Invalid("export requires Linux"))

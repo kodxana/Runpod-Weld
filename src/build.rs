@@ -1074,6 +1074,7 @@ fn directory(root: &Path, image_path: &str, user: Option<&str>) -> Result<PathBu
 struct RootUsage {
     bytes: u64,
     entries: usize,
+    #[cfg(target_os = "linux")]
     unique_payload_bytes: u64,
 }
 
@@ -2365,8 +2366,6 @@ fn build_stage(
     for p in [&spool, &state] {
         fs::create_dir(p)?;
     }
-    let mut base_usage = RootUsage::default();
-    let mut largest_spool = 0u64;
     if let (Some(m), Some(p)) = (&metadata, &base_path) {
         let store = BlobStore::open(p)?;
         let mut bytes = 0u64;
@@ -2404,7 +2403,6 @@ fn build_stage(
             phase.finish();
             bytes += verified.size();
             entries += verified.physical_header_count();
-            largest_spool = largest_spool.max(verified.size());
             check_replay_space(resources, &root, &verified, &cancelled)?;
             let phase = crate::progress::Phase::start(
                 options.progress && options.verbose,
@@ -2433,7 +2431,7 @@ fn build_stage(
                 "{} | checking filesystem budgets",
                 crate::progress::count_bar(layer_index, m.layers.len())
             ));
-            base_usage = root_budget(&root, options.limits, &|| {
+            root_budget(&root, options.limits, &|| {
                 preparation.tick();
                 phase.tick();
                 cancelled()
@@ -2444,23 +2442,8 @@ fn build_stage(
         preparation.finish();
     }
     let baseline = if options.export_mode == ExportMode::Layered && !cache_hit {
-        resource_check(
-            resources,
-            "capturing layered baseline (measured root plus largest spool)",
-            &[crate::build_resources::Requirement {
-                path: work.clone(),
-                bytes: base_usage
-                    .unique_payload_bytes
-                    .checked_add(largest_spool)
-                    .and_then(|n| n.checked_add((base_usage.entries as u64).checked_mul(4096)?))
-                    .ok_or("baseline allocation estimate overflow")?,
-                inodes: (base_usage.entries as u64)
-                    .checked_add(8)
-                    .ok_or("baseline inode overflow")?,
-            }],
-        )?;
         Some(match (&base_path, binding) {
-            (Some(layout), Some(binding)) => export::Baseline::capture(
+            (Some(layout), Some(binding)) => export::Baseline::capture_with_admission(
                 &root,
                 layout,
                 binding.reference.as_deref(),
@@ -2471,6 +2454,17 @@ fn build_stage(
                 export::ReplayLimits {
                     max_bytes: options.limits.max_replay_bytes,
                     max_entries: options.limits.max_replay_entries,
+                },
+                |allocation| {
+                    match allocation {
+                        export::CaptureAllocation::Spool { path, descriptor } => {
+                            check_spool_space(resources, path, descriptor)
+                        }
+                        export::CaptureAllocation::Replay { root, layer } => {
+                            check_replay_space(resources, root, layer, &cancelled)
+                        }
+                    }
+                    .map_err(|e| export::Error::Io(io::Error::other(e)))
                 },
                 &cancelled,
             )?,
