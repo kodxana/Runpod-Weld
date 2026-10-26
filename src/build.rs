@@ -2882,21 +2882,38 @@ fn worker(
     for e in env {
         cmd.arg("--env").arg(e);
     }
+    #[cfg(target_os = "linux")]
+    let stop_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(target_os = "linux")]
+    let sinks = if options.progress {
+        use std::os::fd::AsFd;
+        Some((
+            crate::progress::RunOutput::new(io::stdout().as_fd(), stop_output.clone())?,
+            crate::progress::RunOutput::new(io::stderr().as_fd(), stop_output.clone())?,
+        ))
+    } else {
+        None
+    };
     if options.progress {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
-    let mut child = cmd.spawn()?;
-    let output = if options.progress {
+    #[cfg(target_os = "linux")]
+    let started = std::time::Instant::now();
+    let child = cmd.spawn()?;
+    #[cfg(target_os = "linux")]
+    let mut child = child;
+    #[cfg(target_os = "linux")]
+    let output = if let Some((out_sink, err_sink)) = sinks {
         let stdout = child.stdout.take().ok_or("missing RUN stdout pipe")?;
         let stderr = child.stderr.take().ok_or("missing RUN stderr pipe")?;
         let out_label = format!("{log_label} stdout");
         let err_label = format!("{log_label} stderr");
         Some((
             std::thread::spawn(move || {
-                crate::progress::forward_output(stdout, io::stdout(), &out_label)
+                crate::progress::forward_output(stdout, out_sink, &out_label)
             }),
             std::thread::spawn(move || {
-                crate::progress::forward_output(stderr, io::stderr(), &err_label)
+                crate::progress::forward_output(stderr, err_sink, &err_label)
             }),
         ))
     } else {
@@ -2904,14 +2921,35 @@ fn worker(
     };
     #[cfg(target_os = "linux")]
     {
+        use std::sync::atomic::Ordering;
+        let deadline = Duration::from_secs(timeout.saturating_add(5));
         let (status, stopped) = crate::lease_process::wait(
             &mut child,
-            c,
-            Duration::from_secs(timeout.saturating_add(5)),
+            &|| {
+                let cancelled = c();
+                if cancelled {
+                    stop_output.store(true, Ordering::Release);
+                }
+                cancelled
+            },
+            deadline,
         )?;
+        let mut output_stopped = false;
         if let Some((stdout, stderr)) = output {
+            // The command can exit before its output drains. Continue observing
+            // cancellation/deadline instead of joining a blocked external write.
+            while !stdout.is_finished() || !stderr.is_finished() {
+                if stopped || c() || started.elapsed() >= deadline {
+                    stop_output.store(true, Ordering::Release);
+                    output_stopped = true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let out = stdout.join().map_err(|_| "RUN stdout reader panicked");
             let err = stderr.join().map_err(|_| "RUN stderr reader panicked");
+            if stopped || output_stopped {
+                return Err("RUN/output cancelled/timed out; partial root retained".into());
+            }
             out??;
             err??;
         }
@@ -2925,7 +2963,7 @@ fn worker(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (child, output, timeout, c);
+        let _ = (child, timeout, c, log_label);
         Err("RUN requires Linux".into())
     }
 }

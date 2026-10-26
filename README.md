@@ -49,6 +49,16 @@ completed layers, not time or bytes; `--verbose` adds per-layer timings.
 registry-base reuse, final stage export and required inter-stage verification.
 Separate stdout/stderr streams do not guarantee a combined output order.
 
+RUN output applies backpressure to slow consumers without an unbounded queue.
+For forwarded pipe/socket output, cancellation or the RUN deadline (including the
+five-second supervisor allowance) also bounds draining after the command exits.
+If a consumer remains blocked, Weld stops forwarding, discards the undelivered
+tail and fails the build after the workload's descendants have been reaped.
+Normal output is fully delivered while the consumer drains within that deadline;
+quiet mode keeps its inherited, raw stdout/stderr behavior. Other CLI diagnostics
+and final results still require a draining consumer, and blocked filesystem I/O
+or uninterruptible descendants can still delay shutdown.
+
 The default Dockerfile is `CONTEXT/Dockerfile`. Short image names resolve explicitly to Docker Hub (`ubuntu:24.04` becomes `docker.io/library/ubuntu:24.04`). FROM images reuse fully verified local bases for Linux amd64 and pull on a miss; `--base NAME=LAYOUT` overrides that lookup. Equivalent references are resolved once per invocation. Tags are published only after a successful export; failed pushes retain local images and tags.
 
 Weld creates unique build directories under `${RPWELD_HOME:-$HOME/.local/share/rpweld}`. This directory must be private (0700), owned by the current user, and outside the context. Work, output images and published base generations are retained for inspection; failed registry staging is removed. There is no automatic garbage collection yet. Managed builds derive finite workload ceilings from observed filesystem/cgroup capacity and check current availability before work; diagnostics identify reserves, unknown observations and auto/explicit limits. `--max-rootfs-bytes`, `--max-layer-bytes`, `--metadata-budget`, and `--max-entries` remain hard ceilings. See [resource policy](docs/build-resources.md) for sizing and limitations. Temporary host DNS is enabled (`--no-host-dns` disables it). Explicit `--output` and `--work-dir` without a tag preserve legacy limits and DNS opt-in. Resource checks are not download/disk quotas. Registry transfers have a 15-minute timeout.

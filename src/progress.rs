@@ -8,6 +8,7 @@ const INTERVAL: Duration = Duration::from_secs(10);
 
 /// Bounded line framing for subprocess output, including CR progress redraws.
 /// Preserve payload bytes; quiet mode bypasses this formatter entirely.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn forward_output(
     mut input: impl std::io::Read,
     mut output: impl std::io::Write,
@@ -53,6 +54,108 @@ pub(crate) fn forward_output(
         emit(&mut line, &mut output)?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::RunOutput;
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::{
+        fs::{File, OpenOptions},
+        io::{self, Write},
+        os::{
+            fd::{AsRawFd, BorrowedFd},
+            unix::fs::OpenOptionsExt,
+        },
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    /// Interruptible pipe/socket writes without holding Rust's global stdio locks.
+    pub(crate) struct RunOutput {
+        file: File,
+        socket: bool,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl RunOutput {
+        pub(crate) fn new(fd: BorrowedFd<'_>, stop: Arc<AtomicBool>) -> io::Result<Self> {
+            let owned = fd.try_clone_to_owned()?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(owned.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+            let file = if matches!(kind, libc::S_IFIFO | libc::S_IFCHR) {
+                // dup shares file-status flags with the caller; reopen instead of
+                // changing O_NONBLOCK on an inherited pipe/terminal description.
+                OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+                    .open(format!("/proc/self/fd/{}", owned.as_raw_fd()))?
+            } else {
+                File::from(owned) // Preserve a regular file's offset and append mode.
+            };
+            Ok(Self {
+                file,
+                socket: kind == libc::S_IFSOCK,
+                stop,
+            })
+        }
+    }
+
+    impl Write for RunOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            loop {
+                let n = unsafe {
+                    if self.socket {
+                        libc::send(
+                            self.file.as_raw_fd(),
+                            bytes.as_ptr().cast(),
+                            bytes.len(),
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        )
+                    } else {
+                        libc::write(self.file.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                    }
+                };
+                if n >= 0 {
+                    return Ok(n as usize);
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    return Err(error);
+                }
+                if self.stop.load(Ordering::Acquire) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "RUN output consumer did not drain before cancellation/timeout",
+                    ));
+                }
+                let mut fd = libc::pollfd {
+                    fd: self.file.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut fd, 1, 25) } < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 }
 
 thread_local! {
@@ -174,6 +277,84 @@ fn update_due(last: &Cell<Duration>, elapsed: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pipe_and_socket_forwarding_keep_flags_and_all_bytes_until_cancelled() {
+        use std::{
+            fs::File,
+            io::{Read, Write},
+            os::{
+                fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd},
+                unix::net::UnixStream,
+            },
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+        fn pipe() -> (File, File) {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+        }
+        for (socket, cancel) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (mut reader, writer) = if socket {
+                let (reader, writer) = UnixStream::pair().unwrap();
+                unsafe {
+                    (
+                        File::from_raw_fd(reader.into_raw_fd()),
+                        File::from_raw_fd(writer.into_raw_fd()),
+                    )
+                }
+            } else {
+                pipe()
+            };
+            let original_flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut output = RunOutput::new(writer.as_fd(), stop.clone()).unwrap();
+            assert_eq!(
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) },
+                original_flags
+            );
+            drop(writer);
+            let forwarder = std::thread::spawn(move || output.write_all(&vec![b'x'; 1024 * 1024]));
+            let start = Instant::now();
+            loop {
+                let mut available = 0;
+                assert_eq!(
+                    unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut available) },
+                    0
+                );
+                if available > 0 {
+                    break;
+                }
+                assert!(start.elapsed() < Duration::from_secs(3));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!forwarder.is_finished());
+            if cancel {
+                stop.store(true, Ordering::Release);
+                let start = Instant::now();
+                while !forwarder.is_finished() && start.elapsed() < Duration::from_secs(2) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    forwarder.is_finished(),
+                    "blocked writer ignored cancellation"
+                );
+                assert_eq!(
+                    forwarder.join().unwrap().unwrap_err().kind(),
+                    std::io::ErrorKind::TimedOut
+                );
+            } else {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).unwrap();
+                forwarder.join().unwrap().unwrap();
+                assert_eq!(bytes, vec![b'x'; 1024 * 1024]);
+            }
+        }
+    }
+
     #[test]
     fn output_framing_handles_split_crlf_interrupts_and_write_errors() {
         use std::io::{self, Read};
