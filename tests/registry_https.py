@@ -386,6 +386,8 @@ else: sys.exit(1)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+    subprocess.run(['python3', str(Path(__file__).with_name('registry_preflight_https.py')),
+                    '--weld', weld], check=True)
     print('REGISTRY_HTTPS_PASS', flush=True)
 
 

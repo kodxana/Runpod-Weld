@@ -122,6 +122,88 @@ mod linux {
     };
     type Result<T> = std::result::Result<T, String>;
     const AUTH_CAP: u64 = 1024 * 1024;
+    // Skopeo buffers metadata internally (containers/image's fixed 4 MiB cap).
+    // These cap accepted stdout, not exact network bytes for smaller caller limits.
+    const METADATA_CAP: u64 = 4 * 1024 * 1024;
+    const TOTAL_METADATA_CAP: u64 = 3 * METADATA_CAP;
+    const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+    const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
+    const INDEX: &str = "application/vnd.oci.image.index.v1+json";
+    const DOCKER_INDEX: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ManifestDocument {
+        schema_version: u32,
+        media_type: String,
+        manifests: Option<Vec<crate::oci::Descriptor>>,
+        config: Option<crate::oci::Descriptor>,
+        layers: Option<Vec<crate::oci::Descriptor>>,
+        artifact_type: Option<serde_json::Value>,
+        subject: Option<serde_json::Value>,
+    }
+    fn document(bytes: &[u8]) -> Result<ManifestDocument> {
+        let doc: ManifestDocument =
+            serde_json::from_slice(bytes).map_err(|_| "invalid registry manifest JSON")?;
+        if doc.schema_version != 2 || doc.artifact_type.is_some() || doc.subject.is_some() {
+            return Err("unsupported registry manifest schema or artifact".into());
+        }
+        Ok(doc)
+    }
+    fn descriptor(d: &crate::oci::Descriptor) -> Result<()> {
+        d.digest
+            .parse::<crate::oci::Sha256Digest>()
+            .map_err(|_| "unsupported registry descriptor digest")?;
+        if d.size < 0 || d.extensions.contains_key("urls") || d.extensions.contains_key("data") {
+            return Err(
+                "invalid registry descriptor size or unsupported external/embedded content".into(),
+            );
+        }
+        Ok(())
+    }
+    fn native_platform(value: &serde_json::Value, config: bool) -> bool {
+        value.get("os").and_then(serde_json::Value::as_str) == Some("linux")
+            && value
+                .get("architecture")
+                .and_then(serde_json::Value::as_str)
+                == Some("amd64")
+            && ["variant", "os.version", "os.features"]
+                .iter()
+                .all(|key| value.get(key).is_none_or(|v| config && v.is_null()))
+    }
+    fn verify_metadata(bytes: &[u8], digest: &str, size: Option<i64>) -> Result<()> {
+        if size.is_some_and(|s| s < 0 || s as u64 != bytes.len() as u64)
+            || format!("sha256:{:x}", Sha256::digest(bytes)) != digest
+        {
+            return Err("registry metadata digest or size mismatch".into());
+        }
+        Ok(())
+    }
+    fn layer_sizes(layers: &[crate::oci::Descriptor], limits: crate::image::Limits) -> Result<u64> {
+        let mut total = 0u64;
+        for layer in layers {
+            descriptor(layer)?;
+            if !matches!(
+                layer.media_type.as_str(),
+                "application/vnd.oci.image.layer.v1.tar"
+                    | "application/vnd.oci.image.layer.v1.tar+gzip"
+                    | "application/vnd.docker.image.rootfs.diff.tar"
+                    | "application/vnd.docker.image.rootfs.diff.tar.gzip"
+            ) {
+                return Err("unsupported registry layer compression or media type (only tar/gzip supported)".into());
+            }
+            if layer.size as u64 > limits.max_layer_bytes {
+                return Err("manifest compressed layer bytes exceed image limit".into());
+            }
+            total = total
+                .checked_add(layer.size as u64)
+                .ok_or("manifest total compressed layer bytes overflow")?;
+            if total > limits.max_total_layer_bytes {
+                return Err("manifest total compressed layer bytes exceed image limit".into());
+            }
+        }
+        Ok(total)
+    }
 
     fn err(e: impl std::fmt::Display) -> String {
         e.to_string()
@@ -683,26 +765,200 @@ mod linux {
             };
             let diagnostic =
                 String::from_utf8_lossy(&reader.join().unwrap_or_default()).to_ascii_lowercase();
-            if status.success() {
-                return Ok(());
+            backend_status(status, &diagnostic)
+        }
+
+        fn inspect(
+            &self,
+            lease: &crate::store_lease::StoreLease,
+            reference: &str,
+            config: bool,
+            cap: u64,
+            deadline: Instant,
+            cancelled: &impl Fn() -> bool,
+        ) -> Result<Vec<u8>> {
+            if cancelled() || Instant::now() >= deadline {
+                return Err("registry preflight cancelled or timed out".into());
             }
-            let reason = if diagnostic.contains("x509") || diagnostic.contains("certificate") {
-                "TLS certificate verification failed; configure a trusted CA with --cert-dir"
-            } else if diagnostic.contains("unauthorized")
-                || diagnostic.contains("denied")
-                || diagnostic.contains("authentication")
-            {
-                "registry rejected authentication or repository permissions; check login and token scope"
-            } else if diagnostic.contains("manifest unknown") || diagnostic.contains("name unknown")
-            {
-                "image or tag not found"
-            } else {
-                "registry transfer failed; check connectivity, registry permissions and image compatibility"
+            let mut cmd = self.command(Some(lease))?;
+            cmd.args(["inspect", "--raw", "--tls-verify=true", "--authfile"])
+                .arg(&self.auth);
+            if config {
+                cmd.arg("--config");
+            }
+            if let Some(cert) = &self.cert {
+                cmd.arg("--cert-dir").arg(cert);
+            }
+            cmd.arg(format!("docker://{reference}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let (send, receive) = std::sync::mpsc::sync_channel::<std::process::ChildStdout>(1);
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader_stop = stop.clone();
+            // Reserve both readers before spawning; never leave a guarded child on thread failure.
+            let reader = std::thread::Builder::new()
+                .name("registry-metadata".into())
+                .spawn(move || {
+                    let mut bytes = Vec::new();
+                    let result = receive
+                        .recv()
+                        .map_err(|_| "registry metadata pipe unavailable")
+                        .and_then(|r| {
+                            r.take(cap + 1)
+                                .read_to_end(&mut bytes)
+                                .map_err(|_| "registry metadata read failed")
+                        });
+                    if result.is_err() || bytes.len() as u64 > cap {
+                        reader_stop.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    result?;
+                    if bytes.len() as u64 > cap {
+                        return Err("registry metadata exceeds preflight byte limit");
+                    }
+                    Ok(bytes)
+                })
+                .map_err(|_| "could not start registry metadata reader")?;
+            let (mut child, diagnostics) = match spawn_with_diagnostics(&mut cmd) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    drop(send);
+                    let _ = reader.join();
+                    return Err(error);
+                }
             };
-            Err(format!(
-                "{reason} (backend exit {}); raw diagnostics withheld to protect credentials",
-                status.code().map_or("signal".into(), |n| n.to_string())
-            ))
+            let _ = send.send(child.stdout.take().unwrap());
+            let wait = crate::lease_process::wait(
+                &mut child,
+                &|| cancelled() || stop.load(std::sync::atomic::Ordering::Acquire),
+                deadline.saturating_duration_since(Instant::now()),
+            );
+            let bytes = reader
+                .join()
+                .map_err(|_| "registry metadata reader failed")?
+                .map_err(str::to_owned);
+            let diagnostic = String::from_utf8_lossy(&diagnostics.join().unwrap_or_default())
+                .to_ascii_lowercase();
+            let (status, stopped) = wait.map_err(err)?;
+            let bytes = bytes?;
+            if stopped {
+                return Err("registry preflight cancelled or timed out".into());
+            }
+            backend_status(status, &diagnostic)?;
+            Ok(bytes)
+        }
+
+        /// Check declared compressed sizes before any layer copy; no expanded/rootfs estimate.
+        /// Metadata stdout has fixed structural caps even when resource limits are automatic.
+        /// Cache callers must invoke this only on a miss, after verifying cached content.
+        pub fn pull_checked(
+            &self,
+            lease: &crate::store_lease::StoreLease,
+            reference: &str,
+            destination: &Path,
+            limits: crate::image::Limits,
+            cancelled: &impl Fn() -> bool,
+        ) -> Result<()> {
+            crate::store_access::validate_path(destination, Some(lease)).map_err(err)?;
+            let reference = super::reference(reference, true)?;
+            let repository = reference
+                .split_once('@')
+                .map(|(repo, _)| repo)
+                .unwrap_or_else(|| reference.rsplit_once(':').unwrap().0);
+            let deadline = Instant::now() + Duration::from_secs(910);
+            let mut remaining = limits.max_total_metadata_bytes.min(TOTAL_METADATA_CAP);
+            let cap = limits.max_metadata_bytes.min(METADATA_CAP);
+            let mut read = |reference: &str, config, expected: Option<&crate::oci::Descriptor>| {
+                let allowed = cap.min(remaining);
+                if allowed == 0 || expected.is_some_and(|d| d.size as u64 > allowed) {
+                    return Err("registry metadata exceeds preflight byte limit".into());
+                }
+                let bytes = self.inspect(lease, reference, config, allowed, deadline, cancelled)?;
+                remaining -= bytes.len() as u64;
+                if let Some(d) = expected {
+                    verify_metadata(&bytes, &d.digest, Some(d.size))?;
+                }
+                Ok::<_, String>(bytes)
+            };
+            let mut raw = read(&reference, false, None)?;
+            if let Some((_, digest)) = reference.split_once('@') {
+                verify_metadata(&raw, digest, None)?;
+            }
+            let mut doc = document(&raw)?;
+            let max_descriptors = limits.max_descriptors.min(4096);
+            let mut count = 1usize;
+            if matches!(doc.media_type.as_str(), INDEX | DOCKER_INDEX) {
+                let entries = doc
+                    .manifests
+                    .as_ref()
+                    .ok_or("missing registry index descriptors")?;
+                count = entries.len();
+                if count > max_descriptors {
+                    return Err("registry descriptor count exceeds preflight limit".into());
+                }
+                let mut selected = None;
+                for entry in entries {
+                    descriptor(entry)?;
+                    if entry
+                        .extensions
+                        .get("platform")
+                        .is_some_and(|p| native_platform(p, false))
+                        && selected.replace(entry).is_some()
+                    {
+                        return Err("ambiguous registry linux/amd64 platform selection".into());
+                    }
+                }
+                let selected =
+                    selected.ok_or("registry index has no supported linux/amd64 platform")?;
+                if !matches!(selected.media_type.as_str(), MANIFEST | DOCKER_MANIFEST) {
+                    return Err(
+                        "unsupported registry index descriptor (nested indexes are unsupported)"
+                            .into(),
+                    );
+                }
+                let pinned = format!("{repository}@{}", selected.digest);
+                raw = read(&pinned, false, Some(selected))?;
+                let manifest = document(&raw)?;
+                if manifest.media_type != selected.media_type {
+                    return Err("registry manifest media type mismatch".into());
+                }
+                doc = manifest;
+            }
+            if !matches!(doc.media_type.as_str(), MANIFEST | DOCKER_MANIFEST)
+                || doc.manifests.is_some()
+            {
+                return Err("unsupported registry manifest media type".into());
+            }
+            let layers = doc.layers.as_ref().ok_or("missing registry layers")?;
+            if count
+                .checked_add(1)
+                .and_then(|n| n.checked_add(layers.len()))
+                .is_none_or(|n| n > max_descriptors)
+            {
+                return Err("registry descriptor count exceeds preflight limit".into());
+            }
+            layer_sizes(layers, limits)?;
+            let config = doc.config.as_ref().ok_or("missing registry config")?;
+            descriptor(config)?;
+            if !matches!(
+                config.media_type.as_str(),
+                "application/vnd.oci.image.config.v1+json"
+                    | "application/vnd.docker.container.image.v1+json"
+            ) {
+                return Err("unsupported registry config media type".into());
+            }
+            let pinned = format!("{repository}@sha256:{:x}", Sha256::digest(&raw));
+            // --raw --config internally reopens the manifest: only pass the verified digest.
+            let bytes = read(&pinned, true, Some(config))?;
+            let config: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid registry config JSON")?;
+            if !native_platform(&config, true) {
+                return Err("registry config platform is not supported linux/amd64".into());
+            }
+            if cancelled() || Instant::now() >= deadline {
+                return Err("registry preflight cancelled or timed out".into());
+            }
+            self.pull(lease, &pinned, destination, cancelled)
         }
         pub fn pull(
             &self,
@@ -745,6 +1001,27 @@ mod linux {
             cmd.arg(oci(source)?).arg(format!("docker://{reference}"));
             self.run(cmd, None, false, true, true, cancelled)
         }
+    }
+    fn backend_status(status: std::process::ExitStatus, diagnostic: &str) -> Result<()> {
+        if status.success() {
+            return Ok(());
+        }
+        let reason = if diagnostic.contains("x509") || diagnostic.contains("certificate") {
+            "TLS certificate verification failed; configure a trusted CA with --cert-dir"
+        } else if diagnostic.contains("unauthorized")
+            || diagnostic.contains("denied")
+            || diagnostic.contains("authentication")
+        {
+            "registry rejected authentication or repository permissions; check login and token scope"
+        } else if diagnostic.contains("manifest unknown") || diagnostic.contains("name unknown") {
+            "image or tag not found"
+        } else {
+            "registry transfer failed; check connectivity, registry permissions and image compatibility"
+        };
+        Err(format!(
+            "{reason} (backend exit {}); raw diagnostics withheld to protect credentials",
+            status.code().map_or("signal".into(), |n| n.to_string())
+        ))
     }
     // Reserve the diagnostic reader before any workload exists. Resource
     // exhaustion must not unwind/drop auth files beside a live guarded transfer.
@@ -995,6 +1272,114 @@ mod linux {
     #[cfg(test)]
     mod diagnostic_tests {
         use super::*;
+        fn limits() -> crate::image::Limits {
+            crate::image::Limits {
+                max_metadata_bytes: u64::MAX,
+                max_total_metadata_bytes: u64::MAX,
+                max_descriptors: usize::MAX,
+                max_layer_bytes: u64::MAX,
+                max_total_layer_bytes: u64::MAX,
+            }
+        }
+        fn layer(size: i64) -> crate::oci::Descriptor {
+            crate::oci::Descriptor {
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+                size,
+                annotations: Default::default(),
+                extensions: Default::default(),
+            }
+        }
+        #[test]
+        fn declared_compressed_limits_include_duplicates_and_checked_sum() {
+            let mut cap = limits();
+            cap.max_layer_bytes = 9;
+            assert!(
+                layer_sizes(&[layer(10)], cap)
+                    .unwrap_err()
+                    .contains("layer bytes exceed")
+            );
+            cap.max_layer_bytes = 10;
+            cap.max_total_layer_bytes = 19;
+            assert!(
+                layer_sizes(&[layer(10), layer(10)], cap)
+                    .unwrap_err()
+                    .contains("total compressed")
+            );
+            cap.max_total_layer_bytes = 20;
+            assert_eq!(layer_sizes(&[layer(10), layer(10)], cap).unwrap(), 20);
+            assert!(
+                layer_sizes(&[layer(i64::MAX), layer(i64::MAX), layer(2)], limits())
+                    .unwrap_err()
+                    .contains("overflow")
+            );
+            assert!(layer_sizes(&[layer(-1)], limits()).is_err());
+        }
+        #[test]
+        fn metadata_identity_platform_and_unsupported_compression_fail_closed() {
+            let original = b"{\"os\":\"linux\"}";
+            let changed = b"{\"os\":\"other\"}";
+            let digest = format!("sha256:{:x}", Sha256::digest(original));
+            verify_metadata(original, &digest, Some(original.len() as i64)).unwrap();
+            assert!(verify_metadata(changed, &digest, Some(original.len() as i64)).is_err());
+            assert!(verify_metadata(original, &digest, Some(1)).is_err());
+            for compression in ["zstd", "gzip+encrypted", "unknown"] {
+                let mut value = layer(1);
+                value.media_type = format!("application/vnd.oci.image.layer.v1.tar+{compression}");
+                assert!(
+                    layer_sizes(&[value], limits())
+                        .unwrap_err()
+                        .contains("compression")
+                );
+            }
+            let mut value = layer(1);
+            value.extensions.insert(
+                "urls".into(),
+                serde_json::json!(["https://outside.invalid/layer"]),
+            );
+            assert!(descriptor(&value).is_err());
+            assert!(native_platform(
+                &serde_json::json!({"os":"linux","architecture":"amd64"}),
+                false
+            ));
+            assert!(!native_platform(
+                &serde_json::json!({"os":"linux","architecture":"arm64"}),
+                false
+            ));
+            assert!(!native_platform(
+                &serde_json::json!({"os":"linux","architecture":"amd64","variant":"v3"}),
+                false
+            ));
+            assert!(
+                document(b"{\"secret-password\":")
+                    .err()
+                    .unwrap()
+                    .contains("invalid registry manifest JSON")
+            );
+        }
+        #[test]
+        fn inspect_deadline_and_cancellation_are_checked_before_spawn() {
+            let temp = tempfile::tempdir().unwrap();
+            let lease = crate::store_lease::StoreLease::shared(temp.path(), &|| false).unwrap();
+            let transport = Transport {
+                temp,
+                auth: PathBuf::new(),
+                cert: None,
+            };
+            for (deadline, cancelled) in [
+                (Instant::now(), false),
+                (Instant::now() + Duration::from_secs(5), true),
+            ] {
+                assert!(
+                    transport
+                        .inspect(&lease, "localhost:1/absent", false, 1024, deadline, &|| {
+                            cancelled
+                        })
+                        .unwrap_err()
+                        .contains("cancelled or timed out")
+                );
+            }
+        }
         #[test]
         fn spawn_failure_and_capped_drain_finish() {
             let mut absent = Command::new("/no-such-weld-registry-backend");

@@ -875,8 +875,13 @@ fn prepare_build(
                         writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
                             .map_err(|e| e.to_string())?;
                         out.flush().map_err(|e| e.to_string())?;
-                        registry::Transport::new(&cli.registry)?
-                            .pull(&lease, reference, layout, &cancelled)
+                        registry::Transport::new(&cli.registry)?.pull_checked(
+                            &lease,
+                            reference,
+                            layout,
+                            cli.options.limits.image,
+                            &cancelled,
+                        )
                     },
                     cli.options.progress,
                 )?;
