@@ -149,13 +149,34 @@ impl CacheFixture {
         path
     }
     fn prune(&self) -> cleanup_apply::Report {
-        cleanup_apply::apply(
-            &self.store,
-            cleanup_plan::Request::CachePrune,
-            Default::default(),
-            || false,
-        )
-        .unwrap()
+        use std::time::{Duration, Instant};
+        // Parallel subprocess tests can inherit this fixture's dropped lease until exec.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let report = cleanup_apply::apply(
+                &self.store,
+                cleanup_plan::Request::CachePrune,
+                Default::default(),
+                || false,
+            )
+            .unwrap();
+            if report.status != "store_busy" {
+                return report;
+            }
+            assert!(
+                report.removed.is_empty(),
+                "busy cleanup removed: {report:#?}"
+            );
+            assert!(
+                report.recovered.is_empty(),
+                "busy cleanup recovered: {report:#?}"
+            );
+            assert!(report.plan.is_none(), "busy cleanup planned: {report:#?}");
+            if Instant::now() >= deadline {
+                return report;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn verify_retained(&self) {
         let lease = StoreLease::shared(&self.store, &|| false).unwrap();
