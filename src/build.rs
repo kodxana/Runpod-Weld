@@ -1074,13 +1074,14 @@ fn directory(root: &Path, image_path: &str, user: Option<&str>) -> Result<PathBu
 struct RootUsage {
     bytes: u64,
     entries: usize,
+    unique_payload_bytes: u64,
 }
 
 fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<RootUsage> {
     fn walk(
         p: &Path,
-        bytes: &mut u64,
-        entries: &mut usize,
+        usage: &mut RootUsage,
+        payloads: &mut std::collections::BTreeSet<(u64, u64)>,
         depth: usize,
         l: Limits,
         c: &impl Fn() -> bool,
@@ -1097,13 +1098,30 @@ fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<Roo
                 check(c)?;
                 let p = entry?.path();
                 let m = fs::symlink_metadata(&p)?;
-                *entries = entries.checked_add(1).ok_or("rootfs entry overflow")?;
-                *bytes = bytes.checked_add(m.len()).ok_or("rootfs byte overflow")?;
-                if *entries > l.max_rootfs_entries || *bytes > l.max_rootfs_bytes {
+                usage.entries = usage
+                    .entries
+                    .checked_add(1)
+                    .ok_or("rootfs entry overflow")?;
+                usage.bytes = usage
+                    .bytes
+                    .checked_add(m.len())
+                    .ok_or("rootfs byte overflow")?;
+                if usage.entries > l.max_rootfs_entries || usage.bytes > l.max_rootfs_bytes {
                     return Err("rootfs budget exceeded".into());
                 }
+                // Replay expands sparse files but preserves hardlink payload sharing.
+                #[cfg(target_os = "linux")]
+                if m.is_file() {
+                    use std::os::unix::fs::MetadataExt;
+                    if m.nlink() == 1 || payloads.insert((m.dev(), m.ino())) {
+                        usage.unique_payload_bytes = usage
+                            .unique_payload_bytes
+                            .checked_add(m.len())
+                            .ok_or("rootfs allocation overflow")?;
+                    }
+                }
                 if m.is_dir() {
-                    walk(&p, bytes, entries, depth + 1, l, c)?;
+                    walk(&p, usage, payloads, depth + 1, l, c)?;
                 }
             }
             Ok(())
@@ -1112,7 +1130,14 @@ fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<Roo
         result
     }
     let mut usage = RootUsage::default();
-    walk(root, &mut usage.bytes, &mut usage.entries, 0, limits, c)?;
+    walk(
+        root,
+        &mut usage,
+        &mut std::collections::BTreeSet::new(),
+        0,
+        limits,
+        c,
+    )?;
     Ok(usage)
 }
 
@@ -1120,25 +1145,12 @@ fn check_replay_space(
     resources: Option<&crate::build_resources::Policy>,
     root: &Path,
     verified: &layer::VerifiedLayer,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
     if resources.is_none() {
         return Ok(());
     }
-    let mut bytes = 0u64;
-    let mut inodes = 1u64;
-    for entry in verified.entries() {
-        // Replacement files and implicit parents may coexist with the old tree.
-        // Charge all records conservatively; this is an estimate, not a quota.
-        let parents = entry.path.iter().filter(|b| **b == b'/').count() as u64;
-        inodes = inodes
-            .checked_add(1 + parents)
-            .ok_or("replay inode estimate overflow")?;
-        let payload = entry.size.checked_add(4095).ok_or("replay size overflow")? / 4096 * 4096;
-        bytes = bytes
-            .checked_add(payload)
-            .and_then(|n| n.checked_add((1 + parents) * 4096))
-            .ok_or("replay space estimate overflow")?;
-    }
+    let (bytes, inodes) = replay_allocation(root, verified.entries(), cancelled)?;
     resource_check(
         resources,
         "replaying verified layer (additional allocation estimate)",
@@ -1149,6 +1161,176 @@ fn check_replay_space(
         }],
     )?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn replay_allocation(
+    root: &Path,
+    entries: &[layer::Entry],
+    cancelled: &impl Fn() -> bool,
+) -> Result<(u64, u64)> {
+    use layer::EntryKind;
+    use std::{collections::BTreeSet, ffi::OsStr, os::unix::ffi::OsStrExt};
+    let mut removed = BTreeSet::new();
+    let mut opaque = BTreeSet::new();
+    let mut lower = true;
+    for entry in entries {
+        check(cancelled)?;
+        let split = entry
+            .path
+            .iter()
+            .rposition(|b| *b == b'/')
+            .map_or(0, |i| i + 1);
+        let name = &entry.path[split..];
+        if let Some(target) = name.strip_prefix(b".wh.") {
+            // Whiteouts run before all records. Never inspect a host path through
+            // a lower symlink; an aliased deletion conservatively invalidates credit.
+            for end in entry.path[..split]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| (*b == b'/').then_some(i))
+            {
+                check(cancelled)?;
+                match fs::symlink_metadata(root.join(OsStr::from_bytes(&entry.path[..end]))) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        lower = false;
+                        break;
+                    }
+                    Ok(m) if m.is_dir() => (),
+                    Ok(_) => break,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if name == b".wh..wh..opq" {
+                opaque.insert(&entry.path[..split.saturating_sub(1)]);
+            } else {
+                let mut path = entry.path[..split].to_vec();
+                path.extend_from_slice(target);
+                removed.insert(path);
+            }
+        }
+    }
+    // Keys borrow bounded verified paths; only distinct component prefixes are
+    // retained. A false value means replay creates the directory, hiding lower data.
+    let mut directories = BTreeMap::<&[u8], bool>::new();
+    let mut replaced = BTreeSet::<&[u8]>::new();
+    let mut aliases = BTreeSet::<&[u8]>::new();
+    let mut bytes = 0u64;
+    let mut inodes = 1u64;
+    for entry in entries {
+        check(cancelled)?;
+        if entry
+            .path
+            .rsplit(|b| *b == b'/')
+            .next()
+            .unwrap()
+            .starts_with(b".wh.")
+            || entry.path.is_empty()
+        {
+            continue;
+        }
+        if !lower {
+            // Once traversal involves aliases, retain the conservative per-record
+            // parent allowance rather than crediting uncertain physical locations.
+            directories.clear();
+        }
+        let mut existing = lower && !opaque.contains(b"".as_slice());
+        let mut parent = b"".as_slice();
+        let ends = entry
+            .path
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| (*b == b'/').then_some(i))
+            .chain((entry.kind == EntryKind::Directory).then_some(entry.path.len()));
+        for end in ends {
+            check(cancelled)?;
+            let path = &entry.path[..end];
+            if aliases.contains(path) {
+                directories.clear();
+                lower = false;
+                existing = false;
+            }
+            if let Some(known) = directories.get(path) {
+                existing = *known;
+            } else {
+                existing &=
+                    !removed.contains(path) && !opaque.contains(parent) && !replaced.contains(path);
+                if existing {
+                    // All preceding components were real directories. lstat never
+                    // follows the leaf or reads directory contents/timestamps.
+                    existing = match fs::symlink_metadata(root.join(OsStr::from_bytes(path))) {
+                        Ok(m) if m.file_type().is_symlink() => {
+                            directories.clear();
+                            lower = false;
+                            false
+                        }
+                        Ok(m) => m.is_dir(),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                        Err(e) => return Err(e.into()),
+                    };
+                }
+                if !existing {
+                    inodes = inodes
+                        .checked_add(1)
+                        .ok_or("replay inode estimate overflow")?;
+                    bytes = bytes
+                        .checked_add(4096)
+                        .ok_or("replay space estimate overflow")?;
+                }
+                directories.insert(path, existing);
+            }
+            parent = path;
+        }
+        if entry.kind != EntryKind::Directory {
+            // Replacement records can retain old pinned inodes. Hardlinks allocate
+            // directory entries, but neither another payload nor another inode.
+            let payload = if entry.kind == EntryKind::File {
+                entry.size
+            } else {
+                0
+            };
+            let payload = payload.checked_add(4095).ok_or("replay size overflow")? / 4096 * 4096;
+            bytes = bytes
+                .checked_add(payload)
+                .and_then(|n| n.checked_add(4096))
+                .ok_or("replay space estimate overflow")?;
+            inodes = inodes
+                .checked_add(u64::from(entry.kind != EntryKind::Hardlink))
+                .ok_or("replay inode estimate overflow")?;
+            // Remove only this subtree's cached directories, with cancellable work
+            // proportional to prefixes inserted, including repeated replacements.
+            let path = entry.path.as_slice();
+            directories.remove(path);
+            let mut prefix = path.to_vec();
+            prefix.push(b'/');
+            loop {
+                check(cancelled)?;
+                let next = directories
+                    .range(prefix.as_slice()..)
+                    .next()
+                    .map(|(p, _)| *p);
+                match next {
+                    Some(p) if p.starts_with(&prefix) => {
+                        directories.remove(p);
+                    }
+                    _ => break,
+                }
+            }
+            replaced.insert(path);
+            if matches!(entry.kind, EntryKind::Symlink | EntryKind::Hardlink) {
+                aliases.insert(path);
+            } else {
+                aliases.remove(path);
+            }
+        }
+    }
+    Ok((bytes, inodes))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn replay_allocation(_: &Path, _: &[layer::Entry], _: &impl Fn() -> bool) -> Result<(u64, u64)> {
+    Err("layer replay requires Linux".into())
 }
 
 fn check_spool_space(
@@ -1284,7 +1466,7 @@ fn verify_checkpoint(
         bytes += verified.size();
         entries += verified.physical_header_count();
         if let Some(root) = root {
-            check_replay_space(resources, root, &verified)?;
+            check_replay_space(resources, root, &verified, cancelled)?;
             rootfs::apply_layer(root, &mut verified, cancelled)?;
             root_budget(root, limits, cancelled)?;
         }
@@ -1837,7 +2019,7 @@ fn build_inner_checked(
             let mut verified = layer::verify(&store, descriptor, diff, &spool, budget, cancelled)?;
             bytes += verified.size();
             entries += verified.physical_header_count();
-            check_replay_space(resources, &root, &verified)?;
+            check_replay_space(resources, &root, &verified, &cancelled)?;
             rootfs::apply_layer(&root, &mut verified, cancelled)?;
             root_budget(&root, options.limits, &cancelled)?;
         }
@@ -2223,7 +2405,7 @@ fn build_stage(
             bytes += verified.size();
             entries += verified.physical_header_count();
             largest_spool = largest_spool.max(verified.size());
-            check_replay_space(resources, &root, &verified)?;
+            check_replay_space(resources, &root, &verified, &cancelled)?;
             let phase = crate::progress::Phase::start(
                 options.progress && options.verbose,
                 format!(
@@ -2268,7 +2450,7 @@ fn build_stage(
             &[crate::build_resources::Requirement {
                 path: work.clone(),
                 bytes: base_usage
-                    .bytes
+                    .unique_payload_bytes
                     .checked_add(largest_spool)
                     .and_then(|n| n.checked_add((base_usage.entries as u64).checked_mul(4096)?))
                     .ok_or("baseline allocation estimate overflow")?,
@@ -2490,7 +2672,19 @@ fn build_stage(
                     } else {
                         from.as_ref().map(|n| copy_input(n, previous, external).0)
                     };
-                    let summary = context::copy_filtered_with_options(
+                    let admission = |bytes, inodes| {
+                        resource_check(
+                            resources,
+                            "COPY prepared allocation",
+                            &[crate::build_resources::Requirement {
+                                path: root.clone(),
+                                bytes,
+                                inodes,
+                            }],
+                        )
+                        .map_err(|e| context::Error::Io(io::Error::other(e)))
+                    };
+                    let summary = context::copy_filtered_checked(
                         stage_root.as_deref().unwrap_or(&options.context),
                         &root,
                         &sources.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -2505,6 +2699,7 @@ fn build_stage(
                             chown: chown.as_deref(),
                             chmod: *chmod,
                         },
+                        resources.map(|_| &admission as &dyn Fn(u64, u64) -> _),
                         &cancelled,
                     )?;
                     copied.bytes_written += summary.bytes_written;
@@ -2970,6 +3165,140 @@ fn worker(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    fn never_cancel() -> bool {
+        false
+    }
+
+    fn resource_entry(path: &str, kind: layer::EntryKind, size: u64) -> layer::Entry {
+        layer::Entry {
+            path: path.as_bytes().to_vec(),
+            kind,
+            size,
+            data_offset: 0,
+            link_target: None,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            mtime: layer::Timestamp {
+                negative: false,
+                seconds: 0,
+                fraction: Vec::new(),
+            },
+            atime: None,
+            ctime: None,
+            uname: Vec::new(),
+            gname: Vec::new(),
+            xattrs: BTreeMap::new(),
+            pax_records: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn resource_root_payload_deduplication_does_not_relax_logical_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut options = options(temp.path());
+        fs::write(options.context.join("file"), vec![0; 8193]).unwrap();
+        for name in ["a", "b", "c"] {
+            fs::hard_link(options.context.join("file"), options.context.join(name)).unwrap();
+        }
+        let usage = root_budget(&options.context, options.limits, &never_cancel).unwrap();
+        assert_eq!(usage.bytes, 4 * 8193);
+        assert_eq!(usage.unique_payload_bytes, 8193);
+        assert_eq!(usage.entries, 4);
+        options.limits.max_rootfs_bytes = 3 * 8193;
+        assert!(
+            root_budget(&options.context, options.limits, &never_cancel)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("rootfs budget")
+        );
+    }
+
+    #[test]
+    fn resource_replay_counts_existing_shared_parents_and_hardlinks_without_mutating_metadata() {
+        use layer::EntryKind::{Directory, File, Hardlink};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("a/b")).unwrap();
+        fs::set_permissions(temp.path().join("a/b"), fs::Permissions::from_mode(0o555)).unwrap();
+        let before = fs::metadata(temp.path().join("a/b")).unwrap();
+        let entries = [
+            resource_entry("a", Directory, 0),
+            resource_entry("a/b", Directory, 0),
+            resource_entry("a/b/new/file", File, 4097),
+            resource_entry("a/b/new/file", File, 4097),
+            resource_entry("a/b/new/alias", Hardlink, 0),
+            resource_entry("a/b/new/alias2", Hardlink, 0),
+        ];
+        assert_eq!(
+            replay_allocation(temp.path(), &entries, &never_cancel).unwrap(),
+            (9 * 4096, 4)
+        );
+        let after = fs::metadata(temp.path().join("a/b")).unwrap();
+        assert_eq!(
+            (
+                before.atime(),
+                before.atime_nsec(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec()
+            ),
+            (
+                after.atime(),
+                after.atime_nsec(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec()
+            )
+        );
+        assert!(!temp.path().join("a/b/new").exists());
+    }
+
+    #[test]
+    fn resource_replay_whiteouts_replacements_and_cancellation() {
+        use layer::EntryKind::{Directory, File};
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("a/b")).unwrap();
+        for marker in ["a/.wh.b", "a/.wh..wh..opq", ".wh.a"] {
+            let entries = [
+                resource_entry("a/b/one", File, 0),
+                resource_entry("a/b/two", File, 0),
+                resource_entry(marker, File, 0),
+                resource_entry(marker, File, 0),
+            ];
+            let parents = if marker == ".wh.a" { 2 } else { 1 };
+            assert_eq!(
+                replay_allocation(temp.path(), &entries, &never_cancel).unwrap(),
+                ((2 + parents) * 4096, 3 + parents)
+            );
+        }
+        let entries = [
+            resource_entry("a/b/one", File, 0),
+            resource_entry("a-keep/sub", Directory, 0),
+            resource_entry("a", File, 0),
+            resource_entry("a", Directory, 0),
+            resource_entry("a/b/two", File, 0),
+        ];
+        assert_eq!(
+            replay_allocation(temp.path(), &entries, &never_cancel).unwrap(),
+            (7 * 4096, 8)
+        );
+        let calls = std::cell::Cell::new(0);
+        let cancelled = || {
+            calls.set(calls.get() + 1);
+            calls.get() == 5
+        };
+        assert!(
+            replay_allocation(temp.path(), &entries, &cancelled)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+    }
+
     #[test]
     fn resource_refusal_precedes_work_and_stops_cooperatively_with_its_reason() {
         use std::cell::Cell;

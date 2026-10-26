@@ -297,6 +297,32 @@ pub(crate) fn copy_filtered_with_options(
     options: CopyOptions<'_>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Summary, Error> {
+    copy_filtered_checked(
+        context_root,
+        image_root,
+        sources,
+        destination,
+        limits,
+        policy,
+        options,
+        None,
+        cancelled,
+    )
+}
+
+/// Admission observes the prepared allocation before any destination mutation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_filtered_checked(
+    context_root: &Path,
+    image_root: &Path,
+    sources: &[&str],
+    destination: &str,
+    limits: Limits,
+    policy: Option<&Policy>,
+    options: CopyOptions<'_>,
+    admission: Option<&dyn Fn(u64, u64) -> Result<(), Error>>,
+    cancelled: impl Fn() -> bool,
+) -> Result<Summary, Error> {
     #[cfg(target_os = "linux")]
     {
         linux::copy(
@@ -307,6 +333,7 @@ pub(crate) fn copy_filtered_with_options(
             limits,
             policy,
             options,
+            admission,
             &cancelled,
         )
     }
@@ -320,6 +347,7 @@ pub(crate) fn copy_filtered_with_options(
             limits,
             policy,
             options,
+            admission,
             cancelled,
         );
         Err(Error::Unsupported("local COPY requires Linux"))
@@ -1716,6 +1744,7 @@ mod linux {
         limits: Limits,
         policy: Option<&Policy>,
         options: CopyOptions<'_>,
+        admission: Option<&dyn Fn(u64, u64) -> Result<(), Error>>,
         c: &impl Fn() -> bool,
     ) -> Result<Summary, Error> {
         let ctx = root(ctx)?;
@@ -1731,6 +1760,61 @@ mod linux {
             false,
             c,
         )?;
+        if let Some(admission) = admission {
+            let mut bytes = 0u64;
+            let mut inodes = 0u64;
+            // Borrowed prefixes are bounded by the already-budgeted plan paths.
+            let mut directories = std::collections::BTreeSet::new();
+            for e in &plan.entries {
+                check(c)?;
+                let attrs = e.attrs.iter().try_fold(0u64, |size, (name, value)| {
+                    size.checked_add(name.as_bytes().len() as u64)
+                        .and_then(|n| n.checked_add(value.len() as u64))
+                        .ok_or(Error::Limit("COPY allocation"))
+                })?;
+                let attrs = attrs
+                    .checked_add(4095)
+                    .ok_or(Error::Limit("COPY allocation"))?
+                    / 4096
+                    * 4096;
+                bytes = bytes
+                    .checked_add(attrs)
+                    .ok_or(Error::Limit("COPY allocation"))?;
+                if e.kind != libc::S_IFDIR {
+                    let payload = e
+                        .size
+                        .checked_add(4095)
+                        .ok_or(Error::Limit("COPY allocation"))?
+                        / 4096
+                        * 4096;
+                    bytes = bytes
+                        .checked_add(payload)
+                        .and_then(|n| n.checked_add(4096))
+                        .ok_or(Error::Limit("COPY allocation"))?;
+                    inodes = inodes.checked_add(1).ok_or(Error::Limit("COPY inodes"))?;
+                }
+                let mut parent = if e.kind == libc::S_IFDIR {
+                    e.dst.as_slice()
+                } else {
+                    split(&e.dst).0
+                };
+                while !parent.is_empty() && directories.insert(parent) {
+                    check(c)?;
+                    match open(&image, parent, libc::O_PATH | libc::O_DIRECTORY, false) {
+                        Ok(_) => (),
+                        Err(e) if missing(&e) => {
+                            bytes = bytes
+                                .checked_add(4096)
+                                .ok_or(Error::Limit("COPY allocation"))?;
+                            inodes = inodes.checked_add(1).ok_or(Error::Limit("COPY inodes"))?;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    parent = split(parent).0;
+                }
+            }
+            admission(bytes, inodes)?;
+        }
         // Preflight completes before creating any destination. File payloads are
         // reread only under the caller's stable-context contract.
         let mut created = std::collections::BTreeSet::new();
@@ -1894,6 +1978,86 @@ mod tests {
         fs,
         os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     };
+    fn never_cancel() -> bool {
+        false
+    }
+
+    #[test]
+    fn prepared_copy_admission_precedes_mutation_and_keeps_logical_charges() {
+        let ctx = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        fs::create_dir(ctx.path().join("selected")).unwrap();
+        fs::write(ctx.path().join("selected/file"), vec![0; 4097]).unwrap();
+        fs::hard_link(
+            ctx.path().join("selected/file"),
+            ctx.path().join("selected/alias"),
+        )
+        .unwrap();
+        fs::write(ctx.path().join("unselected"), vec![0; 100_000]).unwrap();
+        fs::create_dir(image.path().join("existing")).unwrap();
+        let before = fs::metadata(image.path().join("existing")).unwrap();
+        let observed = Cell::new(None);
+        let admission = |bytes, inodes| {
+            observed.set(Some((bytes, inodes)));
+            Err(Error::Invalid("fixture admission refused"))
+        };
+        let result = copy_filtered_checked(
+            ctx.path(),
+            image.path(),
+            &["selected"],
+            "/existing/new/",
+            limits(),
+            None,
+            CopyOptions::default(),
+            Some(&admission),
+            never_cancel,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Invalid("fixture admission refused"))
+        ));
+        let (bytes, inodes) = observed.get().unwrap();
+        assert!(bytes >= 7 * 4096 && bytes < 100_000);
+        assert_eq!(inodes, 3);
+        assert!(!image.path().join("existing/new").exists());
+        let after = fs::metadata(image.path().join("existing")).unwrap();
+        assert_eq!(
+            (
+                before.atime(),
+                before.atime_nsec(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec()
+            ),
+            (
+                after.atime(),
+                after.atime_nsec(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec()
+            )
+        );
+        observed.set(None);
+        let mut budget = limits();
+        budget.max_bytes = 8193;
+        let result = copy_filtered_checked(
+            ctx.path(),
+            image.path(),
+            &["selected"],
+            "/existing/new/",
+            budget,
+            None,
+            CopyOptions::default(),
+            Some(&admission),
+            never_cancel,
+        );
+        assert!(matches!(result, Err(Error::Limit("bytes"))));
+        assert_eq!(observed.get(), None);
+        assert!(!image.path().join("existing/new").exists());
+    }
+
     fn limits() -> Limits {
         Limits {
             max_bytes: 1_000_000,
