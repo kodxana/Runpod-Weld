@@ -37,7 +37,7 @@ Usage:
     --output NEWDIR --work-dir NEWDIR [--build-arg KEY=VALUE] [--host-dns] [--verbose]
     [--progress auto|plain|quiet] [--target STAGE] [--no-cache] [--pull] [--platform linux/amd64]
     [--export-mode flattened|layered]
-    [--max-rootfs-bytes N] [--max-layer-bytes N] [--metadata-budget N]
+    [--max-rootfs-bytes N] [--max-layer-bytes N] [--metadata-budget N] [--max-entries N]
     [--run-timeout-seconds N] CONTEXT
 
 Experimental build: Linux amd64, multi-stage, registry/local OCI bases or scratch.
@@ -56,7 +56,11 @@ transfers and final results remain visible. Instruction arguments are not printe
 --tag=TAG and --progress=MODE are accepted.
 Managed builds/push hold a persistent store lease; cross-store inputs are rejected.
 Cancellation waits for all descendants; uninterruptible tasks can delay it indefinitely.
-Managed defaults: 2 GiB rootfs/layer, 64 MiB metadata; temporary host DNS enabled
+Managed workload ceilings: automatic, from observed filesystem/cgroup capacity;
+current available bytes/inodes/headroom are checked before work. Explicit limits
+remain hard ceilings. Diagnostics show auto/explicit origins and reserves.
+Logical metadata is not RSS; unknown cgroup capacity uses a bounded 64 MiB fallback.
+Filesystem quotas remain unknown. Temporary host DNS enabled
 (--no-host-dns disables it). Explicit output/work without -t keep legacy defaults.
 Bindings match ARG-expanded FROM or literal COPY image names; --base-ref selects an OCI ref annotation.
 Without --base-ref the layout must have an unambiguous image selection.
@@ -83,7 +87,7 @@ metadata 16777216 bytes per subsystem; 100000 entries; 1024 descriptors;
 RUN timeout 300 seconds (maximum 86400). Budgets accept positive decimal bytes.
 Dockerfile/parser source cap: 1048576 bytes. Parser/metadata budgets are
 separate from RUN memory; no memory or disk quota enforcement is guaranteed.
-Rootfs is checked between operations. No host RAM sizing or capacity guesses.
+Rootfs is checked between operations. No host RAM capacity is inferred.
 Trusted images/commands and stable paths required; this is not a sandbox.
 Work/output must be new, disjoint paths outside context/base; failures retain them.
 Doctor is read-only. Observed resource limits are not per-build enforcement.
@@ -314,6 +318,8 @@ fn cleanup_command(cmd: &str, args: &[String], out: &mut impl Write) -> Result<(
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct BuildCli {
     record: Option<rpweld::build_record::BuildRecord>,
+    resource_overrides: Option<rpweld::build_resources::Overrides>,
+    resources: Option<rpweld::build_resources::Policy>,
     dockerfile: String,
     options: rpweld::build::BuildOptions,
     tags: Vec<String>,
@@ -419,6 +425,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
                 "--max-rootfs-bytes",
                 "--max-layer-bytes",
                 "--metadata-budget",
+                "--max-entries",
                 "--run-timeout-seconds",
                 "--authfile",
                 "--cert-dir",
@@ -501,11 +508,8 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             _ => Err(format!("invalid positive budget: {key}")),
         }
     };
-    let default_bytes = if managed {
-        2 * 1024 * 1024 * 1024
-    } else {
-        256 * 1024 * 1024
-    };
+    // Legacy placeholders only; managed limits are resolved read-only in prepare_build.
+    let default_bytes = 256 * 1024 * 1024;
     let root = budget("--max-rootfs-bytes", default_bytes)?;
     let layer = budget("--max-layer-bytes", default_bytes)?;
     let metadata = budget(
@@ -516,8 +520,20 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             16 * 1024 * 1024
         },
     )?;
-    let plan_bytes =
-        usize::try_from(metadata).map_err(|_| "metadata budget exceeds platform size")?;
+    let plan_bytes = usize::try_from(if managed {
+        metadata.min(rpweld::build_resources::PLAN_BYTES)
+    } else {
+        metadata
+    })
+    .map_err(|_| "metadata budget exceeds platform size")?;
+    let entries = budget("--max-entries", 100_000)?;
+    let entry_count = usize::try_from(entries).map_err(|_| "entry budget exceeds platform size")?;
+    let resource_overrides = managed.then_some(rpweld::build_resources::Overrides {
+        rootfs_bytes: values.contains_key("--max-rootfs-bytes").then_some(root),
+        layer_bytes: values.contains_key("--max-layer-bytes").then_some(layer),
+        metadata_bytes: values.contains_key("--metadata-budget").then_some(metadata),
+        entries: values.contains_key("--max-entries").then_some(entries),
+    });
     let timeout = budget("--run-timeout-seconds", 300)?;
     if timeout > 86400 {
         return Err("RUN timeout must be 1..86400 seconds".into());
@@ -532,6 +548,8 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
     }
     Ok(BuildCli {
         record: None,
+        resource_overrides,
+        resources: None,
         dockerfile: dockerfile.clone(),
         tags,
         push,
@@ -578,19 +596,19 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
                 layer: rpweld::layer::Limits {
                     max_blob_bytes: layer,
                     max_uncompressed_bytes: layer,
-                    max_entries: 100_000,
+                    max_entries: entry_count,
                     max_metadata_bytes: metadata,
                     max_gzip_header_bytes: 65536,
                 },
                 export: rpweld::export::Limits {
                     max_layer_bytes: layer,
-                    max_entries: 100_000,
+                    max_entries: entry_count,
                     max_metadata_bytes: metadata,
                 },
                 max_replay_bytes: layer,
-                max_replay_entries: 100_000,
+                max_replay_entries: entry_count,
                 max_rootfs_bytes: root,
-                max_rootfs_entries: 100_000,
+                max_rootfs_entries: entry_count,
                 max_plan_bytes: plan_bytes,
                 run_timeout_seconds: timeout,
             },
@@ -749,6 +767,34 @@ fn prepare_build(
         return Ok(None);
     }
     let context = std::fs::canonicalize(&cli.options.context).map_err(|e| e.to_string())?;
+    // Resolve and refuse before store_dir, leases, auth directories, or build records.
+    if let Some(overrides) = cli.resource_overrides {
+        let store = rpweld::store_inventory::resolve_store().map_err(|e| e.to_string())?;
+        let paths = rpweld::build_resources::Paths {
+            work: if cli.options.work.as_os_str().is_empty() {
+                store.clone()
+            } else {
+                cli.options.work.clone()
+            },
+            output: if cli.options.output.as_os_str().is_empty() {
+                store.clone()
+            } else {
+                cli.options.output.clone()
+            },
+            store,
+        };
+        let snapshot = rpweld::build_resources::Snapshot::observe(&paths)?;
+        let resources = rpweld::build_resources::Policy::resolve(
+            paths,
+            &snapshot,
+            overrides,
+            selected.len(),
+            rpweld::build::selected_images(&plan, &selected).len(),
+        )?;
+        resources.apply_to(&mut cli.options.limits);
+        write!(out, "{}", resources.diagnostics()).map_err(|e| e.to_string())?;
+        cli.resources = Some(resources);
+    }
     let store = registry::store_dir()?;
     let lease = match early_lease {
         Some(lease) => lease,
@@ -800,6 +846,10 @@ fn prepare_build(
         if cli.options.output.as_os_str().is_empty() {
             cli.options.output = run.join("image");
         }
+        if let Some(resources) = cli.resources.as_mut() {
+            resources.paths.work = cli.options.work.clone();
+            resources.paths.output = cli.options.output.clone();
+        }
         let mut resolved = BTreeMap::new();
         for name in pulls {
             let reference = registry::reference(&name, true)?;
@@ -814,6 +864,9 @@ fn prepare_build(
                     cli.options.limits.image,
                     cancelled,
                     |reference, layout| {
+                        if let Some(resources) = &cli.resources {
+                            resources.recheck("pull base image", &[])?;
+                        }
                         writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
                             .map_err(|e| e.to_string())?;
                         out.flush().map_err(|e| e.to_string())?;
@@ -831,6 +884,9 @@ fn prepare_build(
                     reference: None,
                 },
             );
+        }
+        if let Some(resources) = &cli.resources {
+            resources.recheck("create build work", &[])?;
         }
         Ok(())
     })();

@@ -3,6 +3,7 @@ pub mod build;
 mod build_cache;
 pub mod build_plan;
 pub mod build_record;
+pub mod build_resources;
 pub mod capabilities;
 pub mod cleanup_apply;
 pub mod cleanup_plan;
