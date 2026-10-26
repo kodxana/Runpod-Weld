@@ -766,6 +766,33 @@ fn finish_build(
 }
 
 #[cfg(target_os = "linux")]
+fn base_download_requirement(
+    destination: &std::path::Path,
+    summary: rpweld::registry::ManifestSummary,
+    metadata_limit: u64,
+) -> Result<rpweld::build_resources::Requirement, String> {
+    // Downloaded blobs coexist with fresh verified cache ingestion. This is
+    // compressed storage only; expanded replay is admitted separately.
+    let count = u64::try_from(summary.layer_count).map_err(|_| "base layer count overflow")?;
+    let bytes = summary
+        .declared_compressed_bytes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(metadata_limit.min(12 * 1024 * 1024) * 2))
+        .and_then(|n| n.checked_add(count.checked_mul(8192)?))
+        .and_then(|n| n.checked_add(65536))
+        .ok_or("base download space estimate overflow")?;
+    let inodes = count
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(32))
+        .ok_or("base download inode estimate overflow")?;
+    Ok(rpweld::build_resources::Requirement {
+        path: destination.to_owned(),
+        bytes,
+        inodes,
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn prepare_build(
     source: &str,
     cli: &mut BuildCli,
@@ -919,12 +946,20 @@ fn prepare_build(
                             writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
                                 .map_err(|e| e.to_string())?;
                             out.flush().map_err(|e| e.to_string())?;
-                            registry::Transport::new(&cli.registry)?.pull_checked(
+                            registry::Transport::new(&cli.registry)?.pull_checked_with_pre_copy(
                                 &lease,
                                 reference,
                                 layout,
                                 cli.options.limits.image,
                                 &cancelled,
+                                |summary| {
+                                    if let Some(resources) = &cli.resources {
+                                        resources.recheck("downloading and storing declared compressed base blobs", &[
+                                            base_download_requirement(layout, summary, cli.options.limits.image.max_total_metadata_bytes)?
+                                        ])?;
+                                    }
+                                    Ok(())
+                                },
                             )
                         },
                         cli.options.progress,
@@ -1300,6 +1335,37 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn base_download_admission_counts_compressed_copies_and_rejects_overflow() {
+        let requirement = base_download_requirement(
+            std::path::Path::new("download"),
+            rpweld::registry::ManifestSummary {
+                declared_compressed_bytes: 300 * 1024 * 1024,
+                layer_count: 2,
+            },
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            requirement.bytes,
+            600 * 1024 * 1024 + 2 * 4096 + 2 * 8192 + 65536
+        );
+        assert_eq!(requirement.inodes, 38);
+        assert!(
+            base_download_requirement(
+                std::path::Path::new("download"),
+                rpweld::registry::ManifestSummary {
+                    declared_compressed_bytes: u64::MAX / 2 + 1,
+                    layer_count: 0
+                },
+                4096,
+            )
+            .unwrap_err()
+            .contains("overflow")
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
