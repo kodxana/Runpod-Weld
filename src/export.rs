@@ -159,6 +159,7 @@ pub(crate) fn export_delta_layout_created(
             &cancelled,
             created,
             Some(baseline),
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -234,6 +235,80 @@ mod tests {
     fn config() -> Value {
         json!({"os":"linux","architecture":"amd64","config":{"Env":["A=B"],"Cmd":["/bin/app"],"User":"123:456","OnBuild":["RUN true"]},"future":{"keep":true},"rootfs":{"diff_ids":["stale"]},"history":[{"created_by":"stale"}]})
     }
+    #[test]
+    fn measured_resource_exports_preserve_flattened_and_layered_results() {
+        for layered in [false, true] {
+            let f = Fixture::new();
+            let baseline = layered.then(|| Baseline::scratch(&f.root, LIMITS, || false).unwrap());
+            fs::write(f.root.join("data"), vec![42; 65537]).unwrap();
+            fs::hard_link(f.root.join("data"), f.root.join("alias")).unwrap();
+            let paths = crate::build_resources::Paths {
+                work: f.root.clone(),
+                output: f.dest.clone(),
+                store: f.temp.path().to_owned(),
+            };
+            let snapshot = crate::build_resources::Snapshot::observe(&paths).unwrap();
+            let policy = crate::build_resources::Policy::resolve(
+                paths,
+                &snapshot,
+                crate::build_resources::Overrides::default(),
+                1,
+                0,
+            )
+            .unwrap();
+            export_created_with_resources(
+                &f.root,
+                &f.dest,
+                &config(),
+                baseline.as_ref(),
+                LIMITS,
+                Some(&policy),
+                || false,
+                || Ok(()),
+            )
+            .unwrap();
+            let metadata = f.load();
+            let spool = f.temp.path().join("verify");
+            fs::create_dir(&spool).unwrap();
+            let store = BlobStore::open(&f.dest).unwrap();
+            let verified = layer::verify(
+                &store,
+                &metadata.layers[0],
+                &metadata.diff_ids[0],
+                &spool,
+                layer::Limits {
+                    max_blob_bytes: 1 << 20,
+                    max_uncompressed_bytes: 1 << 20,
+                    max_entries: 100,
+                    max_metadata_bytes: 1 << 20,
+                    max_gzip_header_bytes: 65536,
+                },
+                || false,
+            )
+            .unwrap();
+            assert_eq!(
+                verified
+                    .entries()
+                    .iter()
+                    .filter(|e| e.kind == layer::EntryKind::File)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                verified
+                    .entries()
+                    .iter()
+                    .filter(|e| e.kind == layer::EntryKind::Hardlink)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                verified.entries().iter().map(|e| e.size).sum::<u64>(),
+                65537
+            );
+        }
+    }
+
     #[test]
     fn symlink_target_is_budgeted_before_read_and_size_checked() {
         let f = Fixture::new();
@@ -737,11 +812,61 @@ pub(crate) fn export_layout_created(
 ) -> Result<Descriptor, Error> {
     #[cfg(target_os = "linux")]
     {
-        linux::export(root, destination, config, limits, &cancelled, created, None)
+        linux::export(
+            root,
+            destination,
+            config,
+            limits,
+            &cancelled,
+            created,
+            None,
+            None,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (root, destination, config, limits, cancelled, created);
+        Err(Error::Invalid("export requires Linux"))
+    }
+}
+
+/// Engine-only current-space preflight; standalone callers retain explicit limits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn export_created_with_resources(
+    root: &Path,
+    destination: &Path,
+    config: &Value,
+    baseline: Option<&Baseline>,
+    limits: Limits,
+    resources: Option<&crate::build_resources::Policy>,
+    cancelled: impl Fn() -> bool,
+    created: impl FnOnce() -> io::Result<()>,
+) -> Result<Descriptor, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::export(
+            root,
+            destination,
+            config,
+            limits,
+            &cancelled,
+            created,
+            baseline,
+            resources,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            root,
+            destination,
+            config,
+            baseline,
+            limits,
+            resources,
+            cancelled,
+            created,
+        );
         Err(Error::Invalid("export requires Linux"))
     }
 }
@@ -834,6 +959,7 @@ mod linux {
         remaining_metadata: u64,
         cancelled: &'a C,
         noatime: bool,
+        estimate: Option<TarEstimate>,
     }
     impl<C: Fn() -> bool> Preflight<'_, C> {
         fn visit(&mut self, path: &Path, depth: usize) -> Result<(), Error> {
@@ -853,6 +979,10 @@ mod linux {
                 return Err(Error::Invalid("nested mount"));
             }
             let m = fs::symlink_metadata(path)?;
+            if let Some(estimate) = &mut self.estimate {
+                let attrs = xattrs(path, &mut estimate.remaining_metadata)?;
+                estimate.add(path, &m, &attrs)?;
+            }
             if m.is_dir() {
                 if self.forbidden.contains(&identity(&m)) {
                     return Err(Error::Invalid("source/destination inode alias"));
@@ -871,6 +1001,110 @@ mod linux {
             Ok(())
         }
     }
+
+    // Sizes come from the selected files and attributes, not workload ceilings.
+    // Allow tar/PAX/GNU headers and padding, and deduplicate hardlink payloads.
+    struct TarEstimate {
+        bytes: u64,
+        links: HashMap<(u64, u64), u64>,
+        remaining_metadata: u64,
+    }
+    impl TarEstimate {
+        fn new(metadata: u64) -> Self {
+            Self {
+                bytes: 1024,
+                links: HashMap::new(),
+                remaining_metadata: metadata,
+            }
+        }
+        fn add_bytes(&mut self, bytes: u64) -> Result<(), Error> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes)
+                .ok_or(Error::Limit("export space estimate"))?;
+            Ok(())
+        }
+        fn padded(bytes: u64) -> Result<u64, Error> {
+            bytes
+                .checked_add(511)
+                .map(|n| n / 512 * 512)
+                .ok_or(Error::Limit("export space estimate"))
+        }
+        fn add(
+            &mut self,
+            path: &Path,
+            m: &Metadata,
+            attrs: &[(String, Vec<u8>)],
+        ) -> Result<(), Error> {
+            let path_bytes = path.as_os_str().len() as u64;
+            let first = if !m.is_dir() && m.nlink() > 1 {
+                if let Some(first) = self.links.get(&identity(m)) {
+                    Some(*first)
+                } else {
+                    charge(&mut self.remaining_metadata, 128)?;
+                    self.links.insert(identity(m), path_bytes);
+                    None
+                }
+            } else {
+                None
+            };
+            self.add_bytes(3072)?;
+            self.add_bytes(Self::padded(path_bytes + 1)?)?;
+            let link_bytes = first.unwrap_or(if m.file_type().is_symlink() {
+                m.len()
+            } else {
+                0
+            });
+            self.add_bytes(Self::padded(
+                link_bytes
+                    .checked_add(1)
+                    .ok_or(Error::Limit("export space estimate"))?,
+            )?)?;
+            let mut pax_bytes = 128u64;
+            for (key, value) in attrs {
+                pax_bytes = pax_bytes
+                    .checked_add(key.len() as u64)
+                    .and_then(|n| n.checked_add(value.len() as u64))
+                    .and_then(|n| n.checked_add(32))
+                    .ok_or(Error::Limit("export space estimate"))?;
+            }
+            self.add_bytes(Self::padded(pax_bytes)?)?;
+            if m.is_file() && first.is_none() {
+                self.add_bytes(Self::padded(m.len())?)?;
+            }
+            Ok(())
+        }
+    }
+    #[cfg(test)]
+    #[test]
+    fn measured_export_space_deduplicates_payload_and_ignores_workload_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("long-first-name");
+        fs::write(&first, vec![7; 2 * 1024 * 1024]).unwrap();
+        let second = dir.path().join("b");
+        let third = dir.path().join("c");
+        fs::hard_link(&first, &second).unwrap();
+        fs::hard_link(&first, &third).unwrap();
+        let attrs = vec![("SCHILY.xattr.user.example".to_string(), vec![42; 1025])];
+        let measure = |ceiling| {
+            let mut estimate = TarEstimate::new(ceiling);
+            for path in [&first, &second, &third] {
+                estimate
+                    .add(path, &fs::metadata(path).unwrap(), &attrs)
+                    .unwrap();
+            }
+            assert_eq!(
+                estimate.links[&identity(&fs::metadata(&first).unwrap())],
+                first.as_os_str().len() as u64
+            );
+            estimate.bytes
+        };
+        let measured = measure(65536);
+        assert_eq!(measured, measure(4 * 1024 * 1024 * 1024));
+        assert!(measured >= 2 * 1024 * 1024 + 3 * 4096);
+        assert!(measured < 2 * 1024 * 1024 + 64 * 1024);
+    }
+
     fn mount_id(path: &Path) -> Result<u64, Error> {
         let p =
             CString::new(path.as_os_str().as_bytes()).map_err(|_| Error::Invalid("NUL path"))?;
@@ -1200,6 +1434,7 @@ mod linux {
         store.ingest(bytes, &d, bytes.len() as u64, c)?;
         Ok(d)
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn export(
         root: &Path,
         dest: &Path,
@@ -1208,6 +1443,7 @@ mod linux {
         c: &impl Fn() -> bool,
         created: impl FnOnce() -> std::io::Result<()>,
         baseline: Option<&Baseline>,
+        resources: Option<&crate::build_resources::Policy>,
     ) -> Result<Descriptor, Error> {
         check(c)?;
         // Our writer emits at most PAX + GNU long path + GNU long link + entry
@@ -1283,9 +1519,55 @@ mod linux {
             remaining_metadata: remaining,
             cancelled: c,
             noatime: baseline.is_some(),
+            estimate: (resources.is_some() && plan.is_none())
+                .then(|| TarEstimate::new(limits.max_metadata_bytes)),
         };
         preflight.visit(root, 0)?;
         remaining = preflight.remaining_metadata;
+        if let Some(resources) = resources {
+            let mut estimate = preflight
+                .estimate
+                .take()
+                .unwrap_or_else(|| TarEstimate::new(limits.max_metadata_bytes));
+            if let Some(plan) = &plan {
+                for path in &plan.changed {
+                    let node = &plan.inventory.entries[path];
+                    estimate.add(path, &node.metadata, &node.attrs)?;
+                }
+                for path in &plan.whiteouts {
+                    estimate.add_bytes(
+                        1024 + TarEstimate::padded(path.as_os_str().len() as u64 + 1)?,
+                    )?;
+                }
+            }
+            let mut bytes = estimate.bytes;
+            let mut inodes = 8u64;
+            if let Some(base) = baseline {
+                // Delta verification keeps a second uncompressed spool. Base
+                // descriptors are copied into independent public output inodes.
+                bytes = bytes
+                    .checked_mul(2)
+                    .ok_or(Error::Limit("export space estimate"))?;
+                let mut seen = std::collections::BTreeSet::new();
+                for descriptor in &base.state.layers {
+                    if seen.insert(&descriptor.digest) {
+                        bytes = bytes
+                            .checked_add(
+                                u64::try_from(descriptor.size)
+                                    .map_err(|_| Error::Invalid("negative base blob size"))?,
+                            )
+                            .ok_or(Error::Limit("export space estimate"))?;
+                        inodes += 1;
+                    }
+                }
+            }
+            bytes = bytes
+                .checked_add(65536)
+                .ok_or(Error::Limit("export space estimate"))?;
+            resources.recheck("exporting selected filesystem records (measured payloads plus tar/padding allowance)", &[
+                crate::build_resources::Requirement { path: dest.to_owned(), bytes, inodes }
+            ]).map_err(io::Error::other)?;
+        }
         fs::create_dir(dest)?; // exclusive ownership; never reuse existing output
         created()?;
         let store = BlobStore::open(dest)?;

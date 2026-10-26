@@ -1070,7 +1070,13 @@ fn directory(root: &Path, image_path: &str, user: Option<&str>) -> Result<PathBu
     Ok(target)
 }
 
-fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<()> {
+#[derive(Default)]
+struct RootUsage {
+    bytes: u64,
+    entries: usize,
+}
+
+fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<RootUsage> {
     fn walk(
         p: &Path,
         bytes: &mut u64,
@@ -1105,7 +1111,117 @@ fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<()>
         directory.set_times(fs::FileTimes::new().set_accessed(accessed))?;
         result
     }
-    walk(root, &mut 0, &mut 0, 0, limits, c)
+    let mut usage = RootUsage::default();
+    walk(root, &mut usage.bytes, &mut usage.entries, 0, limits, c)?;
+    Ok(usage)
+}
+
+fn check_replay_space(
+    resources: Option<&crate::build_resources::Policy>,
+    root: &Path,
+    verified: &layer::VerifiedLayer,
+) -> Result<()> {
+    if resources.is_none() {
+        return Ok(());
+    }
+    let mut bytes = 0u64;
+    let mut inodes = 1u64;
+    for entry in verified.entries() {
+        // Replacement files and implicit parents may coexist with the old tree.
+        // Charge all records conservatively; this is an estimate, not a quota.
+        let parents = entry.path.iter().filter(|b| **b == b'/').count() as u64;
+        inodes = inodes
+            .checked_add(1 + parents)
+            .ok_or("replay inode estimate overflow")?;
+        let payload = entry.size.checked_add(4095).ok_or("replay size overflow")? / 4096 * 4096;
+        bytes = bytes
+            .checked_add(payload)
+            .and_then(|n| n.checked_add((1 + parents) * 4096))
+            .ok_or("replay space estimate overflow")?;
+    }
+    resource_check(
+        resources,
+        "replaying verified layer (additional allocation estimate)",
+        &[crate::build_resources::Requirement {
+            path: root.to_owned(),
+            bytes,
+            inodes,
+        }],
+    )?;
+    Ok(())
+}
+
+fn check_spool_space(
+    resources: Option<&crate::build_resources::Policy>,
+    spool: &Path,
+    descriptor: &Descriptor,
+) -> Result<()> {
+    // Plain tar size is known before spooling. Compressed expansion is unknown;
+    // its streaming cancellation callback still rechecks current disk reserves.
+    if descriptor.media_type.ends_with(".tar") {
+        resource_check(
+            resources,
+            "verifying uncompressed layer spool",
+            &[crate::build_resources::Requirement {
+                path: spool.to_owned(),
+                bytes: u64::try_from(descriptor.size).map_err(|_| "negative layer size")?,
+                inodes: 1,
+            }],
+        )?;
+    }
+    Ok(())
+}
+
+fn check_layout_space(
+    resources: Option<&crate::build_resources::Policy>,
+    source: &Path,
+    destination: &Path,
+    shared_pool: Option<&Path>,
+    limits: Limits,
+    cancelled: &impl Fn() -> bool,
+) -> Result<()> {
+    if resources.is_none() {
+        return Ok(());
+    }
+    let mut bytes = 65536u64;
+    let mut inodes = 8u64;
+    let mut count = 0usize;
+    for entry in fs::read_dir(source.join("blobs/sha256"))? {
+        check(cancelled)?;
+        count = count
+            .checked_add(1)
+            .ok_or("layout descriptor count overflow")?;
+        if count > limits.image.max_descriptors {
+            return Err("layout resource scan descriptor limit".into());
+        }
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("layout resource scan requires regular blob files".into());
+        }
+        // Existing managed blobs are verified by publication; this observation
+        // only avoids reserving a second payload when no copy will be made.
+        let reused = shared_pool.is_some_and(|p| p.join(entry.file_name()).exists());
+        if !reused {
+            bytes = bytes
+                .checked_add(metadata.len())
+                .and_then(|n| n.checked_add(4096))
+                .ok_or("layout copy space overflow")?;
+        }
+        inodes = inodes
+            .checked_add(if shared_pool.is_some() { 3 } else { 1 })
+            .ok_or("layout inode estimate overflow")?;
+    }
+    resource_check(
+        resources,
+        "publishing image/checkpoint (measured blobs plus metadata allowance)",
+        &[crate::build_resources::Requirement {
+            path: destination.to_owned(),
+            bytes,
+            inodes,
+        }],
+    )?;
+    Ok(())
 }
 
 /// Parse/static-preflight completely before creating directories. Spawns the
@@ -1138,6 +1254,7 @@ fn verify_checkpoint(
     root: Option<&Path>,
     spool: &Path,
     limits: Limits,
+    resources: Option<&crate::build_resources::Policy>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Descriptor> {
     for suffix in ["", "blobs", "blobs/sha256"] {
@@ -1162,10 +1279,12 @@ fn verify_checkpoint(
         budget.max_entries = budget
             .max_entries
             .min(limits.max_replay_entries.saturating_sub(entries));
+        check_spool_space(resources, spool, descriptor)?;
         let mut verified = layer::verify(&store, descriptor, diff, spool, budget, cancelled)?;
         bytes += verified.size();
         entries += verified.physical_header_count();
         if let Some(root) = root {
+            check_replay_space(resources, root, &verified)?;
             rootfs::apply_layer(root, &mut verified, cancelled)?;
             root_budget(root, limits, cancelled)?;
         }
@@ -1214,8 +1333,29 @@ impl StageCache<'_> {
         entry: &Path,
         targets: &[Vec<Vec<u8>>],
         limits: Limits,
+        resources: Option<&crate::build_resources::Policy>,
         cancelled: &impl Fn() -> bool,
     ) -> Result<()> {
+        let shared_pool = {
+            #[cfg(target_os = "linux")]
+            {
+                self.managed
+                    .as_ref()
+                    .map(|_| self.root.parent().unwrap().join("content/blobs/sha256"))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None::<PathBuf>
+            }
+        };
+        check_layout_space(
+            resources,
+            source,
+            entry,
+            shared_pool.as_deref(),
+            limits,
+            cancelled,
+        )?;
         #[cfg(target_os = "linux")]
         if let Some(managed) = &self.managed {
             let key = entry
@@ -1249,23 +1389,20 @@ fn export_stage(
     config: &Value,
     baseline: Option<&export::Baseline>,
     limits: export::Limits,
+    resources: Option<&crate::build_resources::Policy>,
     cancelled: &impl Fn() -> bool,
     created: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<Descriptor> {
-    Ok(match baseline {
-        Some(baseline) => export::export_delta_layout_created(
-            root,
-            destination,
-            config,
-            baseline,
-            limits,
-            cancelled,
-            created,
-        )?,
-        None => {
-            export::export_layout_created(root, destination, config, limits, cancelled, created)?
-        }
-    })
+    Ok(export::export_created_with_resources(
+        root,
+        destination,
+        config,
+        baseline,
+        limits,
+        resources,
+        cancelled,
+        created,
+    )?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1276,11 +1413,20 @@ fn restore_checkpoint(
     retained: &str,
     spool: &Path,
     limits: Limits,
+    resources: Option<&crate::build_resources::Policy>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Descriptor> {
     let replacement = work.join(format!("checkpoint-{retained}"));
     create_image_root(&replacement)?;
-    let manifest = verify_checkpoint(layout, config, Some(&replacement), spool, limits, cancelled)?;
+    let manifest = verify_checkpoint(
+        layout,
+        config,
+        Some(&replacement),
+        spool,
+        limits,
+        resources,
+        cancelled,
+    )?;
     check(cancelled)?;
     let root = work.join("rootfs");
     fs::rename(&root, work.join(retained))?;
@@ -1378,7 +1524,7 @@ pub fn build(
     options: &BuildOptions,
     cancelled: impl Fn() -> bool,
 ) -> Result<BuildResult> {
-    build_inner(source, options, None, None, cancelled)
+    build_inner(source, options, None, None, None, cancelled)
 }
 
 /// Caller keeps this lease through use of returned managed paths, tagging and push.
@@ -1388,7 +1534,7 @@ pub fn build_with_lease(
     lease: &crate::store_lease::StoreLease,
     cancelled: impl Fn() -> bool,
 ) -> Result<BuildResult> {
-    build_inner(source, options, Some(lease), None, cancelled)
+    build_inner(source, options, Some(lease), None, None, cancelled)
 }
 
 #[cfg(target_os = "linux")]
@@ -1400,18 +1546,116 @@ pub fn build_recorded(
     cancelled: impl Fn() -> bool,
 ) -> Result<BuildResult> {
     record.update(lease, |r| r.phase = crate::build_record::Phase::Building)?;
-    let result = build_inner(source, options, Some(lease), Some(record), cancelled);
+    let result = build_inner(source, options, Some(lease), Some(record), None, cancelled);
     if result.is_err() && record.record.manifest.is_none() {
         record.update(lease, |r| r.phase = crate::build_record::Phase::Failed)?;
     }
     result
 }
 
+/// Managed CLI entry point with current-capacity checks. These are observations,
+/// not quotas; trusted RUN commands can allocate faster than cooperative polling.
+#[cfg(target_os = "linux")]
+pub fn build_recorded_with_resources(
+    source: &str,
+    options: &BuildOptions,
+    lease: &crate::store_lease::StoreLease,
+    record: &mut crate::build_record::BuildRecord,
+    resources: &crate::build_resources::Policy,
+    cancelled: impl Fn() -> bool,
+) -> Result<BuildResult> {
+    record.update(lease, |r| r.phase = crate::build_record::Phase::Building)?;
+    let result = build_inner(
+        source,
+        options,
+        Some(lease),
+        Some(record),
+        Some(resources),
+        cancelled,
+    );
+    if result.is_err() && record.record.manifest.is_none() {
+        record.update(lease, |r| r.phase = crate::build_record::Phase::Failed)?;
+    }
+    result
+}
+
+// Reuse normal cancellation and descendant cleanup when resources shrink during
+// a RUN or streamed write, but report the capacity error instead of "cancelled".
+fn with_resource_checks<T>(
+    mut recheck: impl FnMut() -> std::result::Result<(), String>,
+    cancelled: impl Fn() -> bool,
+    run: impl FnOnce(&dyn Fn() -> bool) -> Result<T>,
+) -> Result<T> {
+    use std::cell::{Cell, RefCell};
+    check(&cancelled)?;
+    recheck()?;
+    let recheck = RefCell::new(recheck);
+    let last = Cell::new(std::time::Instant::now());
+    let failure = RefCell::new(None);
+    let stop = || {
+        if cancelled() || failure.borrow().is_some() {
+            return true;
+        }
+        if last.get().elapsed() >= std::time::Duration::from_secs(1) {
+            last.set(std::time::Instant::now());
+            if let Err(error) = (recheck.borrow_mut())() {
+                *failure.borrow_mut() = Some(error);
+                return true;
+            }
+        }
+        false
+    };
+    let result = run(&stop);
+    // Do not turn an already-published success into a failure after the fact.
+    match (result, failure.into_inner()) {
+        (Err(original), Some(error)) => {
+            Err(format!("{error}; stopped operation: {original}").into())
+        }
+        (result, _) => result,
+    }
+}
+
 fn build_inner(
     source: &str,
     options: &BuildOptions,
     lease: Option<&crate::store_lease::StoreLease>,
+    record: Option<&mut crate::build_record::BuildRecord>,
+    resources: Option<&crate::build_resources::Policy>,
+    cancelled: impl Fn() -> bool,
+) -> Result<BuildResult> {
+    match resources {
+        Some(policy) => with_resource_policy(policy, "build in progress", cancelled, |stop| {
+            build_inner_checked(source, options, lease, record, resources, stop)
+        }),
+        None => build_inner_checked(source, options, lease, record, None, cancelled),
+    }
+}
+
+/// Apply current-space checks to a cooperative managed operation, including
+/// registry transfers. The callback must stop and clean up when asked to cancel.
+pub fn with_resource_policy<T>(
+    resources: &crate::build_resources::Policy,
+    operation: &str,
+    cancelled: impl Fn() -> bool,
+    run: impl FnOnce(&dyn Fn() -> bool) -> Result<T>,
+) -> Result<T> {
+    with_resource_checks(|| resources.recheck(operation, &[]), cancelled, run)
+}
+
+fn resource_check(
+    resources: Option<&crate::build_resources::Policy>,
+    operation: &str,
+    requirements: &[crate::build_resources::Requirement],
+) -> std::result::Result<(), String> {
+    resources.map_or(Ok(()), |p| p.recheck(operation, requirements))
+}
+
+fn build_inner_checked(
+    source: &str,
+    options: &BuildOptions,
+    lease: Option<&crate::store_lease::StoreLease>,
     mut record: Option<&mut crate::build_record::BuildRecord>,
+    resources: Option<&crate::build_resources::Policy>,
     cancelled: impl Fn() -> bool,
 ) -> Result<BuildResult> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -1589,9 +1833,11 @@ fn build_inner(
             budget.max_entries = budget
                 .max_entries
                 .min(options.limits.max_replay_entries.saturating_sub(entries));
+            check_spool_space(resources, &spool, descriptor)?;
             let mut verified = layer::verify(&store, descriptor, diff, &spool, budget, cancelled)?;
             bytes += verified.size();
             entries += verified.physical_header_count();
+            check_replay_space(resources, &root, &verified)?;
             rootfs::apply_layer(&root, &mut verified, cancelled)?;
             root_budget(&root, options.limits, &cancelled)?;
         }
@@ -1622,6 +1868,7 @@ fn build_inner(
             record.as_deref_mut(),
             n == target,
             lease,
+            resources,
             || {
                 phase.tick();
                 cancelled()
@@ -1646,6 +1893,7 @@ fn build_stage(
     mut record: Option<&mut crate::build_record::BuildRecord>,
     final_stage: bool,
     lease: Option<&crate::store_lease::StoreLease>,
+    resources: Option<&crate::build_resources::Policy>,
     cancelled: impl Fn() -> bool,
 ) -> Result<StageResult> {
     check(&cancelled)?;
@@ -1935,6 +2183,8 @@ fn build_stage(
     for p in [&spool, &state] {
         fs::create_dir(p)?;
     }
+    let mut base_usage = RootUsage::default();
+    let mut largest_spool = 0u64;
     if let (Some(m), Some(p)) = (&metadata, &base_path) {
         let store = BlobStore::open(p)?;
         let mut bytes = 0u64;
@@ -1963,6 +2213,7 @@ fn build_stage(
                 crate::progress::count_bar(layer_index, m.layers.len()),
                 layer_index + 1
             ));
+            check_spool_space(resources, &spool, descriptor)?;
             let mut verified = layer::verify(&store, descriptor, diff, &spool, limits, || {
                 preparation.tick();
                 phase.tick();
@@ -1971,6 +2222,8 @@ fn build_stage(
             phase.finish();
             bytes += verified.size();
             entries += verified.physical_header_count();
+            largest_spool = largest_spool.max(verified.size());
+            check_replay_space(resources, &root, &verified)?;
             let phase = crate::progress::Phase::start(
                 options.progress && options.verbose,
                 format!(
@@ -1998,7 +2251,7 @@ fn build_stage(
                 "{} | checking filesystem budgets",
                 crate::progress::count_bar(layer_index, m.layers.len())
             ));
-            root_budget(&root, options.limits, &|| {
+            base_usage = root_budget(&root, options.limits, &|| {
                 preparation.tick();
                 phase.tick();
                 cancelled()
@@ -2009,6 +2262,21 @@ fn build_stage(
         preparation.finish();
     }
     let baseline = if options.export_mode == ExportMode::Layered && !cache_hit {
+        resource_check(
+            resources,
+            "capturing layered baseline (measured root plus largest spool)",
+            &[crate::build_resources::Requirement {
+                path: work.clone(),
+                bytes: base_usage
+                    .bytes
+                    .checked_add(largest_spool)
+                    .and_then(|n| n.checked_add((base_usage.entries as u64).checked_mul(4096)?))
+                    .ok_or("baseline allocation estimate overflow")?,
+                inodes: (base_usage.entries as u64)
+                    .checked_add(8)
+                    .ok_or("baseline inode overflow")?,
+            }],
+        )?;
         Some(match (&base_path, binding) {
             (Some(layout), Some(binding)) => export::Baseline::capture(
                 &root,
@@ -2172,6 +2440,7 @@ fn build_stage(
                 &format!("rootfs-before-{}", boundary.ordinal),
                 &spool,
                 options.limits,
+                resources,
                 &cancelled,
             )?;
             materialized |= instruction_steps
@@ -2293,6 +2562,7 @@ fn build_stage(
                 &checkpoint_config,
                 baseline.as_ref(),
                 options.limits.export,
+                resources,
                 &|| {
                     phase.tick();
                     cancelled()
@@ -2313,6 +2583,7 @@ fn build_stage(
                 &format!("rootfs-exported-{}", boundary.ordinal),
                 &spool,
                 options.limits,
+                resources,
                 &|| {
                     phase.tick();
                     cancelled()
@@ -2326,6 +2597,7 @@ fn build_stage(
                     &entry,
                     &copy_targets[receipt_start..],
                     options.limits,
+                    resources,
                     &cancelled,
                 )?;
             }
@@ -2357,6 +2629,14 @@ fn build_stage(
     let manifest = if cache_hit {
         // Preserve the cached OCI bytes: re-exporting a replayed tree changes
         // access timestamps and would invalidate every dependent stage.
+        check_layout_space(
+            resources,
+            cache_entry.as_ref().unwrap(),
+            &output,
+            None,
+            options.limits,
+            &cancelled,
+        )?;
         crate::build_cache::publish_created(
             cache_entry.as_ref().unwrap(),
             lease,
@@ -2375,6 +2655,14 @@ fn build_stage(
     } else if let Some((snapshot, manifest, checkpoint_config)) = &last_checkpoint
         && *checkpoint_config == config["config"]
     {
+        check_layout_space(
+            resources,
+            snapshot,
+            &output,
+            None,
+            options.limits,
+            &cancelled,
+        )?;
         crate::build_cache::publish_created(
             snapshot,
             lease,
@@ -2398,6 +2686,7 @@ fn build_stage(
             &config,
             baseline.as_ref(),
             options.limits.export,
+            resources,
             &output_cancelled,
             || {
                 #[cfg(target_os = "linux")]
@@ -2434,6 +2723,7 @@ fn build_stage(
                 None,
                 &spool,
                 options.limits,
+                resources,
                 &verification_cancelled,
             )?
         } else {
@@ -2444,6 +2734,7 @@ fn build_stage(
                 "rootfs-final-export",
                 &spool,
                 options.limits,
+                resources,
                 &verification_cancelled,
             )?
         };
@@ -2466,6 +2757,7 @@ fn build_stage(
             &entry,
             &copy_targets,
             options.limits,
+            resources,
             &cancelled,
         )?;
     }
@@ -2640,6 +2932,48 @@ fn worker(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    #[test]
+    fn resource_refusal_precedes_work_and_stops_cooperatively_with_its_reason() {
+        use std::cell::Cell;
+        let ran = Cell::new(false);
+        let denied = super::with_resource_checks(
+            || Err("export requires 8192 bytes; available 4096".into()),
+            || false,
+            |_| {
+                ran.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!ran.get());
+        assert!(denied.contains("available 4096"));
+        let checks = Cell::new(0);
+        let stopped = Cell::new(false);
+        let denied = super::with_resource_checks(
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 1 {
+                    Ok(())
+                } else {
+                    Err("available disk fell below reserve".into())
+                }
+            },
+            || false,
+            |cancelled| {
+                std::thread::sleep(std::time::Duration::from_millis(1050));
+                assert!(cancelled());
+                stopped.set(true);
+                Err::<(), super::Error>("worker cancelled; descendants stopped".into())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(stopped.get());
+        assert!(denied.contains("available disk fell below reserve"));
+        assert!(denied.contains("descendants stopped"));
+        assert!(!denied.starts_with("build cancelled"));
+    }
     #[test]
     fn absent_secret_guard_never_reads_deletes_or_follows_inherited_paths() {
         use std::{fs, os::unix::fs::symlink};

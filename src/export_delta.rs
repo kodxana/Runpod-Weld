@@ -55,7 +55,7 @@ pub(super) fn names(path: &Path, c: &impl Fn() -> bool) -> Result<Names, Error> 
 
 pub(super) struct Node {
     pub(super) metadata: Metadata,
-    attrs: Vec<(String, Vec<u8>)>,
+    pub(super) attrs: Vec<(String, Vec<u8>)>,
     hash: Option<[u8; 32]>,
     pub(super) target: Option<PathBuf>,
     anchor: PathBuf,
@@ -66,7 +66,7 @@ pub(super) struct Inventory {
 pub(crate) struct State {
     inventory: Inventory,
     layout: Option<PathBuf>,
-    layers: Vec<Descriptor>,
+    pub(super) layers: Vec<Descriptor>,
     diff_ids: Vec<crate::oci::Sha256Digest>,
     history: Option<Value>,
     blob_limit: u64,
@@ -295,6 +295,7 @@ pub(crate) fn capture(
         remaining_metadata: limits.max_metadata_bytes,
         cancelled: c,
         noatime: true,
+        estimate: None,
     };
     preflight.visit(root, 0)?;
     drop(preflight);

@@ -659,7 +659,18 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
         Some(lease) => {
             #[cfg(target_os = "linux")]
             if let Some(r) = cli.record.as_mut() {
-                rpweld::build::build_recorded(&source, &cli.options, lease, r, cancelled)
+                if let Some(resources) = cli.resources.as_ref() {
+                    rpweld::build::build_recorded_with_resources(
+                        &source,
+                        &cli.options,
+                        lease,
+                        r,
+                        resources,
+                        cancelled,
+                    )
+                } else {
+                    rpweld::build::build_recorded(&source, &cli.options, lease, r, cancelled)
+                }
             } else {
                 rpweld::build::build_with_lease(&source, &cli.options, lease, cancelled)
             }
@@ -861,30 +872,44 @@ fn prepare_build(
             let layout = if let Some(layout) = resolved.get(&reference) {
                 std::path::PathBuf::clone(layout)
             } else {
-                let layout = registry::cached_base_with_progress(
-                    &store,
-                    &lease,
-                    &reference,
-                    cli.pull,
-                    cli.options.limits.image,
-                    cancelled,
-                    |reference, layout| {
-                        if let Some(resources) = &cli.resources {
-                            resources.recheck("pull base image", &[])?;
-                        }
-                        writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
-                            .map_err(|e| e.to_string())?;
-                        out.flush().map_err(|e| e.to_string())?;
-                        registry::Transport::new(&cli.registry)?.pull_checked(
-                            &lease,
-                            reference,
-                            layout,
-                            cli.options.limits.image,
-                            &cancelled,
-                        )
-                    },
-                    cli.options.progress,
-                )?;
+                let mut load = |stop: &dyn Fn() -> bool| {
+                    let cancelled = || stop();
+                    registry::cached_base_with_progress(
+                        &store,
+                        &lease,
+                        &reference,
+                        cli.pull,
+                        cli.options.limits.image,
+                        cancelled,
+                        |reference, layout| {
+                            if let Some(resources) = &cli.resources {
+                                resources.recheck("pull base image", &[])?;
+                            }
+                            writeln!(out, "Pulling {reference} (linux/amd64, verified TLS)...")
+                                .map_err(|e| e.to_string())?;
+                            out.flush().map_err(|e| e.to_string())?;
+                            registry::Transport::new(&cli.registry)?.pull_checked(
+                                &lease,
+                                reference,
+                                layout,
+                                cli.options.limits.image,
+                                &cancelled,
+                            )
+                        },
+                        cli.options.progress,
+                    )
+                };
+                let layout = if let Some(resources) = cli.resources.as_ref() {
+                    rpweld::build::with_resource_policy(
+                        resources,
+                        "preparing registry base",
+                        cancelled,
+                        |stop| load(stop).map_err(Into::into),
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    load(&cancelled)?
+                };
                 resolved.insert(reference, layout.clone());
                 layout
             };
@@ -1204,7 +1229,7 @@ fn summary(report: &serde_json::Value) -> String {
             result.push_str(&format!("Warning: {warning}\n"));
         }
     }
-    result.push_str("Experimental build supports multi-stage registry/local OCI or scratch with restricted local COPY; no multistage. See build --help for registry and COPY options. RUN resources require external enforcement. Use --json for raw observations.\n");
+    result.push_str("Build supports multi-stage registry/local OCI or scratch, with bounded Dockerfile support. Managed builds choose workload ceilings from observed resources; rechecks are not RUN resource quotas. See build --help for supported options and --json for raw observations.\n");
     result
 }
 
