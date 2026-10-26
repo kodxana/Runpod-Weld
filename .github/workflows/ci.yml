@@ -11,6 +11,8 @@ jobs:
     timeout-minutes: 35
     env:
       CARGO_BUILD_JOBS: 2
+      # Tests deliberately exec as uid 65534; runner workspaces may be private.
+      CARGO_TARGET_DIR: /var/tmp/rpweld-ci-target
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -23,15 +25,16 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: Run Linux tests with real ownership capabilities
         run: |
+          mkdir -m 755 "$CARGO_TARGET_DIR"
           cargo test --locked --all-targets --no-run
-          sudo env "PATH=$PATH" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" CARGO_BUILD_JOBS=2 cargo test --locked --all-targets
+          sudo env "PATH=$PATH" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" CARGO_BUILD_JOBS=2 cargo test --locked --all-targets
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo build --locked --bin rpweld
       - name: Verify authenticated HTTPS registry workflow
         run: |
           mkdir "$RUNNER_TEMP/weld-registry"
           (cd "$RUNNER_TEMP/weld-registry" && apt-get download docker-registry && dpkg-deb -x ./*.deb unpacked)
-          sudo python3 tests/registry_https.py --weld "$PWD/target/debug/rpweld" \
+          sudo python3 tests/registry_https.py --weld "$CARGO_TARGET_DIR/debug/rpweld" \
             --registry "$RUNNER_TEMP/weld-registry/unpacked/usr/bin/docker-registry"
-      - run: python3 tests/scan_cli.py target/debug/rpweld
+      - run: python3 tests/scan_cli.py "$CARGO_TARGET_DIR/debug/rpweld"
       - run: python3 tests/compatibility.py --self-test
