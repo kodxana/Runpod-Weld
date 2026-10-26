@@ -232,6 +232,77 @@ fn local_base(o: &mut BuildOptions, root: &Path, prepare: impl FnOnce(&Path)) {
 }
 
 #[test]
+fn final_checkpoint_keeps_verified_root_without_second_replay() {
+    use std::os::unix::fs::MetadataExt;
+    for mode in [build::ExportMode::Flattened, build::ExportMode::Layered] {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        o.export_mode = mode;
+        local_base(&mut o, t.path(), |root| {
+            let stamp = root.join("stamp");
+            fs::create_dir(&stamp).unwrap();
+            fs::File::open(stamp)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new().set_accessed(UNIX_EPOCH + Duration::from_secs(946684800)),
+                )
+                .unwrap();
+        });
+        write(&o.context.join("payload"), "payload");
+        let source = "FROM local\nCOPY payload /payload\n";
+        for phase in ["cold", "instruction-hit"] {
+            if phase == "instruction-hit" {
+                // Change the whole-context key without changing selected COPY inputs.
+                write(&o.context.join("unrelated"), "unrelated");
+                next(&mut o, t.path(), phase);
+            }
+            build::build(source, &o, never_cancel).unwrap();
+            assert!(
+                !o.work.join("rootfs-final-export").exists(),
+                "{mode:?} {phase}: redundant replay"
+            );
+            assert_eq!(
+                fs::metadata(o.work.join("rootfs/stamp")).unwrap().atime(),
+                946684800
+            );
+            assert_eq!(fs::read(o.work.join("rootfs/payload")).unwrap(), b"payload");
+            if phase == "instruction-hit" {
+                assert!(o.work.join("rootfs-before-2").exists());
+            }
+            let output = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+            let store = rpweld::oci::BlobStore::open(&o.output).unwrap();
+            let spool = tempfile::tempdir().unwrap();
+            for (descriptor, diff_id) in output.layers.iter().zip(&output.diff_ids) {
+                layer::verify(
+                    &store,
+                    descriptor,
+                    diff_id,
+                    spool.path(),
+                    o.limits.layer,
+                    never_cancel,
+                )
+                .unwrap();
+            }
+        }
+        next(&mut o, t.path(), "metadata-suffix");
+        build::build(
+            &format!("{source}LABEL revision=changed\n"),
+            &o,
+            never_cancel,
+        )
+        .unwrap();
+        assert!(
+            o.work.join("rootfs-final-export").exists(),
+            "a fresh export still needs restoration"
+        );
+        assert_eq!(
+            fs::metadata(o.work.join("rootfs/stamp")).unwrap().atime(),
+            946684800
+        );
+    }
+}
+
+#[test]
 fn cold_and_hit_retained_roots_preserve_checkpoint_directory_atime() {
     use std::os::unix::fs::MetadataExt;
     let t = tempfile::tempdir().unwrap();

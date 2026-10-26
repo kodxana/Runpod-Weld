@@ -2270,6 +2270,7 @@ fn build_stage(
         start = boundary.end;
     }
     check(&cancelled)?;
+    let mut output_reuses_restored_checkpoint = false;
     let manifest = if cache_hit {
         // Preserve the cached OCI bytes: re-exporting a replayed tree changes
         // access timestamps and would invalidate every dependent stage.
@@ -2298,6 +2299,7 @@ fn build_stage(
             }
             Ok(())
         })?;
+        output_reuses_restored_checkpoint = true;
         manifest.clone()
     } else {
         export_stage(
@@ -2319,15 +2321,29 @@ fn build_stage(
     if !cache_hit && (cache_entry.is_some() || !final_stage) {
         // Export traverses directories: COPY --from must consume the exported
         // metadata even with caching disabled or a metadata-only stage suffix.
-        let verified = restore_checkpoint(
-            &output,
-            &config["config"],
-            &work,
-            "rootfs-final-export",
-            &spool,
-            options.limits,
-            &cancelled,
-        )?;
+        let verified = if output_reuses_restored_checkpoint {
+            // The last instruction already restored this exact snapshot. Copying
+            // its OCI blobs does not touch rootfs; verify the output without
+            // writing and retaining another identical filesystem tree.
+            verify_checkpoint(
+                &output,
+                &config["config"],
+                None,
+                &spool,
+                options.limits,
+                &cancelled,
+            )?
+        } else {
+            restore_checkpoint(
+                &output,
+                &config["config"],
+                &work,
+                "rootfs-final-export",
+                &spool,
+                options.limits,
+                &cancelled,
+            )?
+        };
         if verified != manifest {
             return Err("exported stage identity changed during verification".into());
         }
