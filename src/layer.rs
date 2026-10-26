@@ -16,6 +16,7 @@
 //! Payload transfer uses 64 KiB buffers. Metadata accounting is cumulative:
 //! every physical header costs 512 bytes; extension payloads cost twice their size,
 //! every PAX record costs 128 bytes, and effective strings are charged before copying.
+//! A single PAX/GNU payload is capped at 16 MiB independently of workload budgets.
 //! Overwritten/deleted records are not refunded. max_entries bounds physical nonzero
 //! headers (including extensions), not just returned entries. Payload sizes are u64,
 //! bounded by max_uncompressed_bytes and checked framing, without an 8 GiB cap.
@@ -41,6 +42,7 @@ use std::{
 };
 
 const BUFFER_SIZE: usize = 64 * 1024;
+const MAX_EXTENSION_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -645,6 +647,9 @@ fn inspect(
                     "global PAX unsupported (including semantic fields)",
                 ));
             }
+            if raw_size > MAX_EXTENSION_BYTES {
+                return Err(Error::Limit("single extension payload exceeds 16 MiB"));
+            }
             let (end, next) = framing(offset, raw_size, size)?;
             charge(
                 &mut metadata,
@@ -944,6 +949,52 @@ mod tests {
             let verified = f.verify(&bytes, false, &digest(&bytes), limits()).unwrap();
             assert_eq!(verified.entries()[0].path, path.as_bytes());
         }
+    }
+
+    #[test]
+    fn extension_allocation_is_bounded_independently_of_workload_metadata() {
+        let cap = 16 * 1024 * 1024;
+        let large = Limits {
+            max_uncompressed_bytes: 1 << 40,
+            max_metadata_bytes: 1 << 32,
+            ..limits()
+        };
+        for kind in [b'x', b'L', b'K'] {
+            // A valid header alone must fail before payload framing or allocation.
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(header("extension", kind, cap + 1, None).as_bytes())
+                .unwrap();
+            file.rewind().unwrap();
+            assert!(matches!(
+                inspect(&mut file, 512, large, &|| false),
+                Err(Error::Limit("single extension payload exceeds 16 MiB"))
+            ));
+        }
+        // Exact-boundary GNU payload remains valid; the aggregate cap still applies.
+        let mut payload = vec![0; cap as usize];
+        payload[..4].copy_from_slice(b"name");
+        let bytes = archive(vec![
+            (header("extension", b'L', cap, None), payload),
+            (header("raw", b'0', 0, None), vec![]),
+        ]);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.rewind().unwrap();
+        let (entries, _) = inspect(&mut file, bytes.len() as u64, large, &|| false).unwrap();
+        assert_eq!(entries[0].path, b"name");
+        file.rewind().unwrap();
+        assert!(matches!(
+            inspect(
+                &mut file,
+                bytes.len() as u64,
+                Limits {
+                    max_metadata_bytes: cap * 2,
+                    ..large
+                },
+                &|| false
+            ),
+            Err(Error::Limit("metadata bytes"))
+        ));
     }
     use flate2::{Compression, write::GzEncoder};
     use std::{cell::Cell, io::Cursor};
