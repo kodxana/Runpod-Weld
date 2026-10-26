@@ -70,12 +70,16 @@ fn automatic_and_explicit_origins_are_reported_even_when_progress_is_quiet() {
 }
 
 #[test]
-fn fd_preflight_refuses_before_creating_store_work_or_auth_state() {
+fn no_cache_scratch_succeeds_below_replay_fd_overhead() {
+    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let context = temp.path().join("context");
     fs::create_dir(&context).unwrap();
-    // An unresolved registry base demonstrates refusal precedes transport, too.
-    fs::write(context.join("Dockerfile"), "FROM example.invalid/base\n").unwrap();
+    let store = temp.path().join("store");
+    fs::create_dir(&store).unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = store.join("Dockerfile");
+    fs::write(&source, "FROM scratch\n").unwrap();
     let mut cmd = command(temp.path());
     unsafe {
         cmd.pre_exec(|| {
@@ -90,21 +94,104 @@ fn fd_preflight_refuses_before_creating_store_work_or_auth_state() {
         });
     }
     let result = cmd
-        .args(["build", "-t", "test/refusal"])
+        .args(["build", "-t", "test/low-fds", "--no-cache", "-f"])
+        .arg(&source)
         .arg(&context)
         .output()
         .unwrap();
-    assert!(!result.status.success());
-    let error = String::from_utf8_lossy(&result.stderr);
     assert!(
-        error.contains("build preflight")
-            && error.contains("available 200")
-            && error.contains("RLIMIT_NOFILE hard"),
-        "{error}"
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
     );
-    assert!(!temp.path().join("store").exists());
-    assert!(!temp.path().join(".config").exists());
-    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    assert!(String::from_utf8_lossy(&result.stdout).contains("hard NOFILE=Some(200)"));
+    assert!(
+        store.join("store.lock").exists(),
+        "successful managed source reads still acquire a lease"
+    );
+}
+
+#[test]
+#[ignore = "requires isolated mount namespace and CAP_SYS_ADMIN; uses small tmpfs fixtures"]
+fn managed_dockerfile_disk_and_inode_refusals_precede_store_lock() {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    };
+    assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNS) }, 0);
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    struct Mount(CString);
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umount2(self.0.as_ptr(), libc::MNT_DETACH);
+            }
+        }
+    }
+    for (options, expected) in [
+        ("size=64m,nr_inodes=4096,mode=0700", "bytes"),
+        ("size=1g,nr_inodes=32,mode=0700", "inodes"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let context = temp.path().join("context");
+        fs::create_dir(&store).unwrap();
+        fs::create_dir(&context).unwrap();
+        let mount = CString::new(store.as_os_str().as_bytes()).unwrap();
+        let options = CString::new(options).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    mount.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    0,
+                    options.as_ptr().cast(),
+                )
+            },
+            0
+        );
+        let _mount = Mount(mount);
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = store.join("Dockerfile");
+        fs::write(&source, "FROM scratch\n").unwrap();
+        let result = command(temp.path())
+            .args(["build", "-t", "test/refusal", "--no-cache", "-f"])
+            .arg(&source)
+            .arg("--work-dir")
+            .arg(temp.path().join("work"))
+            .arg("--output")
+            .arg(temp.path().join("output"))
+            .arg(&context)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            !store.join("store.lock").exists(),
+            "source lease mutated the store before resource refusal: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            error.contains("resource preflight before source lease") && error.contains(expected),
+            "{error}"
+        );
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 1);
+        assert!(!temp.path().join("work").exists());
+        assert!(!temp.path().join("output").exists());
+        assert!(!temp.path().join(".config").exists());
+    }
 }
 
 #[test]

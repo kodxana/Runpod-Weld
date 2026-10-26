@@ -58,7 +58,8 @@ transfers and final results remain visible. Instruction arguments are not printe
 Managed builds/push hold a persistent store lease; cross-store inputs are rejected.
 Cancellation waits for all descendants; uninterruptible tasks can delay it indefinitely.
 Managed workload ceilings: automatic, from observed filesystem/cgroup capacity;
-current available bytes/inodes/headroom are checked before work. Explicit limits
+current available bytes/inodes are checked before leases/work; memory headroom
+is advisory. Explicit limits
 remain hard ceilings. Diagnostics show auto/explicit origins and reserves.
 Logical metadata is not RSS; unknown cgroup capacity uses a bounded 64 MiB fallback.
 Filesystem quotas remain unknown. Temporary host DNS enabled
@@ -651,6 +652,14 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
         return write!(out, "{HELP}").map_err(|e| e.to_string());
     }
     let mut cli = parse_build_args(args)?;
+    #[cfg(target_os = "linux")]
+    if cli.resource_overrides.is_some()
+        || rpweld::store_access::validate_path(std::path::Path::new(&cli.dockerfile), None).is_err()
+    {
+        // Observe capacity without reading the Dockerfile or creating its lease.
+        rpweld::build_resources::Snapshot::observe(&build_resource_paths(&cli)?)?
+            .check_available("resource preflight before source lease", &[])?;
+    }
     // An explicitly selected Dockerfile can itself be a managed input.
     let early_lease = source_lease(std::path::Path::new(&cli.dockerfile))?;
     let source = read_build_source(&cli.dockerfile)?;
@@ -702,6 +711,24 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     finished
+}
+
+#[cfg(target_os = "linux")]
+fn build_resource_paths(cli: &BuildCli) -> Result<rpweld::build_resources::Paths, String> {
+    let store = rpweld::store_inventory::resolve_store().map_err(|e| e.to_string())?;
+    Ok(rpweld::build_resources::Paths {
+        work: if cli.options.work.as_os_str().is_empty() {
+            store.clone()
+        } else {
+            cli.options.work.clone()
+        },
+        output: if cli.options.output.as_os_str().is_empty() {
+            store.clone()
+        } else {
+            cli.options.output.clone()
+        },
+        store,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -783,29 +810,33 @@ fn prepare_build(
         return Ok(None);
     }
     let context = std::fs::canonicalize(&cli.options.context).map_err(|e| e.to_string())?;
-    // Resolve and refuse before store_dir, leases, auth directories, or build records.
+    // Plan-dependent validation follows the leased Dockerfile read. The earlier
+    // resource-only preflight is the refusal boundary before source-lease mutation.
     if let Some(overrides) = cli.resource_overrides {
-        let store = rpweld::store_inventory::resolve_store().map_err(|e| e.to_string())?;
-        let paths = rpweld::build_resources::Paths {
-            work: if cli.options.work.as_os_str().is_empty() {
-                store.clone()
-            } else {
-                cli.options.work.clone()
-            },
-            output: if cli.options.output.as_os_str().is_empty() {
-                store.clone()
-            } else {
-                cli.options.output.clone()
-            },
-            store,
-        };
+        let paths = build_resource_paths(cli)?;
         let snapshot = rpweld::build_resources::Snapshot::observe(&paths)?;
-        let resources = rpweld::build_resources::Policy::resolve(
+        let external_copy_images = selected
+            .iter()
+            .flat_map(|&n| &plan.stages[n].instructions)
+            .filter_map(|instruction| match &instruction.kind {
+                rpweld::build_plan::InstructionKind::Copy {
+                    from: Some(rpweld::build_plan::CopySource::Image(name)),
+                    ..
+                } => Some(name),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let resources = rpweld::build_resources::Policy::resolve_for_build(
             paths,
             &snapshot,
             overrides,
-            selected.len(),
-            rpweld::build::selected_images(&plan, &selected).len(),
+            rpweld::build_resources::StoragePlan {
+                selected_stages: selected.len(),
+                external_copy_images,
+                stored_base_images: pulls.len(),
+                cache: !cli.options.no_cache,
+            },
         )?;
         resources.apply_to(&mut cli.options.limits);
         write!(out, "{}", resources.diagnostics()).map_err(|e| e.to_string())?;

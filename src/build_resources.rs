@@ -15,6 +15,15 @@ pub struct Overrides {
     pub entries: Option<u64>,
 }
 
+/// Destination roles, not an assumption that every retained stage reaches its ceiling.
+#[derive(Clone, Copy, Debug)]
+pub struct StoragePlan {
+    pub selected_stages: usize,
+    pub external_copy_images: usize,
+    pub stored_base_images: usize,
+    pub cache: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub work: PathBuf,
@@ -49,6 +58,57 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn observe(paths: &Paths) -> Result<Self, String> {
         Self::observe_paths(&paths.all().into_iter().cloned().collect::<Vec<_>>())
+    }
+
+    /// Disk/inode-only admission before source leases or workload planning.
+    /// Cgroup memory pressure and NOFILE observations are advisory here.
+    pub fn check_available(
+        &self,
+        operation: &str,
+        requirements: &[Requirement],
+    ) -> Result<(), String> {
+        let mut devices: BTreeMap<u64, (&Filesystem, u64, u64)> = BTreeMap::new();
+        for fs in &self.filesystems {
+            let entry = devices.entry(fs.device).or_insert((fs, 64 * 1024, 8));
+            if fs.available_bytes < entry.0.available_bytes {
+                entry.0 = fs;
+            }
+        }
+        for requirement in requirements {
+            let fs = self.filesystem(&requirement.path)?;
+            let entry = devices
+                .get_mut(&fs.device)
+                .ok_or("missing device observation")?;
+            entry.1 = add(entry.1, requirement.bytes, operation)?;
+            entry.2 = add(entry.2, requirement.inodes, operation)?;
+        }
+        for (fs, bytes, inodes) in devices.values() {
+            let required = add(*bytes, disk_reserve(fs.total_bytes), operation)?;
+            if required > fs.available_bytes {
+                return Err(format!(
+                    "{operation}: {} requires {required} additional/reserved bytes; available {} (source: current statvfs, automatic reserve {}); free space or choose another work/output/store filesystem; filesystem quota unknown",
+                    fs.path.display(),
+                    fs.available_bytes,
+                    disk_reserve(fs.total_bytes)
+                ));
+            }
+            let available = self
+                .filesystems
+                .iter()
+                .filter(|other| other.device == fs.device)
+                .filter_map(|other| other.available_inodes)
+                .min();
+            let required = add(*inodes, inode_reserve(fs.total_inodes), operation)?;
+            if let Some(available) = available
+                && required > available
+            {
+                return Err(format!(
+                    "{operation}: {} requires {required} additional/reserved inodes; available {available} (source: current statvfs, automatic inode reserve); remove files or choose another filesystem",
+                    fs.path.display()
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -179,14 +239,14 @@ pub struct Policy {
     pub metadata: Ceiling,
     pub entries: Ceiling,
     snapshot: Snapshot,
-    selected_stages: usize,
-    external_images: usize,
+    storage: StoragePlan,
 }
 
 fn add(a: u64, b: u64, what: &str) -> Result<u64, String> {
     a.checked_add(b)
         .ok_or_else(|| format!("{what}: resource estimate overflow"))
 }
+#[cfg(any(target_os = "linux", test))]
 fn multiply(a: u64, b: u64, what: &str) -> Result<u64, String> {
     a.checked_mul(b)
         .ok_or_else(|| format!("{what}: resource estimate overflow"))
@@ -204,11 +264,12 @@ fn disk_reserve(total: u64) -> u64 {
 fn inode_reserve(total: Option<u64>) -> u64 {
     (total.unwrap_or(0) / 20).clamp(128, 65_536)
 }
-fn memory_reserve(ceiling: u64) -> u64 {
+fn memory_margin(ceiling: u64) -> u64 {
     (ceiling / 4).max(128 * MIB)
 }
 
 impl Policy {
+    /// Conservative compatibility helper; CLI callers supply actual storage roles.
     pub fn resolve(
         paths: Paths,
         snapshot: &Snapshot,
@@ -216,24 +277,51 @@ impl Policy {
         selected_stages: usize,
         external_images: usize,
     ) -> Result<Self, String> {
-        if selected_stages == 0 {
+        Self::resolve_for_build(
+            paths,
+            snapshot,
+            overrides,
+            StoragePlan {
+                selected_stages,
+                external_copy_images: external_images,
+                stored_base_images: external_images,
+                cache: true,
+            },
+        )
+    }
+
+    pub fn resolve_for_build(
+        paths: Paths,
+        snapshot: &Snapshot,
+        overrides: Overrides,
+        storage: StoragePlan,
+    ) -> Result<Self, String> {
+        if storage.selected_stages == 0 {
             return Err("resource plan requires a selected stage".into());
         }
-        // Stage roots/images are retained. Checkpoints can outgrow this estimate:
-        // each publication must recheck measured additional bytes independently.
-        let stages = u64::try_from(selected_stages).map_err(|_| "stage count overflow")?;
-        let external = u64::try_from(external_images).map_err(|_| "image count overflow")?;
-        let store_copies = add(
-            multiply(stages, 3, "retained stages")?,
-            multiply(external, 3, "external images")?,
-            "store copies",
-        )?;
+        // Only simultaneous per-operation copies constrain ceilings. Retained
+        // stages/checkpoints consume current space, checked at each write boundary.
+        let store_copies = if storage.selected_stages > 1 {
+            3
+        } else if storage.external_copy_images > 0
+            || storage.stored_base_images > 0
+            || storage.cache
+        {
+            2
+        } else {
+            0
+        };
         let mut devices: BTreeMap<u64, (u64, u64, Option<u64>)> = BTreeMap::new();
         for (path, copies) in [
-            (&paths.work, 3),
+            (&paths.work, 2),
             (&paths.output, 1),
             (&paths.store, store_copies),
         ] {
+            // A bookkeeper/tag-only store still gets availability checks, but
+            // its capacity must not shrink an image written on another device.
+            if copies == 0 {
+                continue;
+            }
             let fs = snapshot.filesystem(path)?;
             let item = devices
                 .entry(fs.device)
@@ -258,9 +346,9 @@ impl Policy {
         // conversion. Keep a finite independent cap; calibrate on more workloads.
         let metadata = snapshot
             .memory_ceiling
-            .map(|n| n.saturating_sub(memory_reserve(n)) / 16)
+            .map(|n| n.saturating_sub(memory_margin(n)) / 16)
             .unwrap_or(64 * MIB)
-            .min(4 * GIB);
+            .clamp(MIB, 4 * GIB);
         let metadata = Ceiling::new(
             overrides.metadata_bytes,
             quantize(metadata),
@@ -285,8 +373,7 @@ impl Policy {
             metadata,
             entries,
             snapshot: snapshot.clone(),
-            selected_stages,
-            external_images,
+            storage,
         };
         policy.check_snapshot(snapshot, "build preflight", &[])?;
         Ok(policy)
@@ -315,7 +402,7 @@ impl Policy {
         limits.max_plan_bytes = self.metadata.value.min(PLAN_BYTES) as usize;
     }
 
-    /// Current availability checks, not reservations. Unknown remains unknown.
+    /// Current disk/inode checks, not reservations. Memory pressure is advisory.
     /// Call before known-size transfers/replay/COPY/export/checkpoint writes and
     /// after RUN. An unbounded RUN can exhaust resources between these checks.
     pub fn recheck(&self, operation: &str, requirements: &[Requirement]) -> Result<(), String> {
@@ -332,65 +419,7 @@ impl Policy {
         operation: &str,
         requirements: &[Requirement],
     ) -> Result<(), String> {
-        let mut devices: BTreeMap<u64, (&Filesystem, u64, u64)> = BTreeMap::new();
-        for fs in &snapshot.filesystems {
-            let entry = devices.entry(fs.device).or_insert((fs, 64 * 1024, 8));
-            if fs.available_bytes < entry.0.available_bytes {
-                entry.0 = fs;
-            }
-        }
-        for requirement in requirements {
-            let fs = snapshot.filesystem(&requirement.path)?;
-            let entry = devices
-                .get_mut(&fs.device)
-                .ok_or("missing device observation")?;
-            entry.1 = add(entry.1, requirement.bytes, operation)?;
-            entry.2 = add(entry.2, requirement.inodes, operation)?;
-        }
-        for (fs, bytes, inodes) in devices.values() {
-            let required = add(*bytes, disk_reserve(fs.total_bytes), operation)?;
-            if required > fs.available_bytes {
-                return Err(format!(
-                    "{operation}: {} requires {required} additional/reserved bytes; available {} (source: current statvfs, automatic reserve {}); free space or choose another work/output/store filesystem; filesystem quota unknown",
-                    fs.path.display(),
-                    fs.available_bytes,
-                    disk_reserve(fs.total_bytes)
-                ));
-            }
-            let inode_observation = snapshot
-                .filesystems
-                .iter()
-                .filter(|other| other.device == fs.device)
-                .filter_map(|other| other.available_inodes.map(|n| (other, n)))
-                .min_by_key(|(_, n)| *n);
-            let required = add(*inodes, inode_reserve(fs.total_inodes), operation)?;
-            if let Some((_, available)) = inode_observation
-                && required > available
-            {
-                return Err(format!(
-                    "{operation}: {} requires {required} additional/reserved inodes; available {available} (source: current statvfs, automatic inode reserve); remove files or choose another filesystem",
-                    fs.path.display()
-                ));
-            }
-        }
-        if let Some(available) = snapshot.memory_headroom {
-            let reserve = memory_reserve(snapshot.memory_ceiling.unwrap_or(0));
-            let required = add(reserve, 16 * MIB, operation)?;
-            if required > available {
-                return Err(format!(
-                    "{operation}: requires {required} bytes memory headroom including reserve {reserve}; available {available} (source: observed cgroup operating headroom); reduce competing memory use or increase the cgroup allowance; logical metadata budget is not RSS"
-                ));
-            }
-        }
-        if let Some(available) = snapshot.hard_fds
-            && available < 272
-        {
-            // rootfs's descriptor_budget adds 272 before counting pins/open FDs.
-            return Err(format!(
-                "{operation}: requires at least 272 file descriptors (replay overhead before pins/open FDs); available {available} (source: RLIMIT_NOFILE hard); use a runtime with a higher hard NOFILE limit; exact replay pin requirement is checked separately"
-            ));
-        }
-        Ok(())
+        snapshot.check_available(operation, requirements)
     }
 
     pub fn diagnostics(&self) -> String {
@@ -405,11 +434,12 @@ impl Policy {
             self.metadata.value,
             self.metadata.origin
         );
-        text.push_str(&format!("Resource planning: {} selected stages, {} external images; retained stage roots/images and spool copies estimated per filesystem. Instruction checkpoints may exceed this estimate and need measured write rechecks.\n", self.selected_stages, self.external_images));
+        text.push_str(&format!("Resource planning: {} selected stages, {} external COPY roots, {} stored base images; instruction cache={}. Per-operation destination allowances: work root+spool, output, and active store payload roles. Retained stages/checkpoints are advisory planning inputs, not multipliers on the ceiling or a full-build fit guarantee; measured write rechecks account for their growth.\n", self.storage.selected_stages, self.storage.external_copy_images, self.storage.stored_base_images, self.storage.cache));
         for fs in &self.snapshot.filesystems {
             text.push_str(&format!("Filesystem {:?}: device={}, capacity={}, available={}, reserve={}, inodes available={:?}, inode reserve={}; quota unknown (shared capacity is not reserved).\n", fs.path, fs.device, fs.total_bytes, fs.available_bytes, disk_reserve(fs.total_bytes), fs.available_inodes, inode_reserve(fs.total_inodes)));
         }
         text.push_str(&format!("Memory: cgroup ceiling={:?}, headroom={:?}, incomplete={}; hard NOFILE={:?} (None means unknown or unlimited; exact replay check remains required).\n", self.snapshot.memory_ceiling, self.snapshot.memory_headroom, self.snapshot.memory_incomplete, self.snapshot.hard_fds));
+        text.push_str("Memory headroom is advisory: memory.high is a pressure threshold and memory.current can include reclaimable cache; saturation does not refuse or abort a build. NOFILE is enforced by exact replay checks only when replay occurs.\n");
         if self.snapshot.memory_ceiling.is_none() {
             text.push_str("Memory capacity unknown: automatic logical metadata uses a bounded 64 MiB fallback; large workloads may need explicit --metadata-budget. No host RAM capacity inferred.\n");
         }
@@ -632,16 +662,12 @@ mod tests {
     }
 
     #[test]
-    fn low_memory_inodes_and_fd_limits_refuse_with_source() {
+    fn inode_exhaustion_refuses_but_memory_pressure_and_fds_are_advisory() {
         let (paths, mut snapshot) = fixture();
         let p = resolve(paths, &snapshot);
         snapshot.memory_headroom = Some(0);
-        assert!(
-            p.check_snapshot(&snapshot, "prepare", &[])
-                .unwrap_err()
-                .contains("cgroup operating headroom")
-        );
-        snapshot.memory_headroom = None;
+        snapshot.hard_fds = Some(200);
+        assert!(p.check_snapshot(&snapshot, "prepare", &[]).is_ok());
         snapshot.filesystems[2].available_inodes = Some(0);
         assert!(
             p.check_snapshot(&snapshot, "prepare", &[])
@@ -649,20 +675,98 @@ mod tests {
                 .contains("inodes")
         );
         snapshot.filesystems[2].available_inodes = None;
-        snapshot.hard_fds = Some(200);
+        assert!(p.check_snapshot(&snapshot, "prepare", &[]).is_ok());
+    }
+
+    #[test]
+    fn saturated_memory_high_including_reclaimable_cache_does_not_refuse_tiny_budget() {
+        let (paths, mut snapshot) = fixture();
+        // memory.high=4 GiB, current=4 GiB (possibly reclaimable page cache).
+        snapshot.memory_ceiling = Some(4 * GIB);
+        snapshot.memory_headroom = Some(0);
+        let p = Policy::resolve(
+            paths,
+            &snapshot,
+            Overrides {
+                rootfs_bytes: Some(1024),
+                layer_bytes: Some(MIB),
+                metadata_bytes: Some(1024),
+                entries: Some(2),
+            },
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(p.metadata.value, 1024);
         assert!(
-            p.check_snapshot(&snapshot, "prepare", &[])
-                .unwrap_err()
-                .contains("RLIMIT_NOFILE hard")
+            p.check_snapshot(&snapshot, "memory.high saturated during build", &[])
+                .is_ok()
         );
     }
 
     #[test]
-    fn multiple_filesystems_and_retained_stages_reduce_stable_allowance() {
+    fn separate_bookkeeping_store_does_not_limit_no_cache_scratch_payload() {
         let (paths, mut snapshot) = fixture();
-        let a = resolve(paths.clone(), &snapshot);
-        let b = Policy::resolve(paths.clone(), &snapshot, Overrides::default(), 10, 2).unwrap();
-        assert!(b.rootfs.value < a.rootfs.value);
+        snapshot.filesystems[2].device = 2;
+        snapshot.filesystems[2].total_bytes = GIB;
+        snapshot.filesystems[2].available_bytes = GIB;
+        let p = Policy::resolve_for_build(
+            paths.clone(),
+            &snapshot,
+            Overrides::default(),
+            StoragePlan {
+                selected_stages: 1,
+                external_copy_images: 0,
+                stored_base_images: 0,
+                cache: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            p.rootfs.value > 300 * MIB && p.layer.value > 300 * MIB,
+            "{p:?}"
+        );
+        snapshot.filesystems[2].available_bytes = 0;
+        assert!(
+            p.check_snapshot(&snapshot, "bookkeeping still needs space", &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn retained_stage_count_is_not_a_hard_capacity_multiplier() {
+        let (paths, snapshot) = fixture();
+        let a = Policy::resolve_for_build(
+            paths.clone(),
+            &snapshot,
+            Overrides::default(),
+            StoragePlan {
+                selected_stages: 2,
+                external_copy_images: 1,
+                stored_base_images: 1,
+                cache: true,
+            },
+        )
+        .unwrap();
+        let b = Policy::resolve_for_build(
+            paths,
+            &snapshot,
+            Overrides::default(),
+            StoragePlan {
+                selected_stages: 100,
+                external_copy_images: 100,
+                stored_base_images: 100,
+                cache: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(a.rootfs.value, b.rootfs.value);
+        assert_eq!(a.entries.value, b.entries.value);
+    }
+
+    #[test]
+    fn multiple_filesystems_limit_the_actual_destination_operation() {
+        let (paths, mut snapshot) = fixture();
         snapshot.filesystems[1].device = 2;
         snapshot.filesystems[1].total_bytes = 16 * GIB;
         let c = resolve(paths.clone(), &snapshot);
@@ -686,16 +790,6 @@ mod tests {
             p.check_snapshot(&snapshot, "export", &requirements)
                 .unwrap_err()
                 .contains("overflow")
-        );
-        assert!(
-            Policy::resolve(
-                paths.clone(),
-                &snapshot,
-                Overrides::default(),
-                usize::MAX,
-                1
-            )
-            .is_err()
         );
         snapshot.memory_ceiling = Some(u64::MAX);
         snapshot.memory_headroom = Some(u64::MAX);
