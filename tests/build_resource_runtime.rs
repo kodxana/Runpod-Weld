@@ -4,7 +4,6 @@ use std::{
     ffi::CString,
     fs,
     os::unix::{ffi::OsStrExt, process::CommandExt},
-    path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -163,7 +162,11 @@ fn running_build_stops_on_disk_reserve_and_reaps_its_descendants() {
     }
     assert!(!output.exists(), "failed build published an image: {log}");
     assert!(
-        !has_file(&store.join("tags")),
+        !fs::read_dir(&store).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("tag-") && name.ends_with(".json")
+        }),
         "failed build published a tag: {log}"
     );
     let records: Vec<rpweld::build_record::Record> = fs::read_dir(&store)
@@ -189,15 +192,4 @@ fn process_start(pid: u32) -> Option<String> {
             .nth(19)?
             .to_owned(),
     )
-}
-
-fn has_file(path: &Path) -> bool {
-    match fs::read_dir(path) {
-        Ok(mut entries) => entries.any(|entry| {
-            let path = entry.unwrap().path();
-            path.is_file() || has_file(&path)
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => panic!("{}: {error}", path.display()),
-    }
 }
