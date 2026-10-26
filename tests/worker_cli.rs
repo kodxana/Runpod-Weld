@@ -1,12 +1,50 @@
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
+fn raw_pty() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let mut termios = std::mem::MaybeUninit::uninit();
+    assert_eq!(unsafe { libc::tcgetattr(slave, termios.as_mut_ptr()) }, 0);
+    let mut termios = unsafe { termios.assume_init() };
+    unsafe { libc::cfmakeraw(&mut termios) };
+    assert_eq!(
+        unsafe { libc::tcsetattr(slave, libc::TCSANOW, &termios) },
+        0
+    );
+    for fd in [master, slave] {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires root, cc -static and child ptrace"]
 fn blocked_run_stdout_is_cancelled_and_reaped_without_closing_the_consumer() {
     use std::{
         fs,
-        os::fd::AsRawFd,
+        os::fd::{AsRawFd, OwnedFd},
         process::Stdio,
         time::{Duration, Instant},
     };
@@ -49,13 +87,17 @@ int main(int argc, char **argv) {
             .unwrap()
             .success()
     );
-    for (mode, cancel, command) in [
+    for ((mode, cancel, command), pty) in [
         ("plain", false, "flood"),
         ("plain", true, "flood"),
         ("plain", false, "complete"),
         ("quiet", false, "flood"),
         ("quiet", true, "flood"),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|case| [false, true].map(|pty| (case, pty)))
+    .filter(|((_, _, command), pty)| !pty || *command != "complete")
+    {
         fs::write(
             context.join("Dockerfile"),
             format!("FROM scratch\nCOPY probe /bin/sh\nRUN {command}\n"),
@@ -64,6 +106,24 @@ int main(int argc, char **argv) {
         let run = tempfile::tempdir_in(tmp.path()).unwrap();
         let work = run.path().join("work");
         let error = run.path().join("stderr");
+        let (writer, reader) = if pty {
+            let (writer, reader) = raw_pty();
+            if mode != "quiet" {
+                let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+                assert_eq!(
+                    unsafe {
+                        libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    },
+                    0
+                );
+            }
+            (Some(writer), Some(reader))
+        } else {
+            (None, None)
+        };
+        let original_flags = writer
+            .as_ref()
+            .map(|fd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) });
         let mut child = Command::new(env!("CARGO_BIN_EXE_rpweld"))
             .args([
                 "build",
@@ -78,13 +138,20 @@ int main(int argc, char **argv) {
             .arg("--work-dir")
             .arg(&work)
             .arg(&context)
-            .stdout(Stdio::piped())
+            .stdout(
+                writer
+                    .as_ref()
+                    .map_or_else(Stdio::piped, |fd| Stdio::from(fd.try_clone().unwrap())),
+            )
             .stderr(fs::File::create(&error).unwrap())
             .spawn()
             .unwrap();
-        // Keep the read end open, deliberately do not drain it, and force backpressure.
-        let consumer = child.stdout.take().unwrap();
-        assert!(unsafe { libc::fcntl(consumer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) } >= 4096);
+        // Keep the original peer open and undrained throughout cancellation/reaping.
+        let consumer =
+            reader.unwrap_or_else(|| fs::File::from(OwnedFd::from(child.stdout.take().unwrap())));
+        if !pty {
+            assert!(unsafe { libc::fcntl(consumer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) } >= 4096);
+        }
         let start = Instant::now();
         let mut signalled = false;
         let mut saw_full_pipe = false;
@@ -95,7 +162,7 @@ int main(int argc, char **argv) {
                 unsafe { libc::ioctl(consumer.as_raw_fd(), libc::FIONREAD, &mut available) },
                 0
             );
-            saw_full_pipe |= available >= 4096;
+            saw_full_pipe |= available >= if pty { 4095 } else { 4096 };
             let pids: Vec<i32> = fs::read_to_string(work.join("rootfs/pids"))
                 .unwrap_or_default()
                 .lines()
@@ -116,7 +183,7 @@ int main(int argc, char **argv) {
                 child.kill().unwrap();
                 child.wait().unwrap();
                 panic!(
-                    "{mode} cancel={cancel} command={command}: undrained stdout prevented shutdown: {}",
+                    "{mode} pty={pty} cancel={cancel} command={command}: undrained stdout prevented shutdown: {}",
                     fs::read_to_string(&error).unwrap()
                 );
             }
@@ -124,7 +191,13 @@ int main(int argc, char **argv) {
         };
         assert!(
             saw_full_pipe && !status.success(),
-            "{mode} {command}: {status}"
+            "{mode} pty={pty} {command}: {status}"
+        );
+        assert_eq!(
+            writer
+                .as_ref()
+                .map(|fd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }),
+            original_flags
         );
         assert_eq!(signalled, cancel);
         if command == "complete" {
@@ -161,6 +234,8 @@ int main(int argc, char **argv) {
 fn build_output_prefixes_complete_without_stdout_lock_deadlock() {
     use std::{
         fs,
+        io::{ErrorKind, Read},
+        os::fd::AsRawFd,
         time::{Duration, Instant},
     };
     assert_eq!(unsafe { libc::geteuid() }, 0);
@@ -172,7 +247,11 @@ fn build_output_prefixes_complete_without_stdout_lock_deadlock() {
         &c,
         r#"#include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 int main(void) {
+    int fd = creat("/executed", 0600);
+    if (fd < 0) return 5;
+    close(fd);
     if (access("/dev/sysgenid", F_OK) != 0 && errno != ENOENT) return 2;
     if (write(1, "hello-out\r\npartial\n", 19) != 19) return 3;
     if (write(2, "hello-err\rtail", 14) != 14) return 4;
@@ -195,16 +274,49 @@ int main(void) {
         "FROM scratch\nCOPY probe /bin/sh\nRUN ignored\n",
     )
     .unwrap();
-    for mode in ["auto", "plain", "quiet"] {
-        let out = tmp.path().join(format!("{mode}.out"));
-        let err = tmp.path().join(format!("{mode}.err"));
+    for (mode, destination) in ["auto", "plain", "quiet"].into_iter().flat_map(|mode| {
+        ["file", "master-nonblocking", "master-blocking", "slave"]
+            .map(|destination| (mode, destination))
+    }) {
+        let run = tempfile::tempdir_in(tmp.path()).unwrap();
+        let out = run.path().join("stdout");
+        let err = run.path().join("stderr");
+        let work = run.path().join("work");
+        let image = run.path().join("image");
+        let (writer, mut peer) = if destination == "file" {
+            (fs::File::create(&out).unwrap(), None)
+        } else {
+            let (master, slave) = raw_pty();
+            let (writer, reader) = if destination == "slave" {
+                (slave, master)
+            } else {
+                (master, slave)
+            };
+            // Only the test's caller sets flags; the builder must preserve them.
+            let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+            if destination == "master-nonblocking" {
+                assert_eq!(
+                    unsafe {
+                        libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    },
+                    0
+                );
+            }
+            let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(
+                unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            (writer, Some(reader))
+        };
+        let original_flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
         let mut child = Command::new(env!("CARGO_BIN_EXE_rpweld"))
             .args(["build", "--no-cache", "--progress", mode, "--output"])
-            .arg(tmp.path().join(format!("image-{mode}")))
+            .arg(&image)
             .arg("--work-dir")
-            .arg(tmp.path().join(format!("work-{mode}")))
+            .arg(&work)
             .arg(&context)
-            .stdout(fs::File::create(&out).unwrap())
+            .stdout(writer.try_clone().unwrap())
             .stderr(fs::File::create(&err).unwrap())
             .spawn()
             .unwrap();
@@ -220,10 +332,40 @@ int main(void) {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        let stdout = fs::read_to_string(out).unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) },
+            original_flags
+        );
+        // Reading the original peer proves terminal identity; cloned /dev/ptmx
+        // masters have identical device metadata but route bytes elsewhere.
+        let stdout = if let Some(peer) = &mut peer {
+            let mut bytes = Vec::new();
+            let error = peer.read_to_end(&mut bytes).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::WouldBlock);
+            String::from_utf8(bytes).unwrap()
+        } else {
+            fs::read_to_string(out).unwrap()
+        };
         let stderr = fs::read_to_string(err).unwrap();
-        assert!(status.success(), "{stderr}");
-        assert!(stdout.contains("hello-out") && stderr.contains("hello-err"));
+        if destination == "master-blocking" && mode != "quiet" {
+            assert!(
+                !status.success(),
+                "{mode}: blocking master must fail before RUN"
+            );
+            assert!(
+                stderr.contains("PTY master") && stderr.contains("--progress quiet"),
+                "{stderr}"
+            );
+            assert!(!work.join("rootfs/executed").exists());
+            assert!(!image.join("index.json").exists());
+            continue;
+        }
+        assert!(status.success(), "{mode} {destination}: {stderr}");
+        assert!(
+            stdout.contains("hello-out") && stderr.contains("hello-err"),
+            "{mode} {destination}: original destination lost RUN bytes: {stdout:?}"
+        );
+        assert!(work.join("rootfs/executed").exists());
         assert_eq!(
             stdout.contains("[stage 1 instruction 3 RUN stdout] hello-out"),
             mode != "quiet"

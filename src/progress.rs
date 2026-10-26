@@ -89,7 +89,25 @@ mod linux {
                 return Err(io::Error::last_os_error());
             }
             let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
-            let file = if matches!(kind, libc::S_IFIFO | libc::S_IFCHR) {
+            let mut pty_number = 0u32;
+            let pty_master = kind == libc::S_IFCHR
+                && unsafe { libc::ioctl(owned.as_raw_fd(), libc::TIOCGPTN, &mut pty_number) } == 0;
+            let file = if pty_master {
+                // Reopening a master allocates another PTY with identical device metadata.
+                let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if flags & libc::O_NONBLOCK == 0 {
+                    // shortcut: blocking masters need quiet until forwarding can be isolated.
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "RUN progress cannot safely forward to a blocking PTY master; use --progress quiet or have the caller supply a nonblocking PTY master",
+                    ));
+                }
+                // The caller must keep this shared description nonblocking during RUN.
+                File::from(owned)
+            } else if matches!(kind, libc::S_IFIFO | libc::S_IFCHR) {
                 // dup shares file-status flags with the caller; reopen instead of
                 // changing O_NONBLOCK on an inherited pipe/terminal description.
                 OpenOptions::new()
@@ -279,7 +297,7 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     #[test]
-    fn pipe_and_socket_forwarding_keep_flags_and_all_bytes_until_cancelled() {
+    fn stream_forwarding_keeps_flags_and_all_bytes_until_cancelled() {
         use std::{
             fs::File,
             io::{Read, Write},
@@ -297,8 +315,41 @@ mod tests {
             assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
             unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
         }
-        for (socket, cancel) in [(false, false), (false, true), (true, false), (true, true)] {
-            let (mut reader, writer) = if socket {
+        fn pty() -> (File, File) {
+            let (mut master, mut slave) = (-1, -1);
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            let mut termios = std::mem::MaybeUninit::uninit();
+            assert_eq!(unsafe { libc::tcgetattr(slave, termios.as_mut_ptr()) }, 0);
+            let mut termios = unsafe { termios.assume_init() };
+            unsafe { libc::cfmakeraw(&mut termios) };
+            assert_eq!(
+                unsafe { libc::tcsetattr(slave, libc::TCSANOW, &termios) },
+                0
+            );
+            for fd in [master, slave] {
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+            unsafe { (File::from_raw_fd(slave), File::from_raw_fd(master)) }
+        }
+        for (destination, cancel) in ["pipe", "socket", "pty-master", "pty-slave"]
+            .into_iter()
+            .flat_map(|destination| [false, true].map(|cancel| (destination, cancel)))
+        {
+            let (mut reader, writer) = if destination == "socket" {
                 let (reader, writer) = UnixStream::pair().unwrap();
                 unsafe {
                     (
@@ -306,9 +357,25 @@ mod tests {
                         File::from_raw_fd(writer.into_raw_fd()),
                     )
                 }
-            } else {
+            } else if destination == "pipe" {
                 pipe()
+            } else {
+                let (slave, master) = pty();
+                if destination == "pty-master" {
+                    (slave, master)
+                } else {
+                    (master, slave)
+                }
             };
+            if destination == "pty-master" {
+                let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+                assert_eq!(
+                    unsafe {
+                        libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    },
+                    0
+                );
+            }
             let original_flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
             let stop = Arc::new(AtomicBool::new(false));
             let mut output = RunOutput::new(writer.as_fd(), stop.clone()).unwrap();
@@ -316,7 +383,6 @@ mod tests {
                 unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) },
                 original_flags
             );
-            drop(writer);
             let forwarder = std::thread::spawn(move || output.write_all(&vec![b'x'; 1024 * 1024]));
             let start = Instant::now();
             loop {
@@ -347,11 +413,16 @@ mod tests {
                     std::io::ErrorKind::TimedOut
                 );
             } else {
-                let mut bytes = Vec::new();
-                reader.read_to_end(&mut bytes).unwrap();
+                let mut bytes = vec![0; 1024 * 1024];
+                reader.read_exact(&mut bytes).unwrap();
                 forwarder.join().unwrap().unwrap();
                 assert_eq!(bytes, vec![b'x'; 1024 * 1024]);
             }
+            assert_eq!(
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) },
+                original_flags,
+                "{destination}: caller flags changed during forwarding"
+            );
         }
     }
 
