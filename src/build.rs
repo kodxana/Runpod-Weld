@@ -1078,11 +1078,10 @@ struct RootUsage {
 }
 
 fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<RootUsage> {
-    #[cfg_attr(not(target_os = "linux"), allow(clippy::only_used_in_recursion))]
     fn walk(
         p: &Path,
         usage: &mut RootUsage,
-        payloads: &mut std::collections::BTreeSet<(u64, u64)>,
+        _payloads: &mut std::collections::BTreeSet<(u64, u64)>,
         depth: usize,
         l: Limits,
         c: &impl Fn() -> bool,
@@ -1114,7 +1113,7 @@ fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<Roo
                 #[cfg(target_os = "linux")]
                 if m.is_file() {
                     use std::os::unix::fs::MetadataExt;
-                    if m.nlink() == 1 || payloads.insert((m.dev(), m.ino())) {
+                    if m.nlink() == 1 || _payloads.insert((m.dev(), m.ino())) {
                         usage.unique_payload_bytes = usage
                             .unique_payload_bytes
                             .checked_add(m.len())
@@ -1122,7 +1121,7 @@ fn root_budget(root: &Path, limits: Limits, c: &impl Fn() -> bool) -> Result<Roo
                     }
                 }
                 if m.is_dir() {
-                    walk(&p, usage, payloads, depth + 1, l, c)?;
+                    walk(&p, usage, _payloads, depth + 1, l, c)?;
                 }
             }
             Ok(())
