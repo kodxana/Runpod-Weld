@@ -486,6 +486,9 @@ mod linux {
         Ok(bytes)
     }
     fn policy_for_pin(bytes: &[u8], original: &str, pinned: &str) -> Result<Vec<u8>> {
+        if bytes.len() as u64 > AUTH_CAP {
+            return Err("registry signature policy snapshot exceeds byte limit".into());
+        }
         let mut policy =
             unique_json(bytes).map_err(|_| "invalid registry signature policy JSON")?;
         if original != pinned {
@@ -540,6 +543,14 @@ mod linux {
                 // Skopeo has no independent source identity; index signatures also bind the original index.
                 return Err("cannot preserve original signing identity with digest pinning: signed tag/index policies are unsupported".into());
             }
+            if let Some(existing) = scopes.and_then(|s| s.get(pinned)) {
+                // Skopeo must validate the complete original policy. Never overwrite a
+                // fragment that could be invalid, even if its scope was not selected.
+                if existing.as_array() != Some(requirements) {
+                    return Err("pinned-digest policy scope collision is unsupported; reconcile the original and digest policy scopes".into());
+                }
+                return Ok(bytes.to_vec());
+            }
             let requirements = Value::Array(requirements.clone());
             let transports = policy
                 .as_object_mut()
@@ -556,7 +567,11 @@ mod linux {
                 .insert(pinned.into(), requirements);
         }
         // Retain the entire policy: Skopeo must still reject invalid/unrecognized policy elsewhere.
-        let bytes = serde_json::to_vec(&policy).map_err(|_| "invalid registry signature policy")?;
+        let bytes = if original == pinned {
+            bytes.to_vec()
+        } else {
+            serde_json::to_vec(&policy).map_err(|_| "invalid registry signature policy")?
+        };
         if bytes.len() as u64 > AUTH_CAP {
             return Err("registry signature policy snapshot exceeds byte limit".into());
         }
@@ -1213,6 +1228,7 @@ mod linux {
         /// The original reference's policy scope is preserved via a bounded private snapshot.
         /// Signed tag/index pulls are unsupported when pinning changes the signing identity;
         /// unchanged direct manifest digests retain full backend policy/signature enforcement.
+        /// A differing existing digest policy scope is unsupported rather than overwritten.
         pub fn pull_checked(
             &self,
             lease: &crate::store_lease::StoreLease,
@@ -1857,6 +1873,34 @@ mod linux {
                 )
                 .is_err()
             );
+        }
+        #[test]
+        fn policy_pinning_never_erases_existing_digest_requirements() {
+            let pin = format!("example.com/ns/repo@sha256:{}", "a".repeat(64));
+            let original = "example.com/ns/repo:tag";
+            let accept = serde_json::json!([{"type":"insecureAcceptAnything"}]);
+            for existing in [
+                serde_json::json!([{"type":"unsupported-fixture-policy"}]),
+                serde_json::json!([{"type":"reject"}]),
+                Value::Null,
+            ] {
+                let policy =
+                    serde_json::json!({"default":accept, "transports":{"docker":{&pin:existing}}});
+                let bytes = serde_json::to_vec_pretty(&policy).unwrap();
+                assert!(
+                    policy_for_pin(&bytes, original, &pin)
+                        .unwrap_err()
+                        .contains("pinned-digest policy scope collision")
+                );
+                // An unchanged digest delegates complete policy validation to Skopeo.
+                assert_eq!(policy_for_pin(&bytes, &pin, &pin).unwrap(), bytes);
+            }
+            let policy = serde_json::json!({"default":accept, "transports":{"docker":{
+                &pin:accept, "example.com/other":[{"type":"unsupported-fixture-policy"}]
+            }}});
+            let bytes = serde_json::to_vec_pretty(&policy).unwrap();
+            // Equal scopes must retain even unrelated invalid fragments for backend validation.
+            assert_eq!(policy_for_pin(&bytes, original, &pin).unwrap(), bytes);
         }
         #[test]
         fn inspect_deadline_and_cancellation_are_checked_before_spawn() {

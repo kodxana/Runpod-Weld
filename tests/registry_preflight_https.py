@@ -307,6 +307,42 @@ def main():
             result, _ = run('policy-invalid', policy={'default': accept, 'unknown': True}, success=False)
             assert len(layer_gets()) == before
             print('PASS original tag reject/allow scopes and unsupported signing policy: zero rejected layer GET', flush=True)
+            pinned_scope = f'{host}/fixture@{original_desc["digest"]}'
+            malformed_collision = {'default': accept, 'transports': {'docker': {
+                pinned_scope: [{'type': 'unsupported-fixture-policy'}]}}}
+            publish('policy-malformed-collision', original)
+            before = len(layer_gets())
+            if driver:
+                drive('old', 'policy-malformed-collision', policy=malformed_collision)
+                assert len(layer_gets()) == before
+            result, _ = run('policy-malformed-collision', policy=malformed_collision, success=False)
+            assert 'pinned-digest policy scope collision' in result.stderr and len(layer_gets()) == before
+            valid_collision = {'default': accept, 'transports': {'docker': {pinned_scope: deny}}}
+            publish('policy-valid-collision', original)
+            # The original tag policy allows this, but adapting the existing digest scope
+            # without complete policy validation is intentionally unsupported.
+            if driver:
+                drive('old', 'policy-valid-collision', policy=valid_collision, success=True)
+            before = len(layer_gets())
+            result, _ = run('policy-valid-collision', policy=valid_collision, success=False)
+            assert 'pinned-digest policy scope collision' in result.stderr and len(layer_gets()) == before
+            equal_scope = {'default': accept, 'transports': {'docker': {pinned_scope: accept}}}
+            publish('policy-equal-scope', original)
+            _, output = run('policy-equal-scope', policy=equal_scope)
+            assert payload(output) == b'original\n'
+            equal_with_invalid = copy.deepcopy(equal_scope)
+            equal_with_invalid['transports']['docker'][f'{host}/other'] = [{'type': 'unsupported-fixture-policy'}]
+            publish('policy-equal-invalid', original)
+            before = len(layer_gets())
+            result, _ = run('policy-equal-invalid', policy=equal_with_invalid, success=False)
+            assert 'scope collision' not in result.stderr and len(layer_gets()) == before
+            if driver:
+                drive('old', 'policy-equal-invalid', policy=equal_with_invalid)
+                assert len(layer_gets()) == before
+                result = drive('checked', original_desc['digest'], policy=malformed_collision)
+                assert 'scope collision' not in result.stderr and len(layer_gets()) == before
+                drive('checked', original_desc['digest'], policy=equal_scope, success=True)
+            print('PASS pinned policy collisions fail closed; equal and unchanged scopes retain complete policy', flush=True)
             if driver:
                 for mode, expected in [('abort', 'fixture pre-copy rejected'), ('cancel', 'cancelled')]:
                     before = len(layer_gets())
