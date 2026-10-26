@@ -3864,14 +3864,14 @@ mod tests {
             .unwrap();
             fs::write(o.context.join("keep"), "keep").unwrap();
             fs::create_dir(o.context.join("ignored")).unwrap();
-            // Keep emitted timestamps stable even on relatime mounts.
+            // Relatime may update atime when it equals mtime, even in the future.
             let future = std::time::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
             for name in ["", "Dockerfile", ".dockerignore", "keep"] {
                 fs::File::open(o.context.join(name))
                     .unwrap()
                     .set_times(
                         fs::FileTimes::new()
-                            .set_accessed(future)
+                            .set_accessed(future + Duration::from_secs(1))
                             .set_modified(future),
                     )
                     .unwrap();
