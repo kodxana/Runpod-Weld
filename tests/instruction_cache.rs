@@ -314,16 +314,18 @@ fn excluded_tree_growth_is_charged_on_instruction_hits() {
             )
             .unwrap();
     }
-    let cold = p.build(&["--metadata-budget", "32768"]);
+    // Isolate cumulative metadata accounting from automatic entry sizing.
+    let limits = ["--metadata-budget", "32768", "--max-entries", "100000"];
+    let cold = p.build(&limits);
     cold.ok();
-    let warm = p.build(&["--metadata-budget", "32768"]);
+    let warm = p.build(&limits);
     warm.ok();
     assert!(warm.log.contains("CACHED"), "{}", warm.log);
     for index in 0..40 {
         fs::write(p.context.join(format!("ignored/{index}")), "excluded").unwrap();
     }
     p.write("Dockerfile", &format!("{prefix}LABEL version=two\n"));
-    let exhausted = p.build(&["--metadata-budget", "32768"]);
+    let exhausted = p.build(&limits);
     assert!(
         !exhausted.success,
         "ignored traversal bypassed cumulative budget: {}",
@@ -331,7 +333,7 @@ fn excluded_tree_growth_is_charged_on_instruction_hits() {
     );
     exhausted.cached(2, "COPY");
     assert!(!exhausted.image.exists());
-    let reference = p.build(&["--metadata-budget", "32768", "--no-cache"]);
+    let reference = p.build(&[limits.as_slice(), &["--no-cache"]].concat());
     assert!(!reference.success, "{}", reference.log);
     assert!(!reference.image.exists());
 }
