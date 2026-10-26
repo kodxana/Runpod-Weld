@@ -162,7 +162,12 @@ fn private_umask_build(
     command.output().unwrap()
 }
 
-fn assert_private_root_build(o: &BuildOptions, store: &Path, output: &std::process::Output) {
+fn assert_private_root_build(
+    o: &BuildOptions,
+    store: &Path,
+    output: &std::process::Output,
+    root_headers: usize,
+) {
     assert!(
         output.status.success(),
         "{}\n{}",
@@ -186,7 +191,7 @@ fn assert_private_root_build(o: &BuildOptions, store: &Path, output: &std::proce
         fs::metadata(o.work.join("rootfs")).unwrap().mode() & 0o777,
         0o755
     );
-    assert_eq!(root_modes(&o.output, o.limits), vec![0o755]);
+    assert_eq!(root_modes(&o.output, o.limits), vec![0o755; root_headers]);
 }
 
 #[test]
@@ -197,21 +202,21 @@ fn private_umask_scratch_initial_checkpoint_and_inherited_roots() {
     let source = "FROM scratch\nWORKDIR /\nLABEL revision=one\n";
     o.no_cache = true;
     let out = private_umask_build(&o, &store, source, None);
-    assert_private_root_build(&o, &store, &out);
+    assert_private_root_build(&o, &store, &out, 1);
     o.no_cache = false;
     next(&mut o, t.path(), "cold");
     let out = private_umask_build(&o, &store, source, None);
-    assert_private_root_build(&o, &store, &out);
+    assert_private_root_build(&o, &store, &out, 1);
     assert!(o.work.join("rootfs-exported-2").is_dir());
     next(&mut o, t.path(), "checkpoint-hit");
     let changed = source.replace("revision=one", "revision=two");
     let out = private_umask_build(&o, &store, &changed, None);
-    assert_private_root_build(&o, &store, &out);
+    assert_private_root_build(&o, &store, &out, 1);
     assert!(o.work.join("rootfs-before-2").is_dir());
     assert!(String::from_utf8_lossy(&out.stderr).contains("CACHED instruction 2 WORKDIR"));
     next(&mut o, t.path(), "whole-stage-hit");
     let out = private_umask_build(&o, &store, &changed, None);
-    assert_private_root_build(&o, &store, &out);
+    assert_private_root_build(&o, &store, &out, 1);
     assert!(String::from_utf8_lossy(&out.stderr).contains("CACHED (verified local stage)"));
     next(&mut o, t.path(), "inherited");
     let out = private_umask_build(
@@ -220,7 +225,7 @@ fn private_umask_scratch_initial_checkpoint_and_inherited_roots() {
         "FROM scratch AS parent\nWORKDIR /\nFROM parent\nLABEL inherited=yes\n",
         None,
     );
-    assert_private_root_build(&o, &store, &out);
+    assert_private_root_build(&o, &store, &out, 2);
 }
 
 #[test]
@@ -241,7 +246,7 @@ fn private_umask_nonroot_run_and_explicit_restricted_root() {
     let source = "FROM alpine AS parent\nUSER 12345:12345\nRUN test \"$(id -u)\" = 12345\nFROM parent\nRUN printf executed > /tmp/rootmode-marker\nLABEL revision=one\n";
     o.no_cache = true;
     let out = private_umask_build(&o, &store, source, Some(&base));
-    assert_private_root_build(&o, &store, &out);
+    assert_private_root_build(&o, &store, &out, 2);
     assert_eq!(
         fs::read(o.work.join("rootfs/tmp/rootmode-marker")).unwrap(),
         b"executed"
@@ -270,7 +275,7 @@ fn private_umask_nonroot_run_and_explicit_restricted_root() {
     o.no_cache = false;
     next(&mut o, t.path(), "runtime-cold");
     let out = private_umask_build(&o, &store, source, Some(&base));
-    assert_private_root_build(&o, &store, &out);
+    assert_private_root_build(&o, &store, &out, 2);
     next(&mut o, t.path(), "runtime-checkpoint-hit");
     let out = private_umask_build(
         &o,
@@ -278,7 +283,7 @@ fn private_umask_nonroot_run_and_explicit_restricted_root() {
         &source.replace("revision=one", "revision=two"),
         Some(&base),
     );
-    assert_private_root_build(&o, &store, &out);
+    assert_private_root_build(&o, &store, &out, 2);
     assert!(String::from_utf8_lossy(&out.stderr).contains("CACHED instruction 2 RUN"));
     assert_eq!(
         fs::read(o.work.join("rootfs/tmp/rootmode-marker")).unwrap(),
