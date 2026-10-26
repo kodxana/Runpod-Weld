@@ -68,6 +68,9 @@ fn multiple_tags_progress_cache_and_failure_preservation() {
         "{logs}"
     );
     assert!(logs.contains("COPY DONE ") && logs.contains("Stage 1/1: DONE "));
+    assert!(logs.contains("Exporting instruction checkpoint: START"));
+    assert!(logs.contains("Verifying and restoring instruction checkpoint: DONE"));
+    assert!(logs.contains("Publishing stage image (export or verified cache reuse): DONE"));
     assert!(!logs.contains("do-not-print-this") && !logs.contains('\r'));
     let records = || {
         let mut records: Vec<_> = fs::read_dir(home.path().join("store"))

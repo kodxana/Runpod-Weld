@@ -59,7 +59,10 @@ def main():
             return work / "rootfs", output, log
 
         def ran(log, token):
-            return "IC_EXEC_" + token in [line.strip() for line in log.splitlines()]
+            marker = "IC_EXEC_" + token
+            return any(line.strip() == marker or
+                       (line.startswith("[stage ") and line.endswith(" RUN stdout] " + marker))
+                       for line in log.splitlines())
 
         cold, _, log = build("cold")
         assert ran(log, "dependencies") and ran(log, "application"), log

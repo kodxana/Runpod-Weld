@@ -719,8 +719,15 @@ fn inspect(
             records.get(b"path".as_slice()),
             long_name.as_ref(),
         )?;
+        // Ordinary linkname bytes have meaning only for link entry types.
+        // Image whiteouts can retain the removed symlink's old header text.
+        let is_link = matches!(kind, EntryKind::Symlink | EntryKind::Hardlink);
         let link = effective(
-            string(&block[157..257])?,
+            if is_link {
+                string(&block[157..257])?
+            } else {
+                b""
+            },
             records.get(b"linkpath".as_slice()),
             long_link.as_ref(),
         )?;
@@ -733,9 +740,7 @@ fn inspect(
             limits,
         )?;
         let path = canonical_path(name, kind)?;
-        if link.contains(&0)
-            || matches!(kind, EntryKind::Symlink | EntryKind::Hardlink) != !link.is_empty()
-        {
+        if link.contains(&0) || is_link == link.is_empty() {
             return Err(Error::Invalid(
                 "missing link target or link text on non-link",
             ));
@@ -1492,7 +1497,6 @@ mod tests {
             (".wh.x/child", b'0', vec![], None),
             ("link", b'2', vec![1], Some("target")),
             ("link", b'2', vec![], None),
-            ("file", b'0', vec![], Some("target")),
         ] {
             let bytes = archive(vec![(
                 header(path, kind, payload.len() as u64, link),
@@ -1501,6 +1505,39 @@ mod tests {
             assert!(f.verify(&bytes, false, &digest(&bytes), limits()).is_err());
         }
         f.clean();
+    }
+    #[test]
+    fn ignores_unused_header_linkname_without_creating_links() {
+        let f = Fixture::new();
+        for ext in [
+            extension(b'x', pax_record(b"linkpath", b"target")),
+            extension(b'K', b"target\0".to_vec()),
+        ] {
+            let bytes = archive(vec![ext, (header("file", b'0', 0, None), vec![])]);
+            assert!(f.verify(&bytes, false, &digest(&bytes), limits()).is_err());
+        }
+        for (path, kind) in [
+            ("tmp/.wh.requirements-cuda.txt", b'0'),
+            ("file", b'0'),
+            ("dir", b'5'),
+        ] {
+            let bytes = archive(vec![(header(path, kind, 0, Some("../../outside")), vec![])]);
+            let layer = f.verify(&bytes, false, &digest(&bytes), limits()).unwrap();
+            assert_eq!(layer.entries().len(), 1);
+            assert_eq!(layer.entries()[0].link_target, None);
+            assert_eq!(
+                layer.entries()[0].kind,
+                if kind == b'5' {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                }
+            );
+        }
+        for kind in [b'1', b'2'] {
+            let bytes = archive(vec![(header("link", kind, 0, None), vec![])]);
+            assert!(f.verify(&bytes, false, &digest(&bytes), limits()).is_err());
+        }
     }
     #[test]
     fn rejects_ambiguous_numeric_headers_and_non_ustar_formats() {

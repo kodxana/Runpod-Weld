@@ -4,6 +4,7 @@ use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
+const BUILD_ID: Option<&str> = option_env!("RPWELD_BUILD_ID");
 
 fn cancelled() -> bool {
     CANCELLED.load(Ordering::Relaxed)
@@ -101,9 +102,13 @@ fn execute(args: &[String], out: &mut impl Write) -> Result<(), String> {
     match args {
         [] => write!(out, "{HELP}").map_err(|e| e.to_string()),
         [arg] if arg == "--help" || arg == "-h" => write!(out, "{HELP}").map_err(|e| e.to_string()),
-        [arg] if arg == "--version" || arg == "-V" => {
-            writeln!(out, "rpweld {}", env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())
-        }
+        [arg] if arg == "--version" || arg == "-V" => writeln!(
+            out,
+            "rpweld {} (build {})",
+            env!("CARGO_PKG_VERSION"),
+            BUILD_ID.unwrap_or("unrecorded")
+        )
+        .map_err(|e| e.to_string()),
         [cmd] if cmd == "doctor" => doctor(out, false),
         [cmd, flag] if cmd == "doctor" && flag == "--json" => doctor(out, true),
         [cmd, rest @ ..] if cmd == "scan" => scan(rest, out),
@@ -856,7 +861,7 @@ fn prepare_build(
             let layout = if let Some(layout) = resolved.get(&reference) {
                 std::path::PathBuf::clone(layout)
             } else {
-                let layout = registry::cached_base(
+                let layout = registry::cached_base_with_progress(
                     &store,
                     &lease,
                     &reference,
@@ -873,6 +878,7 @@ fn prepare_build(
                         registry::Transport::new(&cli.registry)?
                             .pull(&lease, reference, layout, &cancelled)
                     },
+                    cli.options.progress,
                 )?;
                 resolved.insert(reference, layout.clone());
                 layout
@@ -1143,6 +1149,7 @@ fn doctor(out: &mut impl Write, machine: bool) -> Result<(), String> {
         "schema_version": 1,
         "tool": "rpweld",
         "version": env!("CARGO_PKG_VERSION"),
+        "build_id": BUILD_ID,
         "capabilities": rpweld::capabilities::inspect(),
         "resources": rpweld::resources::discover(),
     });
@@ -1222,7 +1229,8 @@ fn main() {
         eprintln!("rpweld: cannot install cancellation handlers: {error}");
         std::process::exit(2);
     }
-    if let Err(error) = execute(&args, &mut io::stdout().lock()) {
+    // RUN output readers write concurrently; never hold stdout's lock across a build.
+    if let Err(error) = execute(&args, &mut io::stdout()) {
         eprintln!("rpweld: {error}");
         std::process::exit(2);
     }
@@ -1585,13 +1593,16 @@ mod tests {
     }
 
     #[test]
-    fn version_matches_package() {
+    fn version_matches_package_and_supplied_build_identity() {
         let mut out = Vec::new();
         execute(&["--version".into()], &mut out).unwrap();
-        assert!(
-            String::from_utf8(out)
-                .unwrap()
-                .contains(env!("CARGO_PKG_VERSION"))
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "rpweld {} (build {})\n",
+                env!("CARGO_PKG_VERSION"),
+                BUILD_ID.unwrap_or("unrecorded")
+            )
         );
     }
 

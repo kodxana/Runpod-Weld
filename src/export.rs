@@ -759,7 +759,7 @@ mod linux {
         collections::HashMap,
         ffi::CString,
         fs::{self, File, Metadata, OpenOptions},
-        io::{Read, Seek, SeekFrom, Write},
+        io::{Read, Write},
         os::unix::{
             ffi::{OsStrExt, OsStringExt},
             fs::{MetadataExt, OpenOptionsExt},
@@ -1289,10 +1289,10 @@ mod linux {
         fs::create_dir(dest)?; // exclusive ownership; never reuse existing output
         created()?;
         let store = BlobStore::open(dest)?;
-        let mut spool = tempfile::tempfile_in(dest)?;
+        let mut spool = store.pending_export()?;
         let layer = {
             let sink = Sink {
-                file: &mut spool,
+                file: spool.as_file_mut(),
                 hash: Sha256::new(),
                 size: 0,
                 max: limits.max_layer_bytes.min(i64::MAX as u64),
@@ -1344,8 +1344,7 @@ mod linux {
             let sink = walk.tar.into_inner()?;
             descriptor(LAYER, sink.size, sink.hash)?
         };
-        spool.seek(SeekFrom::Start(0))?;
-        store.ingest(&mut spool, &layer, limits.max_layer_bytes, c)?;
+        store.publish_export(spool, &layer, limits.max_layer_bytes, c)?;
         if baseline.is_some() {
             let diff_id = layer.digest.parse().map_err(Error::Blob)?;
             crate::layer::verify(

@@ -31,10 +31,23 @@ are stage-local instruction ordinals for FROM/COPY/RUN/WORKDIR, so gaps denote
 metadata instructions evaluated with the next boundary or final export.
 Lines show operation names, start/completion, verified cache hits and elapsed
 seconds; instruction arguments are omitted. A whole-stage hit summarizes all
-instructions. `quiet` hides these engine lines only: RUN stdout/stderr stream
-unchanged, and diagnostics, registry transfer output and final results remain
-visible. These modes do not change cache identity. RUN can itself print secrets;
+instructions. `quiet` hides these engine lines only and preserves raw RUN
+stdout/stderr. Otherwise RUN output is prefixed with stage, instruction and stream
+identifiers; CR progress records become lines and long records are split into
+bounded chunks. Engine phase messages carry `[weld]`. Diagnostics, registry
+transfer output and final results remain visible. These modes do not change cache identity. RUN can itself print secrets;
 progress does not echo Dockerfile arguments or environment values.
+
+Base-cache lock waits, image verification, blob storage, base-layer preparation,
+checkpoint export/restoration and stage publication report their phase and elapsed
+time. Cooperative work checks emit activity at most once every ten seconds;
+blocked filesystem calls can delay updates. Active child phases suppress parent
+heartbeats. Failed or cancelled phases end with `FAILED/INTERRUPTED`, never `DONE`.
+`--progress=quiet` suppresses these messages too. The layer count bar measures
+completed layers, not time or bytes; `--verbose` adds per-layer timings.
+`--no-cache` skips instruction checkpoint exports/restores while retaining verified
+registry-base reuse, final stage export and required inter-stage verification.
+Separate stdout/stderr streams do not guarantee a combined output order.
 
 The default Dockerfile is `CONTEXT/Dockerfile`. Short image names resolve explicitly to Docker Hub (`ubuntu:24.04` becomes `docker.io/library/ubuntu:24.04`). FROM images reuse fully verified local bases for Linux amd64 and pull on a miss; `--base NAME=LAYOUT` overrides that lookup. Equivalent references are resolved once per invocation. Tags are published only after a successful export; failed pushes retain local images and tags.
 
@@ -78,6 +91,13 @@ cargo build --locked --release
 ```
 
 Linux is the runtime target. On other platforms, `doctor` reports inspection as unsupported. It does not infer Pod allocations from host RAM or CPU counts.
+
+For a release built from a clean, committed checkout, set `RPWELD_BUILD_ID` to
+the full source commit when running `cargo build --locked --release`.
+`rpweld --version` reports that compile-time label and `doctor --json` includes
+`build_id`. Without a supplied label they report `unrecorded` and `null`,
+respectively. The label is supplied by the builder, not verified provenance;
+record the exact source commit and the final binary's SHA-256 alongside releases.
 
 Resource inspection reads cgroup v1/v2 membership, visible ancestor limits and usage, CPU quota, affinity and cpusets. Unknown restrictions remain unknown. The observations are not reserved resources or per-build enforcement, and cannot guarantee protection from OOM in a shared Pod.
 
@@ -196,7 +216,7 @@ python tests/compatibility.py --self-test
 
 The [compatibility fixtures](tests/fixtures/README.md) define an explicit Docker reference workflow. Candidate comparisons fail as unsupported until an image-build implementation exists.
 
-`export::export_layout` writes a flattened Linux/amd64 OCI layout containing one uncompressed full-tree layer. It preserves supported metadata and hardlinks under explicit byte/entry/metadata limits, and publishes the index last. Supply a stable, quiescent tree and a new output path; unsupported special files, nested mounts, external hardlinks and symlink/empty xattrs are rejected. Export uses temporary disk space plus the final blob (roughly twice the layer size); failed output may remain partial.
+`export::export_layout` writes a flattened Linux/amd64 OCI layout containing one uncompressed full-tree layer. It preserves supported metadata and hardlinks under explicit byte/entry/metadata limits, and publishes the index last. Supply a stable, quiescent tree and a new output path; unsupported special files, nested mounts, external hardlinks and symlink/empty xattrs are rejected. Export writes one owned temporary layer, verifies it, and publishes that same file without a second payload copy; failed output may remain partial.
 
 ## Experimental execution probe
 

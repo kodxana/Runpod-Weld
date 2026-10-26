@@ -253,7 +253,7 @@ mod linux {
     fn device(path: &[u8]) -> bool {
         matches!(
             path,
-            b"null" | b"zero" | b"random" | b"urandom" | b"tty" | b"ptmx"
+            b"null" | b"zero" | b"random" | b"urandom" | b"tty" | b"ptmx" | b"sysgenid"
         ) || path
             .strip_prefix(b"pts/")
             .is_some_and(|p| p == b"ptmx" || (!p.is_empty() && p.iter().all(u8::is_ascii_digit)))
@@ -1509,10 +1509,17 @@ mod linux {
         }
         #[test]
         fn whitelist_and_descriptor_protection() {
-            for path in [b"null".as_slice(), b"pts/0", b"pts/ptmx"] {
+            for path in [b"null".as_slice(), b"pts/0", b"pts/ptmx", b"sysgenid"] {
                 assert!(device(path));
             }
-            for path in [b"sda".as_slice(), b"pts/../sda", b"null/", b"pts/"] {
+            for path in [
+                b"sda".as_slice(),
+                b"pts/../sda",
+                b"null/",
+                b"pts/",
+                b"sysgenid/",
+                b"sysgenid-other",
+            ] {
                 assert!(!device(path));
             }
             let mut task = Task::default();

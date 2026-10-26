@@ -1538,6 +1538,14 @@ fn build_inner(
     };
     let mut external = BTreeMap::new();
     for (index, name) in copy_names.iter().enumerate() {
+        let phase = crate::progress::Phase::start(
+            options.progress,
+            format!("Preparing COPY image {}/{}", index + 1, copy_names.len()),
+        );
+        let cancelled = || {
+            phase.tick();
+            cancelled()
+        };
         check(&cancelled)?;
         let binding = options
             .bases
@@ -1554,7 +1562,7 @@ fn build_inner(
             &layout,
             binding.reference.as_deref(),
             options.limits.image,
-            &cancelled,
+            cancelled,
         )?;
         let directory = intermediate
             .as_ref()
@@ -1581,13 +1589,14 @@ fn build_inner(
             budget.max_entries = budget
                 .max_entries
                 .min(options.limits.max_replay_entries.saturating_sub(entries));
-            let mut verified = layer::verify(&store, descriptor, diff, &spool, budget, &cancelled)?;
+            let mut verified = layer::verify(&store, descriptor, diff, &spool, budget, cancelled)?;
             bytes += verified.size();
             entries += verified.physical_header_count();
-            rootfs::apply_layer(&root, &mut verified, &cancelled)?;
+            rootfs::apply_layer(&root, &mut verified, cancelled)?;
             root_budget(&root, options.limits, &cancelled)?;
         }
         external.insert(name.clone(), (root, metadata.selected.digest.to_string()));
+        phase.finish();
     }
     let mut previous = BTreeMap::new();
     let mut notice = false;
@@ -1598,10 +1607,10 @@ fn build_inner(
             stage_options.work = parent.join(format!("stage-{n}-work"));
             stage_options.output = parent.join(format!("stage-{n}-image"));
         }
-        let stage_started = std::time::Instant::now();
-        if options.progress {
-            eprintln!("Stage {}/{}: START", n + 1, plan.stages.len());
-        }
+        let phase = crate::progress::Phase::start(
+            options.progress,
+            format!("Stage {}/{}", n + 1, plan.stages.len()),
+        );
         let result = build_stage(
             &plan,
             n,
@@ -1613,18 +1622,13 @@ fn build_inner(
             record.as_deref_mut(),
             n == target,
             lease,
-            &cancelled,
+            || {
+                phase.tick();
+                cancelled()
+            },
         );
-        if options.progress {
-            eprintln!(
-                "Stage {}/{}: {} {:.3}s",
-                n + 1,
-                plan.stages.len(),
-                if result.is_ok() { "DONE" } else { "FAILED" },
-                stage_started.elapsed().as_secs_f64()
-            );
-        }
         previous.insert(n, result?);
+        phase.finish();
     }
     Ok(previous.remove(&target).unwrap().result)
 }
@@ -1935,7 +1939,9 @@ fn build_stage(
         let store = BlobStore::open(p)?;
         let mut bytes = 0u64;
         let mut entries = 0usize;
-        for (descriptor, diff) in m.layers.iter().zip(&m.diff_ids) {
+        let preparation =
+            crate::progress::Phase::start(options.progress, "  Preparing base layers");
+        for (layer_index, (descriptor, diff)) in m.layers.iter().zip(&m.diff_ids).enumerate() {
             check(&cancelled)?;
             let mut limits = options.limits.layer;
             limits.max_uncompressed_bytes = limits
@@ -1944,12 +1950,63 @@ fn build_stage(
             limits.max_entries = limits
                 .max_entries
                 .min(options.limits.max_replay_entries - entries);
-            let mut verified = layer::verify(&store, descriptor, diff, &spool, limits, &cancelled)?;
+            let phase = crate::progress::Phase::start(
+                options.progress && options.verbose,
+                format!(
+                    "  Layer {}/{}: verifying and decompressing",
+                    layer_index + 1,
+                    m.layers.len()
+                ),
+            );
+            preparation.detail(format!(
+                "{} | layer {}: verifying/decompressing",
+                crate::progress::count_bar(layer_index, m.layers.len()),
+                layer_index + 1
+            ));
+            let mut verified = layer::verify(&store, descriptor, diff, &spool, limits, || {
+                preparation.tick();
+                phase.tick();
+                cancelled()
+            })?;
+            phase.finish();
             bytes += verified.size();
             entries += verified.physical_header_count();
-            rootfs::apply_layer(&root, &mut verified, &cancelled)?;
-            root_budget(&root, options.limits, &cancelled)?;
+            let phase = crate::progress::Phase::start(
+                options.progress && options.verbose,
+                format!(
+                    "  Layer {}/{}: applying filesystem entries",
+                    layer_index + 1,
+                    m.layers.len()
+                ),
+            );
+            preparation.detail(format!(
+                "{} | layer {}: applying",
+                crate::progress::count_bar(layer_index, m.layers.len()),
+                layer_index + 1
+            ));
+            rootfs::apply_layer(&root, &mut verified, || {
+                preparation.tick();
+                phase.tick();
+                cancelled()
+            })?;
+            phase.finish();
+            let phase = crate::progress::Phase::start(
+                options.progress && options.verbose,
+                "  Checking filesystem budgets",
+            );
+            preparation.detail(format!(
+                "{} | checking filesystem budgets",
+                crate::progress::count_bar(layer_index, m.layers.len())
+            ));
+            root_budget(&root, options.limits, &|| {
+                preparation.tick();
+                phase.tick();
+                cancelled()
+            })?;
+            phase.finish();
         }
+        preparation.detail(crate::progress::count_bar(m.layers.len(), m.layers.len()));
+        preparation.finish();
     }
     let baseline = if options.export_mode == ExportMode::Layered && !cache_hit {
         Some(match (&base_path, binding) {
@@ -1994,7 +2051,7 @@ fn build_stage(
         let started = std::time::Instant::now();
         if options.progress {
             eprintln!(
-                "  [stage {} instruction {}] {} START",
+                "[weld] [stage {} instruction {}] {} START",
                 index + 1,
                 boundary.ordinal,
                 boundary.operation
@@ -2135,6 +2192,7 @@ fn build_stage(
             continue;
         }
         let receipt_start = copy_targets.len();
+        let run_label = format!("stage {} instruction {} RUN", index + 1, boundary.ordinal);
         for (index, step) in steps.iter().enumerate().take(boundary.end).skip(start) {
             check(&cancelled)?;
             match step {
@@ -2206,7 +2264,8 @@ fn build_stage(
                         None
                     };
                     let result = worker(
-                        &root, &run_state, command, workdir, env, user, options, lease, &cancelled,
+                        &root, &run_state, command, workdir, env, user, options, lease, &run_label,
+                        &cancelled,
                     );
                     // Restore even on failed/cancelled RUN; restoration errors are fatal.
                     if let Some(dns) = dns {
@@ -2224,17 +2283,29 @@ fn build_stage(
             let snapshot = work.join(format!("checkpoint-image-{}", boundary.ordinal));
             let mut checkpoint_config = config.clone();
             checkpoint_config["config"] = boundary.config.clone();
+            let phase = crate::progress::Phase::start(
+                options.progress,
+                "  Exporting instruction checkpoint",
+            );
             export_stage(
                 &root,
                 &snapshot,
                 &checkpoint_config,
                 baseline.as_ref(),
                 options.limits.export,
-                &cancelled,
+                &|| {
+                    phase.tick();
+                    cancelled()
+                },
                 || Ok(()),
             )?;
+            phase.finish();
             // Export traverses directories. Continue from the archived state on
             // cold builds too, so later RUNs observe the same atimes as cache hits.
+            let phase = crate::progress::Phase::start(
+                options.progress,
+                "  Verifying and restoring instruction checkpoint",
+            );
             let manifest = restore_checkpoint(
                 &snapshot,
                 &boundary.config,
@@ -2242,8 +2313,12 @@ fn build_stage(
                 &format!("rootfs-exported-{}", boundary.ordinal),
                 &spool,
                 options.limits,
-                &cancelled,
+                &|| {
+                    phase.tick();
+                    cancelled()
+                },
             )?;
+            phase.finish();
             check(&cancelled)?;
             if let Some(entry) = entry {
                 stage_cache.as_ref().unwrap().publish(
@@ -2260,7 +2335,7 @@ fn build_stage(
         }
         if options.progress {
             eprintln!(
-                "  [stage {} instruction {}] {} DONE {:.3}s",
+                "[weld] [stage {} instruction {}] {} DONE {:.3}s",
                 index + 1,
                 boundary.ordinal,
                 boundary.operation,
@@ -2271,6 +2346,14 @@ fn build_stage(
     }
     check(&cancelled)?;
     let mut output_reuses_restored_checkpoint = false;
+    let output_phase = crate::progress::Phase::start(
+        options.progress,
+        "  Publishing stage image (export or verified cache reuse)",
+    );
+    let output_cancelled = || {
+        output_phase.tick();
+        cancelled()
+    };
     let manifest = if cache_hit {
         // Preserve the cached OCI bytes: re-exporting a replayed tree changes
         // access timestamps and would invalidate every dependent stage.
@@ -2279,7 +2362,7 @@ fn build_stage(
             lease,
             &output,
             None,
-            &cancelled,
+            &output_cancelled,
             || {
                 #[cfg(target_os = "linux")]
                 if let Some(r) = record.as_deref_mut() {
@@ -2292,13 +2375,20 @@ fn build_stage(
     } else if let Some((snapshot, manifest, checkpoint_config)) = &last_checkpoint
         && *checkpoint_config == config["config"]
     {
-        crate::build_cache::publish_created(snapshot, lease, &output, None, &cancelled, || {
-            #[cfg(target_os = "linux")]
-            if let Some(r) = record.as_deref_mut() {
-                r.created(&output, lease.unwrap())?;
-            }
-            Ok(())
-        })?;
+        crate::build_cache::publish_created(
+            snapshot,
+            lease,
+            &output,
+            None,
+            &output_cancelled,
+            || {
+                #[cfg(target_os = "linux")]
+                if let Some(r) = record.as_deref_mut() {
+                    r.created(&output, lease.unwrap())?;
+                }
+                Ok(())
+            },
+        )?;
         output_reuses_restored_checkpoint = true;
         manifest.clone()
     } else {
@@ -2308,7 +2398,7 @@ fn build_stage(
             &config,
             baseline.as_ref(),
             options.limits.export,
-            &cancelled,
+            &output_cancelled,
             || {
                 #[cfg(target_os = "linux")]
                 if let Some(r) = record.as_deref_mut() {
@@ -2318,9 +2408,22 @@ fn build_stage(
             },
         )?
     };
+    output_phase.finish();
     if !cache_hit && (cache_entry.is_some() || !final_stage) {
         // Export traverses directories: COPY --from must consume the exported
         // metadata even with caching disabled or a metadata-only stage suffix.
+        let phase = crate::progress::Phase::start(
+            options.progress,
+            if output_reuses_restored_checkpoint {
+                "  Verifying reused stage checkpoint"
+            } else {
+                "  Verifying and restoring exported stage"
+            },
+        );
+        let verification_cancelled = || {
+            phase.tick();
+            cancelled()
+        };
         let verified = if output_reuses_restored_checkpoint {
             // The last instruction already restored this exact snapshot. Copying
             // its OCI blobs does not touch rootfs; verify the output without
@@ -2331,7 +2434,7 @@ fn build_stage(
                 None,
                 &spool,
                 options.limits,
-                &cancelled,
+                &verification_cancelled,
             )?
         } else {
             restore_checkpoint(
@@ -2341,12 +2444,13 @@ fn build_stage(
                 "rootfs-final-export",
                 &spool,
                 options.limits,
-                &cancelled,
+                &verification_cancelled,
             )?
         };
         if verified != manifest {
             return Err("exported stage identity changed during verification".into());
         }
+        phase.finish();
     }
     #[cfg(target_os = "linux")]
     if final_stage && let Some(r) = record {
@@ -2454,6 +2558,7 @@ fn worker(
     user: &str,
     options: &BuildOptions,
     lease: Option<&crate::store_lease::StoreLease>,
+    log_label: &str,
     c: &impl Fn() -> bool,
 ) -> Result<()> {
     let timeout = options.limits.run_timeout_seconds;
@@ -2485,15 +2590,39 @@ fn worker(
     for e in env {
         cmd.arg("--env").arg(e);
     }
-    let child = cmd.spawn()?;
+    if options.progress {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
+    let mut child = cmd.spawn()?;
+    let output = if options.progress {
+        let stdout = child.stdout.take().ok_or("missing RUN stdout pipe")?;
+        let stderr = child.stderr.take().ok_or("missing RUN stderr pipe")?;
+        let out_label = format!("{log_label} stdout");
+        let err_label = format!("{log_label} stderr");
+        Some((
+            std::thread::spawn(move || {
+                crate::progress::forward_output(stdout, io::stdout(), &out_label)
+            }),
+            std::thread::spawn(move || {
+                crate::progress::forward_output(stderr, io::stderr(), &err_label)
+            }),
+        ))
+    } else {
+        None
+    };
     #[cfg(target_os = "linux")]
     {
-        let mut child = child;
         let (status, stopped) = crate::lease_process::wait(
             &mut child,
             c,
             Duration::from_secs(timeout.saturating_add(5)),
         )?;
+        if let Some((stdout, stderr)) = output {
+            let out = stdout.join().map_err(|_| "RUN stdout reader panicked");
+            let err = stderr.join().map_err(|_| "RUN stderr reader panicked");
+            out??;
+            err??;
+        }
         if stopped {
             return Err("RUN cancelled/timed out; partial root retained".into());
         }
@@ -2504,7 +2633,7 @@ fn worker(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (child, timeout, c);
+        let _ = (child, output, timeout, c);
         Err("RUN requires Linux".into())
     }
 }

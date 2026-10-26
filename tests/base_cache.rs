@@ -435,6 +435,41 @@ fn cli_offline_hit_ignores_invalid_credentials_even_with_no_cache() {
     );
     assert!(!String::from_utf8_lossy(&result.stdout).contains("Pulling"));
     assert!(!String::from_utf8_lossy(&result.stderr).contains("SECRET"));
+    let logs = String::from_utf8_lossy(&result.stderr);
+    assert!(logs.contains("Verifying cached base image: START"));
+    assert!(logs.contains("Verifying cached base image: DONE"));
+    let quiet = std::process::Command::new(env!("CARGO_BIN_EXE_rpweld"))
+        .env("RPWELD_HOME", &store)
+        .env("HOME", tmp.path())
+        .args(["build", "--no-cache", "--progress=quiet", "--authfile"])
+        .arg(&auth)
+        .arg(&context)
+        .output()
+        .unwrap();
+    assert!(
+        quiet.status.success(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert!(quiet.stderr.is_empty());
+
+    // Failed verification must not print a successful completion for that phase.
+    let layout = populate(
+        &store,
+        &rpweld::store_lease::StoreLease::shared(&store, &|| false).unwrap(),
+    );
+    fs::write(layout.join("index.json"), b"invalid").unwrap();
+    let failed = std::process::Command::new(env!("CARGO_BIN_EXE_rpweld"))
+        .env("RPWELD_HOME", &store)
+        .env("HOME", tmp.path())
+        .args(["build", "--no-cache"])
+        .arg(&context)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let logs = String::from_utf8_lossy(&failed.stderr);
+    assert!(logs.contains("Verifying cached base image: FAILED/INTERRUPTED"));
+    assert!(!logs.contains("Verifying cached base image: DONE"));
 }
 
 #[test]

@@ -297,6 +297,29 @@ mod linux {
         cancel: impl Fn() -> bool,
         fetch: impl FnOnce(&str, &Path) -> Result<()>,
     ) -> Result<PathBuf> {
+        cached_base_with_progress(
+            store,
+            lease,
+            raw,
+            refresh_tags,
+            limits,
+            cancel,
+            fetch,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Preserve the existing quiet library API.
+    pub fn cached_base_with_progress(
+        store: &Path,
+        lease: &crate::store_lease::StoreLease,
+        raw: &str,
+        refresh_tags: bool,
+        limits: crate::image::Limits,
+        cancel: impl Fn() -> bool,
+        fetch: impl FnOnce(&str, &Path) -> Result<()>,
+        progress: bool,
+    ) -> Result<PathBuf> {
         crate::store_access::validate_root(store, lease).map_err(err)?;
         let reference = super::reference(raw, true)?;
         let source_digest = reference.split_once('@').map(|(_, d)| d.to_owned());
@@ -305,7 +328,15 @@ mod linux {
         let generations = private_dir(&root.join("generations"))?;
         let key = format!("{:x}", Sha256::digest(format!("{reference}\nlinux/amd64")));
         let record_path = refs.join(format!("{key}.json"));
-        let _lock = state_lock(&refs.join(format!("{key}.lock")), Some(&cancel))?;
+        let waiting = crate::progress::Phase::start(progress, "Waiting for base cache lock");
+        let _lock = state_lock(
+            &refs.join(format!("{key}.lock")),
+            Some(&|| {
+                waiting.tick();
+                cancel()
+            }),
+        )?;
+        waiting.finish();
         if let Some(bytes) = read_private(&record_path, AUTH_CAP)? {
             let record: BaseRecord =
                 serde_json::from_slice(&bytes).map_err(|_| "invalid base cache record")?;
@@ -323,11 +354,16 @@ mod linux {
                 return Err("invalid base cache identity or generation".into());
             }
             let layout = generations.join(&record.generation);
-            let metadata =
-                crate::image::load_layout(&layout, None, limits, &cancel).map_err(err)?;
+            let phase = crate::progress::Phase::start(progress, "Verifying cached base image");
+            let metadata = crate::image::load_layout(&layout, None, limits, || {
+                phase.tick();
+                cancel()
+            })
+            .map_err(err)?;
             if metadata.selected != record.selected {
                 return Err("base cache selected descriptor mismatch".into());
             }
+            phase.finish();
             if !refresh_tags || source_digest.is_some() {
                 return Ok(layout);
             }
@@ -341,7 +377,19 @@ mod linux {
             .map_err(err)?;
         let download = staging.path().join("download");
         fetch(&reference, &download)?;
-        let metadata = crate::image::load_layout(&download, None, limits, &cancel).map_err(err)?;
+        let phase = crate::progress::Phase::start(progress, "Verifying downloaded base image");
+        let metadata = crate::image::load_layout(&download, None, limits, || {
+            phase.tick();
+            cancel()
+        })
+        .map_err(err)?;
+        phase.finish();
+        let phase =
+            crate::progress::Phase::start(progress, "Storing and verifying base cache blobs");
+        let cache_cancel = || {
+            phase.tick();
+            cancel()
+        };
         let source = crate::oci::BlobStore::open(&download).map_err(err)?;
         let shared_root = private_dir(&root.join("content"))?;
         let shared = crate::oci::BlobStore::open(&shared_root).map_err(err)?;
@@ -358,13 +406,16 @@ mod linux {
         .chain(metadata.layers.iter().map(|d| (d, limits.max_layer_bytes)))
         {
             let file = source
-                .open_verified(descriptor, cap, &cancel)
+                .open_verified(descriptor, cap, cache_cancel)
                 .map_err(err)?;
-            shared.ingest(file, descriptor, cap, &cancel).map_err(err)?;
             shared
-                .link_verified(&target, descriptor, cap, &cancel)
+                .ingest(file, descriptor, cap, cache_cancel)
+                .map_err(err)?;
+            shared
+                .link_verified(&target, descriptor, cap, cache_cancel)
                 .map_err(err)?;
         }
+        phase.finish();
         atomic_write(
             &generation.path().join("oci-layout"),
             b"{\"imageLayoutVersion\":\"1.0.0\"}",
@@ -372,8 +423,12 @@ mod linux {
         atomic_write(&generation.path().join("index.json"), &serde_json::to_vec(
             &serde_json::json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json", "manifests":[metadata.selected]})
         ).map_err(err)?)?;
-        let verified =
-            crate::image::load_layout(generation.path(), None, limits, &cancel).map_err(err)?;
+        let phase = crate::progress::Phase::start(progress, "Verifying base cache publication");
+        let verified = crate::image::load_layout(generation.path(), None, limits, || {
+            phase.tick();
+            cancel()
+        })
+        .map_err(err)?;
         if verified.selected != metadata.selected {
             return Err("base cache publication descriptor mismatch".into());
         }
@@ -408,6 +463,7 @@ mod linux {
             return Err("base cache record exceeds size limit".into());
         }
         atomic_write(&record_path, &bytes)?;
+        phase.finish();
         Ok(layout)
     }
 

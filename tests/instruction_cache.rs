@@ -97,9 +97,12 @@ impl Build {
     fn executed(&self, marker: &str) -> bool {
         // The Dockerfile splits the token across printf arguments; printing the
         // instruction text cannot masquerade as actual process output.
-        self.log
-            .lines()
-            .any(|line| line.trim() == format!("IC_EXEC_{marker}"))
+        self.log.lines().any(|line| {
+            let line = line.trim();
+            line == format!("IC_EXEC_{marker}")
+                || (line.starts_with("[stage ")
+                    && line.ends_with(&format!(" RUN stdout] IC_EXEC_{marker}")))
+        })
     }
 
     fn cached(&self, ordinal: usize, op: &str) {

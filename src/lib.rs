@@ -22,6 +22,7 @@ mod lease_guard;
 #[cfg(target_os = "linux")]
 pub mod lease_process;
 pub mod oci;
+pub mod progress;
 pub mod registry;
 pub mod resources;
 pub mod rootfs;

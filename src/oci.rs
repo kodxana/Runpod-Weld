@@ -230,6 +230,52 @@ impl BlobStore {
         }
     }
 
+    /// Private export spool on the store's filesystem; callers own stable paths.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn pending_export(&self) -> Result<tempfile::NamedTempFile, Error> {
+        check_directories(&self.directory)?;
+        Ok(tempfile::Builder::new()
+            .prefix(".tmp-export-")
+            .tempfile_in(&self.directory)?)
+    }
+
+    /// Verify the owned spool, then publish without copying its payload again.
+    /// Never accept an arbitrary source path or replace an existing blob.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn publish_export<C: Fn() -> bool>(
+        &self,
+        mut file: tempfile::NamedTempFile,
+        descriptor: &Descriptor,
+        max_size: u64,
+        cancelled: C,
+    ) -> Result<(), Error> {
+        let (digest, size) = descriptor.expected(max_size)?;
+        check_cancel(&cancelled)?;
+        check_directories(&self.directory)?;
+        if file.path().parent() != Some(self.directory.as_path()) {
+            return Err(Error::UnsafePath(file.path().to_owned()));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        verify_stream(file.as_file_mut(), None, &digest, size, &cancelled)?;
+        file.as_file().sync_all()?;
+        check_cancel(&cancelled)?;
+        check_directories(&self.directory)?;
+        match file.persist_noclobber(self.directory.join(digest.encoded())) {
+            Ok(_) => Ok(()),
+            Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => self
+                .open_verified(descriptor, max_size, &cancelled)
+                .map(|_| ())
+                .map_err(|e| {
+                    if matches!(e, Error::Cancelled) {
+                        e
+                    } else {
+                        Error::ExistingInvalid(Box::new(e))
+                    }
+                }),
+            Err(e) => Err(e.error.into()),
+        }
+    }
+
     /// Verifies the entire regular file, then returns the same read-only handle
     /// rewound to zero. No filename, existence check or cached result proves validity.
     pub fn open_verified<C: Fn() -> bool>(
@@ -455,6 +501,88 @@ mod tests {
         file.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"abc");
         f.clean();
+    }
+
+    #[test]
+    fn owned_export_verifies_and_publishes_without_rewriting_inode() {
+        use std::io::Write;
+        let f = Fixture::new();
+        let mut pending = f.1.pending_export().unwrap();
+        pending.write_all(b"abc").unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            pending.as_file().metadata().unwrap().ino()
+        };
+        f.1.publish_export(pending, &descriptor(), 3, || false)
+            .unwrap();
+        assert_eq!(fs::read(f.destination()).unwrap(), b"abc");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(f.destination()).unwrap().ino(), inode);
+        }
+        for payload in [b"abc", b"bad"] {
+            let mut pending = f.1.pending_export().unwrap();
+            pending.write_all(payload).unwrap();
+            assert_eq!(
+                f.1.publish_export(pending, &descriptor(), 3, || false)
+                    .is_ok(),
+                payload == b"abc"
+            );
+        }
+        assert_eq!(fs::read(f.destination()).unwrap(), b"abc");
+        f.clean();
+    }
+
+    #[test]
+    fn owned_export_cancel_and_corruption_never_publish() {
+        use std::io::Write;
+        let f = Fixture::new();
+        for (payload, cancel) in [(b"abc", true), (b"bad", false)] {
+            let mut pending = f.1.pending_export().unwrap();
+            pending.write_all(payload).unwrap();
+            assert!(
+                f.1.publish_export(pending, &descriptor(), 3, || cancel)
+                    .is_err()
+            );
+            assert!(!f.destination().exists());
+            f.clean();
+        }
+        fs::write(f.destination(), b"bad").unwrap();
+        let mut pending = f.1.pending_export().unwrap();
+        pending.write_all(b"abc").unwrap();
+        assert!(matches!(
+            f.1.publish_export(pending, &descriptor(), 3, || false),
+            Err(Error::ExistingInvalid(_))
+        ));
+        assert_eq!(fs::read(f.destination()).unwrap(), b"bad");
+        f.clean();
+    }
+
+    #[test]
+    fn owned_export_keeps_size_and_store_boundaries() {
+        let f = Fixture::new();
+        let other = Fixture::new();
+        for (bytes, max) in [(b"abc".as_slice(), 2), (b"ab", 3), (b"abcd", 3)] {
+            let mut pending = f.1.pending_export().unwrap();
+            pending.write_all(bytes).unwrap();
+            assert!(
+                f.1.publish_export(pending, &descriptor(), max, || false)
+                    .is_err()
+            );
+            assert!(!f.destination().exists());
+            f.clean();
+        }
+        let mut pending = other.1.pending_export().unwrap();
+        pending.write_all(b"abc").unwrap();
+        assert!(matches!(
+            f.1.publish_export(pending, &descriptor(), 3, || false),
+            Err(Error::UnsafePath(_))
+        ));
+        assert!(!f.destination().exists());
+        f.clean();
+        other.clean();
     }
 
     #[test]
