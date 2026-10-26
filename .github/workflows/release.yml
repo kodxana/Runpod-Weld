@@ -1,0 +1,97 @@
+name: Linux release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check version tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [ "$REF_TYPE" = tag ]; then test "$REF_NAME" = "v$version"; fi
+      - name: Install pinned Rust and distribution packaging tools
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo ca-certificates binutils dpkg-dev busybox-static apache2-utils
+          # Runner images can retain superseded libraries whose source packages
+          # are no longer in apt indexes. Refresh the exact bundled closure first.
+          packages=$(python3 scripts/release-dependencies.py)
+          sudo apt-get install -y --only-upgrade --no-install-recommends $packages
+          docker pull python:3.12-bookworm
+      - run: cargo fmt --all -- --check
+      - name: Test Linux ownership, worker and cache behavior
+        run: |
+          cargo test --locked --all-targets --no-run
+          sudo env "PATH=$PATH" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" CARGO_BUILD_JOBS=2 cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo doc --locked --no-deps
+      - name: Build static Weld, offline archive and Debian package
+        run: bash scripts/release-linux.sh "$RUNNER_TEMP/artifacts"
+      - name: Offline installation, nonroot RUN and bundled registry checks
+        run: sudo env "PATH=$PATH" bash scripts/test-release-linux.sh "$RUNNER_TEMP/artifacts"
+      - name: Full authenticated TLS push/pull roundtrip with bundled backend
+        run: |
+          mkdir "$RUNNER_TEMP/roundtrip"
+          (cd "$RUNNER_TEMP/roundtrip" && apt-get download docker-registry && dpkg-deb -x ./*.deb registry)
+          tar -xzf "$RUNNER_TEMP/artifacts/"rpweld-*-linux-amd64.tar.gz -C "$RUNNER_TEMP/roundtrip"
+          sudo python3 tests/registry_https.py --weld "$RUNNER_TEMP/roundtrip/"rpweld-*-linux-amd64/bin/rpweld \
+            --registry "$RUNNER_TEMP/roundtrip/registry/usr/bin/docker-registry"
+      - name: Collect exact corresponding source packages and final checksums
+        run: |
+          python3 scripts/release-sources.py "$RUNNER_TEMP/artifacts"
+          (cd "$RUNNER_TEMP/artifacts" && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: linux-amd64-release
+          path: ${{ runner.temp }}/artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Download tested artifacts and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh run download "$RUN_ID" --repo "$REPOSITORY" --name linux-amd64-release --dir artifacts
+          (cd artifacts && sha256sum -c SHA256SUMS)
+          # Never overwrite an already published release on a retry.
+          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing to replace its assets.' >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" artifacts/* --repo "$REPOSITORY" --verify-tag \
+            --title "Runpod Weld $RELEASE_TAG — Linux amd64" \
+            --notes-file "docs/releases/$RELEASE_TAG.md" --latest

@@ -1,36 +1,37 @@
-name: Rust checks
+name: Linux checks
 on:
   push:
+    branches: ['**']
   pull_request:
 permissions:
   contents: read
 jobs:
   check:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: 2
     steps:
-      - uses: actions/checkout@v4
-      - name: Install pinned Rust
-        run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
-      - run: cargo fmt --all -- --check
-      - run: cargo test --locked --all-targets
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo build --locked --bin rpweld
-      - name: Verify authenticated HTTPS registry workflow
-        if: runner.os == 'Linux'
-        shell: bash
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install build and test tools
         run: |
+          rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends skopeo apache2-utils
+      - run: cargo fmt --all -- --check
+      - name: Run Linux tests with real ownership capabilities
+        run: |
+          cargo test --locked --all-targets --no-run
+          sudo env "PATH=$PATH" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" CARGO_BUILD_JOBS=2 cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo build --locked --bin rpweld
+      - name: Verify authenticated HTTPS registry workflow
+        run: |
           mkdir "$RUNNER_TEMP/weld-registry"
-          (
-            cd "$RUNNER_TEMP/weld-registry"
-            apt-get download docker-registry
-            dpkg-deb -x ./*.deb unpacked
-          )
+          (cd "$RUNNER_TEMP/weld-registry" && apt-get download docker-registry && dpkg-deb -x ./*.deb unpacked)
           sudo python3 tests/registry_https.py --weld "$PWD/target/debug/rpweld" \
             --registry "$RUNNER_TEMP/weld-registry/unpacked/usr/bin/docker-registry"
-      - run: python tests/scan_cli.py target/debug/rpweld
-      - run: python tests/compatibility.py --self-test
+      - run: python3 tests/scan_cli.py target/debug/rpweld
+      - run: python3 tests/compatibility.py --self-test

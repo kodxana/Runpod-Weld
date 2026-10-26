@@ -1,11 +1,12 @@
 [package]
 name = "rpweld"
-version = "0.1.0-dev"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Runpod Weld: a Rust image builder for ordinary Runpod Pods"
 repository = "https://github.com/kodxana/Runpod-Weld"
 publish = false
+license = "Apache-2.0"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

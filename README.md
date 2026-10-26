@@ -2,7 +2,9 @@
 
 `rpweld` is a standalone Rust project for building OCI/Docker images inside ordinary Runpod Pods. It has no Kaniko runtime dependency.
 
-**Development preview:** experimental multi-stage builds from registry images, local OCI images or scratch are available on Linux amd64. Authenticated pulls/pushes use Skopeo. Named stages, COPY --from, target selection and local completed-stage caching are supported. A container run command is not implemented. Trusted workloads only; this is not a security sandbox.
+**Linux amd64 release:** multi-stage builds from registry images, local OCI images or scratch are available. Authenticated pulls/pushes use the bundled Skopeo backend. Named stages, COPY --from, target selection and local completed-stage caching are supported. This remains an early release, not complete Docker compatibility. A container run command is not implemented. Trusted workloads only; this is not a security sandbox.
+
+Download the offline `.deb` or portable archive from [GitHub Releases](https://github.com/kodxana/Runpod-Weld/releases/latest). See [installation and release notes](docs/releases/v0.1.0.md). Weld is licensed under [Apache-2.0](LICENSE); bundled dependencies retain their original licenses.
 
 ## Build, tag and publish
 
@@ -83,14 +85,16 @@ HTTPS and certificate verification are mandatory, including localhost. `--cert-d
 
 Registry builds inspect bounded manifest/config metadata before downloading layers, then pin the selected content digest. Declared compressed sizes are checked against workload limits and available download/cache storage; expansion is checked during replay. The original reference's system signature-policy scope is retained. Signed tag or index pulls that would change signing identity are explicitly unsupported; a directly pinned single-manifest digest retains backend signature enforcement. Metadata limits bound accepted output, not an exact network-byte quota: Skopeo's internal reads retain its own fixed bounds.
 
-On Debian/Ubuntu amd64, build the package with Rust 1.90 and `dpkg-deb`:
+The release `.deb` installs without network access or dependencies to download:
 
 ```sh
-bash scripts/package-deb.sh
-sudo apt install ./target/packages/rpweld_0.1.0~dev_amd64.deb
+sudo dpkg -i ./rpweld_0.1.0_amd64.deb
+rpweld --version
 ```
 
-The package declares Skopeo (>= 1.13) and CA certificates as dependencies, so installation brings the backend with it. Weld invokes `/usr/bin/skopeo` directly, never a binary from the build context's PATH. A raw `cargo build` binary needs this backend installed for registry operations; offline local-base builds still work without it.
+Both release packages carry Skopeo, private shared libraries/loader and fallback CA roots. They resolve the backend relative to Weld's actual executable, never from the build context or PATH. Keep the portable archive's `bin`, `lib` and `share` directories together. Existing system signature policies and certificate configuration are preserved; bundles need updating when their dependencies receive security updates. Optional credential helpers and GnuPG policy tools/keyrings remain operator supplied. A raw development `cargo build` binary falls back to `/usr/bin/skopeo`; local-base builds work without it.
+
+To build release packages on Ubuntu 24.04 amd64 with Rust 1.90, Skopeo, CA certificates, binutils, Python 3.11+ and `dpkg-deb`, run `bash scripts/package-deb.sh`. The [release workflow](.github/workflows/release.yml) builds, tests, collects corresponding sources and publishes on version tags.
 
 ## Build and inspect
 

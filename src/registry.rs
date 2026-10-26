@@ -103,6 +103,10 @@ pub fn reference(raw: &str, allow_digest: bool) -> Result<String, String> {
 pub use linux::*;
 
 #[cfg(target_os = "linux")]
+#[path = "registry_backend.rs"]
+mod backend;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use serde::Deserialize;
@@ -464,14 +468,13 @@ mod linux {
             .unwrap_or_else(|| reference.rsplit_once(':').unwrap().0)
     }
     fn read_system_policy() -> Result<Vec<u8>> {
-        // command() gives Skopeo an empty private HOME, so DefaultPolicy falls back here.
-        // Packaged backend lookup: containers/image signature/policy_config.go,
-        // defaultPolicyPathWithHomeDir (no caller HOME policy or permissive fallback).
+        // command() gives Skopeo an empty private HOME. Honor the system policy;
+        // only an absent system file may use the release bundle's explicit default.
         // https://github.com/containers/image/blob/v5.26.0/signature/policy_config.go
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open("/etc/containers/policy.json")
+            .open(super::backend::Backend::discover()?.policy()?)
             .map_err(|_| "cannot read registry signature policy")?;
         if !file.metadata().map_err(err)?.is_file() {
             return Err("registry signature policy must be a regular file".into());
@@ -1006,15 +1009,8 @@ mod linux {
             })
         }
         fn command(&self, lease: Option<&crate::store_lease::StoreLease>) -> Result<Command> {
-            // Never resolve an executable from a build context or a caller's PATH.
-            let mut cmd = if let Some(lease) = lease {
-                crate::lease_process::command("/usr/bin/skopeo", Some(lease)).map_err(err)?
-            } else {
-                Command::new("/usr/bin/skopeo")
-            };
-            if !Path::new("/usr/bin/skopeo").is_file() {
-                return Err("registry backend missing: install the Weld Debian package (includes the Skopeo dependency)".into());
-            }
+            let backend = super::backend::Backend::discover()?;
+            let mut cmd = backend.command(lease)?;
             cmd.env_clear()
                 .env("PATH", "/usr/local/bin:/usr/bin:/bin")
                 .env("HOME", self.temp.path())
@@ -1038,6 +1034,7 @@ mod linux {
                     cmd.env(key, value);
                 }
             }
+            backend.configure(&mut cmd)?;
             cmd.args([
                 "--command-timeout",
                 "900s",
