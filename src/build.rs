@@ -2366,6 +2366,8 @@ fn build_stage(
     for p in [&spool, &state] {
         fs::create_dir(p)?;
     }
+    // Bounded by the loaded descriptor count; repeated digests share one size.
+    let mut baseline_spool_sizes = BTreeMap::new();
     if let (Some(m), Some(p)) = (&metadata, &base_path) {
         let store = BlobStore::open(p)?;
         let mut bytes = 0u64;
@@ -2403,6 +2405,7 @@ fn build_stage(
             phase.finish();
             bytes += verified.size();
             entries += verified.physical_header_count();
+            baseline_spool_sizes.insert(descriptor.digest.as_str(), verified.size());
             check_replay_space(resources, &root, &verified, &cancelled)?;
             let phase = crate::progress::Phase::start(
                 options.progress && options.verbose,
@@ -2458,7 +2461,21 @@ fn build_stage(
                 |allocation| {
                     match allocation {
                         export::CaptureAllocation::Spool { path, descriptor } => {
-                            check_spool_space(resources, path, descriptor)
+                            let bytes = *baseline_spool_sizes
+                                .get(descriptor.digest.as_str())
+                                .ok_or(export::Error::Invalid(
+                                    "missing verified baseline spool measurement",
+                                ))?;
+                            resource_check(
+                                resources,
+                                "verifying measured baseline layer spool",
+                                &[crate::build_resources::Requirement {
+                                    path: path.to_owned(),
+                                    bytes,
+                                    inodes: 1,
+                                }],
+                            )
+                            .map_err(Into::into)
                         }
                         export::CaptureAllocation::Replay { root, layer } => {
                             check_replay_space(resources, root, layer, &cancelled)

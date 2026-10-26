@@ -215,6 +215,10 @@ impl Fixture {
 
     fn plain_base(&self, layers: &[serde_json::Value]) {
         let ids: Vec<_> = layers.iter().map(|layer| layer["digest"].clone()).collect();
+        self.base_layers(layers, &ids);
+    }
+
+    fn base_layers(&self, layers: &[serde_json::Value], ids: &[serde_json::Value]) {
         let history: Vec<_> = (0..layers.len())
             .map(|i| serde_json::json!({"created_by":format!("fixture layer {i}")}))
             .collect();
@@ -452,4 +456,101 @@ fn regression_export_inherits_duplicate_blobs_without_temporary_copy() {
             serde_json::json!({"created_by":format!("fixture layer {i}")})
         );
     }
+}
+
+#[test]
+#[ignore = "requires root and CAP_SYS_ADMIN; disposable 512 MiB tmpfs"]
+fn regression_baseline_admits_measured_gzip_spool_before_decompression() {
+    let fixture = Fixture::new(16384);
+    let plain = [
+        fixture.plain_layer(&[("first", b'0', 120 << 20, None)]),
+        fixture.plain_layer(&[("second", b'0', 60 << 20, None)]),
+    ];
+    let ids: Vec<_> = plain.iter().map(|layer| layer["digest"].clone()).collect();
+    let compressed: Vec<_> = plain
+        .iter()
+        .map(|layer| {
+            let encoded = layer["digest"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("sha256:")
+                .unwrap();
+            let mut file = fs::File::open(fixture.path("base/blobs/sha256").join(encoded)).unwrap();
+            let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::copy(&mut file, &mut gzip).unwrap();
+            fixture.blob(
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                &gzip.finish().unwrap(),
+            )
+        })
+        .collect();
+    fixture.base_layers(&compressed, &ids);
+    let mut minimum = fixture.available();
+    let output = fixture.build_at(
+        "FROM local\nLABEL changed=yes\n",
+        400 << 20,
+        "limited/work",
+        "output",
+        || minimum = minimum.min(fixture.available()),
+    );
+    eprintln!(
+        "gzip baseline minimum free bytes: {minimum}; reserve: {}",
+        256 << 20
+    );
+    assert!(!output.status.success(), "{}", log(&output));
+    let root = fixture.path("limited/work/rootfs");
+    assert_eq!(
+        fs::read_dir(&root).unwrap().count(),
+        2,
+        "initial replay must be retained"
+    );
+    for (name, size) in [("first", 120 << 20), ("second", 60 << 20)] {
+        let mut file = fs::File::open(root.join(name)).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), size);
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest).unwrap();
+        let mut expected = Sha256::new();
+        std::io::copy(&mut std::io::repeat(0).take(size), &mut expected).unwrap();
+        assert_eq!(
+            digest.finalize(),
+            expected.finalize(),
+            "retained {name} changed"
+        );
+    }
+    assert!(!fixture.path("output").exists());
+    let mut remaining: Vec<_> = fs::read_dir(fixture.path("limited/work"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        ["rootfs", "spool", "state"],
+        "capture must clean its replay"
+    );
+    assert!(
+        !fs::read_dir(fixture.path("store")).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("tag-") && name.ends_with(".json")
+        }),
+        "failed build published a tag: {}",
+        log(&output)
+    );
+    assert!(
+        minimum >= 256 << 20,
+        "gzip baseline crossed reserve: {minimum}; {}",
+        log(&output)
+    );
+    assert!(
+        log(&output).contains("verifying measured baseline layer spool")
+            && log(&output).contains("additional/reserved bytes"),
+        "{}",
+        log(&output)
+    );
+    assert!(
+        !log(&output).contains("Layer(Cancelled)"),
+        "{}",
+        log(&output)
+    );
 }
