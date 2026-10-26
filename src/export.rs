@@ -45,6 +45,13 @@ pub struct Baseline {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "Standalone replay admission is exercised by internal regression tests; the engine uses replay receipts"
+    )
+)]
 pub(crate) enum CaptureAllocation<'a> {
     Spool {
         path: &'a Path,
@@ -57,6 +64,32 @@ pub(crate) enum CaptureAllocation<'a> {
 }
 
 impl Baseline {
+    /// Reuse the engine's complete initial replay; never reread live symlink targets.
+    /// The engine retains the stable base layout and exclusively owns the root.
+    pub(crate) fn capture_replayed(
+        root: &Path,
+        layout: &Path,
+        metadata: &crate::image::ImageMetadata,
+        receipt: crate::rootfs::ReplayReceipt,
+        limits: Limits,
+        blob_limit: u64,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::delta::capture_replayed(
+                root, layout, metadata, receipt, limits, blob_limit, &cancelled,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                root, layout, metadata, receipt, limits, blob_limit, cancelled,
+            );
+            Err(Error::Invalid("export requires Linux"))
+        }
+    }
+
     /// Capture BEFORE any build instruction. `workspace` is an owned canonical
     /// directory for a bounded temporary replay, removed on return. Keep the
     /// original layout immutable and available until the final delta export.
@@ -202,6 +235,7 @@ pub(crate) fn export_delta_layout_created(
             created,
             Some(baseline),
             None,
+            linux::SourceState::Observed,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -863,6 +897,7 @@ pub(crate) fn export_layout_created(
             created,
             None,
             None,
+            linux::SourceState::Observed,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -895,6 +930,7 @@ pub(crate) fn export_created_with_resources(
             created,
             baseline,
             resources,
+            linux::SourceState::Archived,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -1498,6 +1534,11 @@ mod linux {
         store.ingest(bytes, &d, bytes.len() as u64, c)?;
         Ok(d)
     }
+    pub(super) enum SourceState {
+        Observed,
+        Archived,
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn export(
         root: &Path,
@@ -1508,6 +1549,7 @@ mod linux {
         created: impl FnOnce() -> std::io::Result<()>,
         baseline: Option<&Baseline>,
         resources: Option<&crate::build_resources::Policy>,
+        source_state: SourceState,
     ) -> Result<Descriptor, Error> {
         check(c)?;
         // Our writer emits at most PAX + GNU long path + GNU long link + entry
@@ -1715,6 +1757,9 @@ mod linux {
             output["history"] = json!([{"created_by":"Weld flattened rootfs export", "comment":"Full filesystem snapshot; original layer history replaced."}]);
             vec![layer]
         };
+        if let (SourceState::Archived, Some(plan)) = (source_state, &plan) {
+            delta::restore_observed_links(root, &plan.inventory, c)?;
+        }
         let config = blob(&store, CONFIG, &json_bytes(&output, &mut remaining)?, c)?;
         let manifest = blob(
             &store,

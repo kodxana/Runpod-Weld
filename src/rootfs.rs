@@ -57,12 +57,118 @@ pub fn apply_layer(
 ) -> Result<Summary, Error> {
     #[cfg(target_os = "linux")]
     {
-        linux::apply(root, layer, &cancelled)
+        linux::apply(root, layer, None, &cancelled)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (root, layer, cancelled);
         Err(Error::Unsupported("layer application requires Linux"))
+    }
+}
+
+/// Build-private evidence from applying verified layers to a fresh, owned root.
+/// Symlink targets are recorded at creation, without reading the resulting links.
+pub(crate) struct ReplayReceipt {
+    #[cfg(target_os = "linux")]
+    root: std::fs::File,
+    #[cfg(target_os = "linux")]
+    targets: std::collections::BTreeMap<(u64, u64), std::path::PathBuf>,
+    diff_ids: Vec<crate::oci::Sha256Digest>,
+    remaining: u64,
+    charged: u64,
+    valid: bool,
+}
+
+impl ReplayReceipt {
+    pub(crate) fn new(root: &Path, metadata_limit: u64) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(root)?;
+            if std::fs::read_dir(root)?.next().transpose()?.is_some() {
+                return Err(Error::Invalid("recorded replay requires an empty root"));
+            }
+            Ok(Self {
+                root: file,
+                targets: Default::default(),
+                diff_ids: Vec::new(),
+                remaining: metadata_limit,
+                charged: 0,
+                valid: true,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root, metadata_limit);
+            Err(Error::Unsupported("recorded replay requires Linux"))
+        }
+    }
+
+    fn charge(&mut self, bytes: u64) -> Result<(), Error> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .ok_or(Error::Invalid("replay receipt metadata budget exceeded"))?;
+        self.charged += bytes;
+        Ok(())
+    }
+
+    pub(crate) fn apply(
+        &mut self,
+        root: &Path,
+        layer: &mut VerifiedLayer,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Summary, Error> {
+        self.validate(root, &self.diff_ids)?;
+        self.valid = false;
+        self.charge(128)?;
+        #[cfg(target_os = "linux")]
+        {
+            let summary = linux::apply(root, layer, Some(self), &cancelled)?;
+            self.diff_ids.push(layer.diff_id().clone());
+            self.valid = true;
+            Ok(summary)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (layer, cancelled);
+            Err(Error::Unsupported("recorded replay requires Linux"))
+        }
+    }
+
+    pub(crate) fn validate(
+        &self,
+        root: &Path,
+        diff_ids: &[crate::oci::Sha256Digest],
+    ) -> Result<(), Error> {
+        if !self.valid || self.diff_ids != diff_ids {
+            return Err(Error::Invalid("incomplete or mismatched replay receipt"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let actual = std::fs::symlink_metadata(root)?;
+            let pinned = self.root.metadata()?;
+            if !actual.is_dir() || (actual.dev(), actual.ino()) != (pinned.dev(), pinned.ino()) {
+                return Err(Error::Invalid("replay receipt root identity changed"));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = root;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn target(&self, identity: (u64, u64)) -> Option<&Path> {
+        self.targets.get(&identity).map(std::path::PathBuf::as_path)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn metadata_bytes(&self) -> u64 {
+        self.charged
     }
 }
 
@@ -536,6 +642,7 @@ mod linux {
     pub(super) fn apply(
         path: &Path,
         layer: &mut VerifiedLayer,
+        mut receipt: Option<&mut ReplayReceipt>,
         c: &impl Fn() -> bool,
     ) -> Result<Summary, Error> {
         check(c)?;
@@ -661,12 +768,18 @@ mod linux {
                         )
                     })?;
                     symlink_metadata(d.as_raw_fd(), name, e)?;
-                    symlinks.push((
-                        i,
-                        d.try_clone()?,
-                        name.to_vec(),
-                        open(d.as_raw_fd(), name, libc::O_PATH)?,
-                    ));
+                    let pin = open(d.as_raw_fd(), name, libc::O_PATH)?;
+                    if let Some(receipt) = receipt.as_deref_mut() {
+                        use std::os::unix::ffi::OsStringExt;
+                        let target = e.link_target.as_ref().unwrap();
+                        receipt.charge(target.len() as u64 + 128)?;
+                        let s = fstat(pin.as_raw_fd())?;
+                        receipt.targets.insert(
+                            (s.st_dev, s.st_ino),
+                            std::ffi::OsString::from_vec(target.clone()).into(),
+                        );
+                    }
+                    symlinks.push((i, d.try_clone()?, name.to_vec(), pin));
                 }
                 EntryKind::File => {
                     let fd = open(
@@ -913,6 +1026,79 @@ mod tests {
     }
     fn apply(root: &Path, items: Vec<Item>) -> Summary {
         apply_layer(root, &mut verified(items), || false).unwrap()
+    }
+
+    #[test]
+    fn recorded_replay_tracks_inode_targets_through_aliases_and_whiteouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let mut receipt = ReplayReceipt::new(&root, 1 << 20).unwrap();
+        let mut first = verified(vec![
+            directory("d"),
+            link("alias", "d", false),
+            link("alias/s", "old", false),
+            link("held", "d/s", true),
+        ]);
+        receipt.apply(&root, &mut first, || false).unwrap();
+        let mut second = verified(vec![
+            file("d/.wh.s", b""),
+            link("d/s", "new", false),
+            link("chain", "held", true),
+        ]);
+        receipt.apply(&root, &mut second, || false).unwrap();
+        receipt
+            .validate(&root, &[first.diff_id().clone(), second.diff_id().clone()])
+            .unwrap();
+        for (name, expected) in [
+            ("alias", "d"),
+            ("d/s", "new"),
+            ("held", "old"),
+            ("chain", "old"),
+        ] {
+            let before = fs::symlink_metadata(root.join(name)).unwrap();
+            assert_eq!(
+                receipt.target((before.dev(), before.ino())),
+                Some(Path::new(expected))
+            );
+            let after = fs::symlink_metadata(root.join(name)).unwrap();
+            assert_eq!(
+                (
+                    before.atime(),
+                    before.atime_nsec(),
+                    before.ctime(),
+                    before.ctime_nsec()
+                ),
+                (
+                    after.atime(),
+                    after.atime_nsec(),
+                    after.ctime(),
+                    after.ctime_nsec()
+                )
+            );
+        }
+        assert!(
+            receipt
+                .validate(&root, &[second.diff_id().clone()])
+                .is_err()
+        );
+        let replacement = tmp.path().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        assert!(receipt.validate(&replacement, &receipt.diff_ids).is_err());
+        let mut cancelled = verified(vec![file("must-not-exist", b"")]);
+        assert!(receipt.apply(&root, &mut cancelled, || true).is_err());
+        assert!(receipt.validate(&root, &receipt.diff_ids).is_err());
+        assert!(!root.join("must-not-exist").exists());
+    }
+
+    #[test]
+    fn recorded_replay_requires_empty_root_and_bounded_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut receipt = ReplayReceipt::new(tmp.path(), 128).unwrap();
+        let mut layer = verified(vec![link("link", "target", false)]);
+        assert!(receipt.apply(tmp.path(), &mut layer, || false).is_err());
+        assert!(!receipt.valid);
+        assert!(ReplayReceipt::new(tmp.path(), 1024).is_err());
     }
 
     #[test]

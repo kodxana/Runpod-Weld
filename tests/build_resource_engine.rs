@@ -346,7 +346,7 @@ fn replay_reserves_shared_implicit_parents_once() {
 
 #[test]
 #[ignore = "requires root and CAP_SYS_ADMIN; disposable 512 MiB tmpfs"]
-fn regression_baseline_admits_each_intermediate_replay_allocation() {
+fn baseline_reuses_initial_replay_without_allocating_intermediate_roots() {
     let fixture = Fixture::new(16384);
     let first = fixture.plain_layer(&[("old", b'0', 120 << 20, None)]);
     let second = fixture.plain_layer(&[
@@ -376,15 +376,10 @@ fn regression_baseline_admits_each_intermediate_replay_allocation() {
     for name in ["alias1", "alias2", "alias3"] {
         assert_eq!(fs::metadata(root.join(name)).unwrap().ino(), payload.ino());
     }
-    assert!(!output.status.success(), "{}", log(&output));
+    assert!(output.status.success(), "{}", log(&output));
     assert!(minimum >= 256 << 20, "baseline crossed reserve: {minimum}");
-    assert!(
-        log(&output).contains("replaying verified layer")
-            && log(&output).contains("additional/reserved bytes"),
-        "{}",
-        log(&output)
-    );
-    assert!(!fixture.path("output").exists());
+    assert!(log(&output).contains("Capturing verified base filesystem (no replay)"));
+    assert!(fixture.path("output/index.json").is_file());
     let mut remaining: Vec<_> = fs::read_dir(fixture.path("limited/work"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -393,7 +388,7 @@ fn regression_baseline_admits_each_intermediate_replay_allocation() {
     assert_eq!(
         remaining,
         ["rootfs", "spool", "state"],
-        "capture must clean its replay"
+        "capture must not create a second replay"
     );
 }
 
@@ -460,7 +455,7 @@ fn regression_export_inherits_duplicate_blobs_without_temporary_copy() {
 
 #[test]
 #[ignore = "requires root and CAP_SYS_ADMIN; disposable 512 MiB tmpfs"]
-fn regression_baseline_admits_measured_gzip_spool_before_decompression() {
+fn baseline_reuses_verified_gzip_without_a_second_decompression() {
     let fixture = Fixture::new(16384);
     let plain = [
         fixture.plain_layer(&[("first", b'0', 120 << 20, None)]),
@@ -497,7 +492,7 @@ fn regression_baseline_admits_measured_gzip_spool_before_decompression() {
         "gzip baseline minimum free bytes: {minimum}; reserve: {}",
         256 << 20
     );
-    assert!(!output.status.success(), "{}", log(&output));
+    assert!(output.status.success(), "{}", log(&output));
     let root = fixture.path("limited/work/rootfs");
     assert_eq!(
         fs::read_dir(&root).unwrap().count(),
@@ -517,7 +512,7 @@ fn regression_baseline_admits_measured_gzip_spool_before_decompression() {
             "retained {name} changed"
         );
     }
-    assert!(!fixture.path("output").exists());
+    assert!(fixture.path("output/index.json").is_file());
     let mut remaining: Vec<_> = fs::read_dir(fixture.path("limited/work"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -526,16 +521,7 @@ fn regression_baseline_admits_measured_gzip_spool_before_decompression() {
     assert_eq!(
         remaining,
         ["rootfs", "spool", "state"],
-        "capture must clean its replay"
-    );
-    assert!(
-        !fs::read_dir(fixture.path("store")).unwrap().any(|entry| {
-            let name = entry.unwrap().file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("tag-") && name.ends_with(".json")
-        }),
-        "failed build published a tag: {}",
-        log(&output)
+        "capture must not create a second replay"
     );
     assert!(
         minimum >= 256 << 20,
@@ -543,8 +529,7 @@ fn regression_baseline_admits_measured_gzip_spool_before_decompression() {
         log(&output)
     );
     assert!(
-        log(&output).contains("verifying measured baseline layer spool")
-            && log(&output).contains("additional/reserved bytes"),
+        log(&output).contains("Capturing verified base filesystem (no replay)"),
         "{}",
         log(&output)
     );

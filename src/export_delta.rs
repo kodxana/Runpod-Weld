@@ -63,6 +63,44 @@ pub(super) struct Node {
 pub(super) struct Inventory {
     pub(super) entries: BTreeMap<PathBuf, Node>,
 }
+
+/// Repair only readlink-induced atime changes at an engine checkpoint.
+/// Checkpoints never promise ctime preservation; standalone capture does.
+pub(super) fn restore_observed_links(root: &Path, inventory: &Inventory, c: &impl Fn() -> bool) -> Result<(), Error> {
+    for (path, node) in &inventory.entries {
+        check(c)?;
+        if !node.metadata.file_type().is_symlink() || node.anchor != *path {
+            continue;
+        }
+        let pin = OpenOptions::new().read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW).open(root.join(path))?;
+        let current = pin.metadata()?;
+        let saved = &node.metadata;
+        if !current.file_type().is_symlink() || identity(&current) != identity(saved)
+            || current.len() != saved.len() || current.nlink() != saved.nlink()
+            || current.mtime() != saved.mtime() || current.mtime_nsec() != saved.mtime_nsec()
+            || current.ctime() != saved.ctime() || current.ctime_nsec() != saved.ctime_nsec() {
+            return Err(Error::Invalid("symlink changed during checkpoint export"));
+        }
+        if (current.atime(), current.atime_nsec()) == (saved.atime(), saved.atime_nsec()) { continue; }
+        let times = [
+            libc::timespec { tv_sec: saved.atime(), tv_nsec: saved.atime_nsec() },
+            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
+        ];
+        // SAFETY: the live O_PATH descriptor pins this symlink; the array and
+        // empty C string remain valid, and AT_EMPTY_PATH never follows its target.
+        if unsafe { libc::utimensat(pin.as_raw_fd(), c"".as_ptr(), times.as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let after = pin.metadata()?;
+        if (after.atime(), after.atime_nsec(), after.mtime(), after.mtime_nsec())
+            != (saved.atime(), saved.atime_nsec(), saved.mtime(), saved.mtime_nsec()) {
+            return Err(Error::Invalid("checkpoint symlink timestamps were not restored"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct State {
     inventory: Inventory,
     layout: Option<PathBuf>,
@@ -72,11 +110,16 @@ pub(crate) struct State {
     blob_limit: u64,
 }
 
+enum Targets<'a> {
+    Inventory(&'a Inventory),
+    Replay(&'a crate::rootfs::ReplayReceipt),
+}
+
 fn inventory(
     root: &Path,
     limits: Limits,
     remaining: &mut u64,
-    targets: Option<&Inventory>,
+    targets: Option<Targets<'_>>,
     c: &impl Fn() -> bool,
 ) -> Result<Inventory, Error> {
     canonical_dir(root)?;
@@ -224,19 +267,17 @@ fn inventory(
             }
             node.hash = Some(hash.finalize().into());
         } else {
-            node.target = Some(if let Some(targets) = targets {
-                let target = targets
-                    .entries
-                    .get(path)
-                    .and_then(|n| n.target.as_ref())
-                    .ok_or(Error::Invalid(
-                        "baseline symlink absent from verified replay",
-                    ))?;
+            node.target = Some(if let Some(targets) = &targets {
+                let target = match targets {
+                    Targets::Inventory(targets) => targets.entries.get(path)
+                        .and_then(|n| n.target.as_deref()),
+                    Targets::Replay(receipt) => receipt.target(identity(m)),
+                }.ok_or(Error::Invalid("baseline symlink absent from verified replay"))?;
                 if target.as_os_str().len() as u64 != m.len() {
                     return Err(Error::Invalid("baseline symlink size differs"));
                 }
                 charge(remaining, m.len())?;
-                target.clone()
+                target.to_owned()
             } else {
                 bounded_link(&absolute, m.len(), remaining)?
             });
@@ -348,7 +389,7 @@ pub(crate) fn capture(
         json_bytes(&metadata.manifest, &mut remaining)?;
         json_bytes(&metadata.config, &mut remaining)?;
         let replay_inventory = inventory(&replay, limits, &mut remaining, None, c)?;
-        let inventory = inventory(root, limits, &mut remaining, Some(&replay_inventory), c)?;
+        let inventory = inventory(root, limits, &mut remaining, Some(Targets::Inventory(&replay_inventory)), c)?;
         let history = metadata.config.get("history").cloned();
         validate_history(history.as_ref(), metadata.layers.len())?;
         Ok(Baseline {
@@ -363,6 +404,53 @@ pub(crate) fn capture(
         })
     })();
     finish_capture(temp, cleanup_root, cleanup_entries, result)
+}
+
+pub(crate) fn capture_replayed(
+    root: &Path,
+    layout: &Path,
+    metadata: &crate::image::ImageMetadata,
+    receipt: crate::rootfs::ReplayReceipt,
+    limits: Limits,
+    blob_limit: u64,
+    c: &impl Fn() -> bool,
+) -> Result<Baseline, Error> {
+    check(c)?;
+    canonical_dir(root)?;
+    canonical_dir(layout)?;
+    if layout.starts_with(root) || root.starts_with(layout) {
+        return Err(Error::Invalid("baseline layout overlaps root"));
+    }
+    receipt.validate(root, &metadata.diff_ids).map_err(Error::Replay)?;
+    let mut remaining = limits.max_metadata_bytes;
+    charge(&mut remaining, receipt.metadata_bytes())?;
+    json_bytes(&metadata.manifest, &mut remaining)?;
+    json_bytes(&metadata.config, &mut remaining)?;
+    let mut preflight = Preflight {
+        forbidden: layout.ancestors()
+            .map(|p| fs::metadata(p).map(|m| identity(&m)))
+            .collect::<io::Result<Vec<_>>>()?,
+        directories: HashMap::new(),
+        mount: mount_id(root)?,
+        remaining_entries: limits.max_entries,
+        remaining_metadata: remaining,
+        cancelled: c,
+        noatime: true,
+        estimate: None,
+    };
+    preflight.visit(root, 0)?;
+    drop(preflight);
+    let inventory = inventory(root, limits, &mut remaining, Some(Targets::Replay(&receipt)), c)?;
+    let history = metadata.config.get("history").cloned();
+    validate_history(history.as_ref(), metadata.layers.len())?;
+    Ok(Baseline { state: State {
+        inventory,
+        layout: Some(layout.to_owned()),
+        layers: metadata.layers.clone(),
+        diff_ids: metadata.diff_ids.clone(),
+        history,
+        blob_limit,
+    }})
 }
 
 // Only the disposable replay namespace is modified. Pin each directory before
@@ -827,6 +915,42 @@ mod tests {
             || false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn recorded_baseline_matches_private_replay_without_mutating_source() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let work = temp.path();
+        let seed = work.join("seed");
+        fs::create_dir(&seed).unwrap();
+        fs::write(seed.join("payload"), vec![42; 1 << 20]).unwrap();
+        symlink("/payload", seed.join("link")).unwrap();
+        fs::hard_link(seed.join("link"), seed.join("alias")).unwrap();
+        times(&seed.join("link"), false);
+        let layout = work.join("base");
+        export_layout(&seed, &layout, &config(), LIMITS, || false).unwrap();
+        let root = work.join("root");
+        fs::create_dir(&root).unwrap();
+        let mut receipt = crate::rootfs::ReplayReceipt::new(&root, LIMITS.max_metadata_bytes).unwrap();
+        let metadata = load(&layout);
+        let store = BlobStore::open(&layout).unwrap();
+        for (d, id) in metadata.layers.iter().zip(&metadata.diff_ids) {
+            let mut layer = crate::layer::verify(&store, d, id, work, layer_limits(), || false).unwrap();
+            receipt.apply(&root, &mut layer, || false).unwrap();
+        }
+        let before = ["", "payload", "link", "alias"].map(|p| fs::symlink_metadata(root.join(p)).unwrap());
+        let expected = capture(&root, &layout, work);
+        let entries_before = fs::read_dir(work).unwrap().count();
+        let actual = capture_replayed(&root, &layout, &metadata, receipt, LIMITS, LIMITS.max_layer_bytes, &|| false).unwrap();
+        assert_eq!(fs::read_dir(work).unwrap().count(), entries_before);
+        equivalent(&expected.state.inventory, &actual.state.inventory);
+        assert_eq!(actual.state.layers, expected.state.layers);
+        assert_eq!(actual.state.diff_ids, expected.state.diff_ids);
+        for (p, before) in ["", "payload", "link", "alias"].into_iter().zip(before) {
+            let after = fs::symlink_metadata(root.join(p)).unwrap();
+            assert_eq!((before.atime(), before.atime_nsec(), before.ctime(), before.ctime_nsec()),
+                (after.atime(), after.atime_nsec(), after.ctime(), after.ctime_nsec()), "{p}");
+        }
     }
 
     #[test]

@@ -392,16 +392,24 @@ layer chain. Deletions, replacements, hardlinks and preserved metadata participa
 in the delta; runtime configuration still comes from the evaluated Dockerfile.
 Use `--export-mode flattened` to write one full-filesystem layer. Layered output
 does not yet produce a separate delivered layer for each RUN or COPY instruction.
-Layered capture verifies and temporarily replays the base under owned work and
-requires permission to use `O_NOATIME` for inventory reads. It can therefore use
-additional temporary disk space and fail where a flattened export succeeds.
-Public outputs do not share blob inodes with the base or managed cache.
+Layered builds capture the baseline from the initial verified replay. A bounded,
+root-identity-bound receipt supplies symlink targets without rereading live links
+or extracting the base a second time. Inventory reads still require `O_NOATIME`.
+Standalone `Baseline::capture` callers without a replay receipt retain its private
+verified replay. Public outputs never share blob inodes with the base or cache.
 
-Checkpoints use the selected export mode. Both freshly created checkpoints and hits
-are replayed before subsequent execution so preserved metadata agrees. This adds
-disk I/O and retained roots; it does not preserve ctime, matching the existing
-export/replay limitation. Strict-atime source filesystems can cause cache misses
+Fresh layered checkpoints keep the working root. Export repairs only access times
+changed by its own symlink reads, then verifies the new delta under the remaining
+replay budgets. Base blob hashes are checked again, without decompressing or
+applying that already-verified prefix. Cache hits still verify and replay their
+complete state. Flattened checkpoints retain export-and-replay behavior. No path
+promises ctime preservation across checkpoints; standalone baseline capture still
+preserves source atime/ctime. Strict-atime source filesystems can cause cache misses
 when reads cannot use O_NOATIME.
+
+This removes cold layered checkpoint reconstruction and retained duplicate roots.
+Checkpoint exports still scan the current tree and copy inherited OCI blobs;
+per-instruction delivered layers and incremental COPY inventories remain future work.
 
 `--no-cache` bypasses stage and instruction cache reads and writes. Cache hits verify OCI digests and
 replay layers under the requested limits before reuse. Corrupt entries fail

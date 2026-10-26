@@ -1475,6 +1475,56 @@ fn verify_checkpoint(
     Ok(metadata.selected)
 }
 
+/// Fresh exports copy the already-verified base prefix unchanged. Verify stored
+/// blob hashes again, but decode only the newly generated layer. Cache hits still
+/// use full verification and replay; this evidence never crosses build lifetimes.
+#[allow(clippy::too_many_arguments)]
+fn verify_fresh_checkpoint(
+    layout: &Path,
+    config: &Value,
+    base: Option<&image::ImageMetadata>,
+    base_usage: (u64, usize),
+    spool: &Path,
+    limits: Limits,
+    resources: Option<&crate::build_resources::Policy>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Descriptor> {
+    let metadata = image::load_layout(layout, None, limits.image, cancelled)?;
+    let base_layers = base.map_or(&[][..], |m| m.layers.as_slice());
+    let base_ids = base.map_or(&[][..], |m| m.diff_ids.as_slice());
+    if metadata.config["config"] != *config
+        || metadata.layers.len() != base_layers.len() + 1
+        || !metadata.layers.starts_with(base_layers)
+        || !metadata.diff_ids.starts_with(base_ids)
+    {
+        return Err("fresh checkpoint differs from verified base/config".into());
+    }
+    let mut budget = limits.layer;
+    budget.max_uncompressed_bytes = budget.max_uncompressed_bytes.min(
+        limits
+            .max_replay_bytes
+            .checked_sub(base_usage.0)
+            .ok_or("replay byte budget exceeded")?,
+    );
+    budget.max_entries = budget.max_entries.min(
+        limits
+            .max_replay_entries
+            .checked_sub(base_usage.1)
+            .ok_or("replay entry budget exceeded")?,
+    );
+    let descriptor = metadata.layers.last().unwrap();
+    check_spool_space(resources, spool, descriptor)?;
+    layer::verify(
+        &BlobStore::open(layout)?,
+        descriptor,
+        metadata.diff_ids.last().unwrap(),
+        spool,
+        budget,
+        cancelled,
+    )?;
+    Ok(metadata.selected)
+}
+
 struct StageCache<'a> {
     root: PathBuf,
     lease: Option<&'a crate::store_lease::StoreLease>,
@@ -2366,8 +2416,16 @@ fn build_stage(
     for p in [&spool, &state] {
         fs::create_dir(p)?;
     }
-    // Bounded by the loaded descriptor count; repeated digests share one size.
-    let mut baseline_spool_sizes = BTreeMap::new();
+    let mut base_replay_usage = (0u64, 0usize);
+    let mut replay_receipt =
+        if options.export_mode == ExportMode::Layered && !cache_hit && metadata.is_some() {
+            Some(rootfs::ReplayReceipt::new(
+                &root,
+                options.limits.export.max_metadata_bytes,
+            )?)
+        } else {
+            None
+        };
     if let (Some(m), Some(p)) = (&metadata, &base_path) {
         let store = BlobStore::open(p)?;
         let mut bytes = 0u64;
@@ -2405,7 +2463,6 @@ fn build_stage(
             phase.finish();
             bytes += verified.size();
             entries += verified.physical_header_count();
-            baseline_spool_sizes.insert(descriptor.digest.as_str(), verified.size());
             check_replay_space(resources, &root, &verified, &cancelled)?;
             let phase = crate::progress::Phase::start(
                 options.progress && options.verbose,
@@ -2420,11 +2477,16 @@ fn build_stage(
                 crate::progress::count_bar(layer_index, m.layers.len()),
                 layer_index + 1
             ));
-            rootfs::apply_layer(&root, &mut verified, || {
+            let applying = || {
                 preparation.tick();
                 phase.tick();
                 cancelled()
-            })?;
+            };
+            if let Some(receipt) = &mut replay_receipt {
+                receipt.apply(&root, &mut verified, applying)?;
+            } else {
+                rootfs::apply_layer(&root, &mut verified, applying)?;
+            }
             phase.finish();
             let phase = crate::progress::Phase::start(
                 options.progress && options.verbose,
@@ -2441,53 +2503,36 @@ fn build_stage(
             })?;
             phase.finish();
         }
+        base_replay_usage = (bytes, entries);
         preparation.detail(crate::progress::count_bar(m.layers.len(), m.layers.len()));
         preparation.finish();
     }
     let baseline = if options.export_mode == ExportMode::Layered && !cache_hit {
-        Some(match (&base_path, binding) {
-            (Some(layout), Some(binding)) => export::Baseline::capture_with_admission(
+        let phase = crate::progress::Phase::start(
+            options.progress,
+            "  Capturing verified base filesystem (no replay)",
+        );
+        let capturing = || {
+            phase.tick();
+            cancelled()
+        };
+        let baseline = match (&base_path, &metadata, replay_receipt) {
+            (Some(layout), Some(metadata), Some(receipt)) => export::Baseline::capture_replayed(
                 &root,
                 layout,
-                binding.reference.as_deref(),
-                &work,
+                metadata,
+                receipt,
                 options.limits.export,
-                options.limits.image,
-                options.limits.layer,
-                export::ReplayLimits {
-                    max_bytes: options.limits.max_replay_bytes,
-                    max_entries: options.limits.max_replay_entries,
-                },
-                |allocation| {
-                    match allocation {
-                        export::CaptureAllocation::Spool { path, descriptor } => {
-                            let bytes = *baseline_spool_sizes
-                                .get(descriptor.digest.as_str())
-                                .ok_or(export::Error::Invalid(
-                                    "missing verified baseline spool measurement",
-                                ))?;
-                            resource_check(
-                                resources,
-                                "verifying measured baseline layer spool",
-                                &[crate::build_resources::Requirement {
-                                    path: path.to_owned(),
-                                    bytes,
-                                    inodes: 1,
-                                }],
-                            )
-                            .map_err(Into::into)
-                        }
-                        export::CaptureAllocation::Replay { root, layer } => {
-                            check_replay_space(resources, root, layer, &cancelled)
-                        }
-                    }
-                    .map_err(|e| export::Error::Io(io::Error::other(e)))
-                },
-                &cancelled,
+                options.limits.image.max_layer_bytes,
+                capturing,
             )?,
-            (None, None) => export::Baseline::scratch(&root, options.limits.export, &cancelled)?,
+            (None, None, None) => {
+                export::Baseline::scratch(&root, options.limits.export, capturing)?
+            }
             _ => return Err("inconsistent layered export base".into()),
-        })
+        };
+        phase.finish();
+        Some(baseline)
     } else {
         None
     };
@@ -2762,7 +2807,7 @@ fn build_stage(
                 options.progress,
                 "  Exporting instruction checkpoint",
             );
-            export_stage(
+            let exported = export_stage(
                 &root,
                 &snapshot,
                 &checkpoint_config,
@@ -2776,36 +2821,65 @@ fn build_stage(
                 || Ok(()),
             )?;
             phase.finish();
-            // Export traverses directories. Continue from the archived state on
-            // cold builds too, so later RUNs observe the same atimes as cache hits.
+            // Layered engine export repairs only its own readlink observations;
+            // the live root already has the archived filesystem state.
             let phase = crate::progress::Phase::start(
                 options.progress,
-                "  Verifying and restoring instruction checkpoint",
-            );
-            let manifest = restore_checkpoint(
-                &snapshot,
-                &boundary.config,
-                &work,
-                &format!("rootfs-exported-{}", boundary.ordinal),
-                &spool,
-                options.limits,
-                resources,
-                &|| {
-                    phase.tick();
-                    cancelled()
+                if baseline.is_some() {
+                    "  Verifying checkpoint delta (keeping working filesystem)"
+                } else {
+                    "  Verifying and restoring instruction checkpoint"
                 },
-            )?;
+            );
+            let verifying = || {
+                phase.tick();
+                cancelled()
+            };
+            let manifest = if baseline.is_some() {
+                verify_fresh_checkpoint(
+                    &snapshot,
+                    &boundary.config,
+                    metadata.as_ref(),
+                    base_replay_usage,
+                    &spool,
+                    options.limits,
+                    resources,
+                    &verifying,
+                )?
+            } else {
+                restore_checkpoint(
+                    &snapshot,
+                    &boundary.config,
+                    &work,
+                    &format!("rootfs-exported-{}", boundary.ordinal),
+                    &spool,
+                    options.limits,
+                    resources,
+                    &verifying,
+                )?
+            };
+            if manifest != exported {
+                return Err("checkpoint identity changed during verification".into());
+            }
             phase.finish();
             check(&cancelled)?;
             if let Some(entry) = entry {
+                let publication = crate::progress::Phase::start(
+                    options.progress,
+                    "  Publishing instruction cache",
+                );
                 stage_cache.as_ref().unwrap().publish(
                     &snapshot,
                     &entry,
                     &copy_targets[receipt_start..],
                     options.limits,
                     resources,
-                    &cancelled,
+                    &|| {
+                        publication.tick();
+                        cancelled()
+                    },
                 )?;
+                publication.finish();
             }
             // Even an unkeyable COPY must replace the prior filesystem identity.
             prior_identity = Some(manifest.digest.to_string());
@@ -2823,7 +2897,7 @@ fn build_stage(
         start = boundary.end;
     }
     check(&cancelled)?;
-    let mut output_reuses_restored_checkpoint = false;
+    let mut output_reuses_checkpoint = false;
     let output_phase = crate::progress::Phase::start(
         options.progress,
         "  Publishing stage image (export or verified cache reuse)",
@@ -2883,7 +2957,7 @@ fn build_stage(
                 Ok(())
             },
         )?;
-        output_reuses_restored_checkpoint = true;
+        output_reuses_checkpoint = true;
         manifest.clone()
     } else {
         export_stage(
@@ -2909,8 +2983,8 @@ fn build_stage(
         // metadata even with caching disabled or a metadata-only stage suffix.
         let phase = crate::progress::Phase::start(
             options.progress,
-            if output_reuses_restored_checkpoint {
-                "  Verifying reused stage checkpoint"
+            if baseline.is_some() || output_reuses_checkpoint {
+                "  Verifying stage checkpoint (keeping working filesystem)"
             } else {
                 "  Verifying and restoring exported stage"
             },
@@ -2919,7 +2993,18 @@ fn build_stage(
             phase.tick();
             cancelled()
         };
-        let verified = if output_reuses_restored_checkpoint {
+        let verified = if baseline.is_some() {
+            verify_fresh_checkpoint(
+                &output,
+                &config["config"],
+                metadata.as_ref(),
+                base_replay_usage,
+                &spool,
+                options.limits,
+                resources,
+                &verification_cancelled,
+            )?
+        } else if output_reuses_checkpoint {
             // The last instruction already restored this exact snapshot. Copying
             // its OCI blobs does not touch rootfs; verify the output without
             // writing and retaining another identical filesystem tree.

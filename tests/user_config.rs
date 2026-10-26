@@ -207,7 +207,10 @@ fn private_umask_scratch_initial_checkpoint_and_inherited_roots() {
     next(&mut o, t.path(), "cold");
     let out = private_umask_build(&o, &store, source, None);
     assert_private_root_build(&o, &store, &out, 1);
-    assert!(o.work.join("rootfs-exported-2").is_dir());
+    assert!(
+        !o.work.join("rootfs-exported-2").exists(),
+        "cold layered checkpoints must keep the original working root"
+    );
     next(&mut o, t.path(), "checkpoint-hit");
     let changed = source.replace("revision=one", "revision=two");
     let out = private_umask_build(&o, &store, &changed, None);
