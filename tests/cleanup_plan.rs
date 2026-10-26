@@ -438,14 +438,23 @@ fn malformed_tag_blocks_all_components_without_content_leaks() {
     let path = fs::read_dir(t.path())
         .unwrap()
         .map(|e| e.unwrap().path())
-        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("tag-"))
+        // The tag's persistent .lock sibling has the same prefix. Directory
+        // enumeration order must not decide which file the fixture corrupts.
+        .find(|p| {
+            p.file_name().unwrap().to_string_lossy().starts_with("tag-")
+                && p.extension().is_some_and(|ext| ext == "json")
+        })
         .unwrap();
     fs::write(path, b"{PRIVATE_BROKEN_RECORD").unwrap();
     let p = plan(t.path(), Request::BuildsPrune);
     assert!(p.candidates.is_empty());
-    assert!(p.protected.iter().any(
-        |e| e.reason == "reference_alias_scope_uncertain" || e.reason == "incomplete_inventory"
-    ));
+    assert!(
+        p.protected
+            .iter()
+            .any(|e| e.reason == "reference_alias_scope_uncertain"
+                || e.reason == "incomplete_inventory"),
+        "{p:#?}"
+    );
     assert!(!serde_json::to_string(&p).unwrap().contains("PRIVATE_"));
 }
 
