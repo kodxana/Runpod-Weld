@@ -411,6 +411,12 @@ This removes cold layered checkpoint reconstruction and retained duplicate roots
 Checkpoint exports still scan the current tree and copy inherited OCI blobs;
 per-instruction delivered layers and incremental COPY inventories remain future work.
 
+With `--no-cache`, intermediate stages used only by `COPY --from` retain their
+owned filesystem without baseline inventory, image serialization, or checkpoint
+verification. The confined copier reads that filesystem directly under the existing
+COPY and rootfs limits. Selected targets and stages used by a selected `FROM` still
+export images; cached builds keep their image identities and verification paths.
+
 `--no-cache` bypasses stage and instruction cache reads and writes. Cache hits verify OCI digests and
 replay layers under the requested limits before reuse. Corrupt entries fail
 closed; use `--no-cache` to bypass them. Credentials are not cache inputs and

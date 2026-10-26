@@ -39,3 +39,47 @@ independent OCI/Docker acceptance passed. Linux and Windows cross-target linting
 passed. Native Windows execution and a full cached Nemotron run were not measured.
 The tested binary SHA-256 was
 `6f68a5fd466d1567e80f3cc4662c21dbd1ebdc69844fa26a35525fb1c741e46a`.
+
+## COPY-only intermediate stages
+
+No-cache builds now retain the owned root of a stage used only by `COPY --from`,
+without capturing an export baseline or publishing an unused intermediate image.
+The final target and selected `FROM` dependencies still export. Cached builds
+retain manifest-based dependency identities and their existing verification.
+
+This follows the useful separation between image-stage dependencies and file-copy
+dependencies in the maintained [Kaniko executor](https://github.com/osscontainertools/kaniko/blob/c6ffb6a3f8805a2579e80fa25f362e7667177b65/pkg/executor/build.go).
+That project is [Apache-2.0 licensed](https://github.com/osscontainertools/kaniko/blob/c6ffb6a3f8805a2579e80fa25f362e7667177b65/LICENSE).
+Weld's implementation uses its existing Rust planner, owned roots and confined
+copier; no Kaniko source code or runtime dependency was incorporated.
+
+On the same A40 Pod, four alternating-order runs (old/new/new/old) copied a
+1 GiB file through a producer stage into the final image with caching disabled:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Elapsed mean, two samples | 16.93 s | 6.63 s |
+| Retained build allocation | 4.00 GiB | 3.00 GiB |
+
+Every output passed independent archive content, ownership, mode, xattr and exact
+timestamp checks. This small workload isolates the omitted stage export; it does
+not predict the speed of RUN-heavy builds or cached builds.
+
+The unchanged Nemotron workload then completed in **20m05.4s**, compared with
+**28m50.4s** for the preceding candidate on the same Pod. This is an observed
+8m45s reduction, not a controlled estimate: package/model downloads and page-cache
+conditions can vary. Both runs reused the downloaded base, disabled instruction
+caching, and used automatic limits. The model stage fell from 760.295s to 310.972s;
+its baseline capture, intermediate export and checkpoint verification were omitted.
+
+Retained build allocation fell from **196.65 GiB to 162.23 GiB**. The final image
+still has 48 layers and 36,882,096,234 referenced layer bytes. An independent
+streaming verifier checked every blob/diff ID, the exact base prefix, configuration,
+117 pinned model files and source files. Source and prior tags were preserved.
+
+Validation: 571 normal tests and seven additional resource tests passed, plus
+independent OCI/Docker acceptance, formatting, documentation and Linux/Windows
+cross-target linting. The tested binary SHA-256 is
+`17046660f362eeaf49c3f8757e1a9778d89867fc125ed3a7f552006216743468`.
+Cached full-image performance and GPU inference remain untested. Repeated inherited
+base preparation still took 538.494s and is the next major optimization target.

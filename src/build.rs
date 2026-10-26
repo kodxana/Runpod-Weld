@@ -1413,7 +1413,8 @@ fn check_layout_space(
 /// Cancellation is cooperative for I/O; RUN cancellation signals its dedicated
 /// worker through the lease guard, waiting for descendant-safe cleanup.
 struct StageResult {
-    result: BuildResult,
+    work: PathBuf,
+    image: Option<BuildResult>,
     args: BTreeMap<String, String>,
 }
 
@@ -1421,13 +1422,19 @@ fn copy_input(
     source: &CopySource,
     previous: &BTreeMap<usize, StageResult>,
     external: &BTreeMap<String, (PathBuf, String)>,
-) -> (PathBuf, String) {
+) -> (PathBuf, Option<String>) {
     match source {
         CopySource::Stage(n) => (
-            previous[n].result.work.join("rootfs"),
-            previous[n].result.manifest.digest.to_string(),
+            previous[n].work.join("rootfs"),
+            previous[n]
+                .image
+                .as_ref()
+                .map(|image| image.manifest.digest.to_string()),
         ),
-        CopySource::Image(name) => external[name].clone(),
+        CopySource::Image(name) => {
+            let (root, identity) = &external[name];
+            (root.clone(), Some(identity.clone()))
+        }
     }
 }
 
@@ -2079,6 +2086,14 @@ fn build_inner_checked(
     }
     let mut previous = BTreeMap::new();
     let mut notice = false;
+    // COPY consumes an owned root directly; FROM still requires a verified OCI image.
+    let inherited_stages: std::collections::BTreeSet<_> = selected
+        .iter()
+        .filter_map(|&n| match plan.stages[n].base {
+            Base::Stage(base) => Some(base),
+            Base::Image(_) => None,
+        })
+        .collect();
     for n in selected {
         let mut stage_options = options.clone();
         if n != target {
@@ -2100,6 +2115,7 @@ fn build_inner_checked(
             &policy,
             record.as_deref_mut(),
             n == target,
+            !options.no_cache || n == target || inherited_stages.contains(&n),
             lease,
             resources,
             || {
@@ -2110,7 +2126,11 @@ fn build_inner_checked(
         previous.insert(n, result?);
         phase.finish();
     }
-    Ok(previous.remove(&target).unwrap().result)
+    previous
+        .remove(&target)
+        .unwrap()
+        .image
+        .ok_or_else(|| "target stage image missing".into())
 }
 
 #[allow(clippy::too_many_arguments)] // Keep the operation lease explicit at each call boundary.
@@ -2125,6 +2145,7 @@ fn build_stage(
     policy: &crate::dockerignore::Policy,
     mut record: Option<&mut crate::build_record::BuildRecord>,
     final_stage: bool,
+    export_image: bool,
     lease: Option<&crate::store_lease::StoreLease>,
     resources: Option<&crate::build_resources::Policy>,
     cancelled: impl Fn() -> bool,
@@ -2170,7 +2191,12 @@ fn build_stage(
     let mut paths = vec![work.clone(), output.clone(), context];
     let stage_base = match plan.stages[index].base {
         Base::Stage(n) => Some(LocalBase {
-            layout: previous[&n].result.output.clone(),
+            layout: previous[&n]
+                .image
+                .as_ref()
+                .ok_or("inherited stage image missing")?
+                .output
+                .clone(),
             reference: None,
         }),
         _ => None,
@@ -2254,10 +2280,14 @@ fn build_stage(
             .instructions
             .iter()
             .filter_map(|i| match &i.kind {
-                I::Copy { from: Some(n), .. } => Some(copy_input(n, previous, external).1),
+                I::Copy { from: Some(n), .. } => Some(
+                    copy_input(n, previous, external)
+                        .1
+                        .ok_or("cached COPY source image missing"),
+                ),
                 _ => None,
             })
-            .collect();
+            .collect::<std::result::Result<_, _>>()?;
         let input = format!(
             "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{}\n{:?}\n{:?}",
             plan.global_args,
@@ -2417,15 +2447,18 @@ fn build_stage(
         fs::create_dir(p)?;
     }
     let mut base_replay_usage = (0u64, 0usize);
-    let mut replay_receipt =
-        if options.export_mode == ExportMode::Layered && !cache_hit && metadata.is_some() {
-            Some(rootfs::ReplayReceipt::new(
-                &root,
-                options.limits.export.max_metadata_bytes,
-            )?)
-        } else {
-            None
-        };
+    let mut replay_receipt = if export_image
+        && options.export_mode == ExportMode::Layered
+        && !cache_hit
+        && metadata.is_some()
+    {
+        Some(rootfs::ReplayReceipt::new(
+            &root,
+            options.limits.export.max_metadata_bytes,
+        )?)
+    } else {
+        None
+    };
     if let (Some(m), Some(p)) = (&metadata, &base_path) {
         let store = BlobStore::open(p)?;
         let mut bytes = 0u64;
@@ -2507,7 +2540,7 @@ fn build_stage(
         preparation.detail(crate::progress::count_bar(m.layers.len(), m.layers.len()));
         preparation.finish();
     }
-    let baseline = if options.export_mode == ExportMode::Layered && !cache_hit {
+    let baseline = if export_image && options.export_mode == ExportMode::Layered && !cache_hit {
         let phase = crate::progress::Phase::start(
             options.progress,
             "  Capturing verified base filesystem (no replay)",
@@ -2596,7 +2629,14 @@ fn build_stage(
                     } else {
                         from.as_ref().map(|n| copy_input(n, previous, external).0)
                     };
-                    dependency = from.as_ref().map(|n| copy_input(n, previous, external).1);
+                    dependency = from
+                        .as_ref()
+                        .map(|n| {
+                            copy_input(n, previous, external)
+                                .1
+                                .ok_or("cached COPY source image missing")
+                        })
+                        .transpose()?;
                     #[cfg(target_os = "linux")]
                     {
                         match context::fingerprint_copy(
@@ -2897,6 +2937,16 @@ fn build_stage(
         start = boundary.end;
     }
     check(&cancelled)?;
+    if !export_image {
+        if options.progress {
+            eprintln!("[weld]   Keeping COPY-only stage filesystem; no intermediate image export");
+        }
+        return Ok(StageResult {
+            work,
+            image: None,
+            args,
+        });
+    }
     let mut output_reuses_checkpoint = false;
     let output_phase = crate::progress::Phase::start(
         options.progress,
@@ -3053,11 +3103,12 @@ fn build_stage(
         )?;
     }
     Ok(StageResult {
-        result: BuildResult {
+        work: work.clone(),
+        image: Some(BuildResult {
             manifest,
             output,
             work,
-        },
+        }),
         args,
     })
 }

@@ -15,6 +15,138 @@ fn never_cancel() -> bool {
     false
 }
 
+fn stages(root: &Path) -> PathBuf {
+    fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".weld-stages-")
+        })
+        .expect("intermediate stage directory")
+}
+
+#[test]
+fn no_cache_copy_only_stages_keep_filesystems_without_images() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    for mode in [build::ExportMode::Layered, build::ExportMode::Flattened] {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        o.no_cache = true;
+        o.export_mode = mode;
+        fs::create_dir(o.context.join("tree")).unwrap();
+        write(&o.context.join("tree/file"), "stage payload");
+        fs::set_permissions(
+            o.context.join("tree/file"),
+            fs::Permissions::from_mode(0o440),
+        )
+        .unwrap();
+        fs::hard_link(o.context.join("tree/file"), o.context.join("tree/alias")).unwrap();
+        symlink("file", o.context.join("tree/link")).unwrap();
+        let source = "FROM scratch AS producer\nCOPY --chown=123:456 tree /tree\nENV PRIVATE=yes\nFROM producer AS unused\nCOPY missing /missing\nFROM scratch AS relay\nCOPY --from=producer /tree /relay\nFROM scratch\nCOPY --from=producer /tree /direct\nCOPY --from=relay /relay /indirect\n";
+        build::build(source, &o, never_cancel).unwrap();
+        let intermediate = stages(t.path());
+        for n in [0, 2] {
+            assert!(intermediate.join(format!("stage-{n}-work/rootfs")).is_dir());
+            assert!(
+                !intermediate.join(format!("stage-{n}-image")).exists(),
+                "COPY-only stage was exported"
+            );
+        }
+        assert!(!intermediate.join("stage-1-work").exists());
+        assert!(o.output.join("index.json").is_file());
+        assert_eq!(fs::read_dir(o.cache.as_ref().unwrap()).unwrap().count(), 0);
+        for prefix in ["direct", "indirect"] {
+            let root = o.work.join("rootfs").join(prefix);
+            let meta = fs::metadata(root.join("file")).unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid(), meta.mode() & 0o777),
+                (123, 456, 0o440)
+            );
+            // COPY currently materializes hardlink aliases independently in both paths.
+            let alias = fs::metadata(root.join("alias")).unwrap();
+            assert_eq!(
+                (alias.uid(), alias.gid(), alias.mode() & 0o777),
+                (123, 456, 0o440)
+            );
+            assert_eq!(
+                (alias.mtime(), alias.mtime_nsec()),
+                (meta.mtime(), meta.mtime_nsec())
+            );
+            assert_eq!((meta.atime(), meta.atime_nsec()), (2_000_000_000, 0));
+            assert_eq!(fs::read(root.join("alias")).unwrap(), b"stage payload");
+            assert_eq!(fs::read(root.join("file")).unwrap(), b"stage payload");
+            assert_eq!(fs::read_link(root.join("link")).unwrap(), Path::new("file"));
+        }
+        let result = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+        assert_eq!(result.config["config"]["Env"], serde_json::json!([]));
+    }
+}
+
+#[test]
+fn no_cache_copy_only_cancellation_and_budget_failure_publish_nothing() {
+    let source = "FROM scratch AS producer\nCOPY payload /payload\nFROM scratch\nCOPY --from=producer /payload /payload\n";
+    for cancel in [false, true] {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        o.no_cache = true;
+        o.export_mode = build::ExportMode::Layered;
+        write(&o.context.join("payload"), "payload");
+        if !cancel {
+            o.limits.max_rootfs_bytes = 1;
+        }
+        let error = build::build(source, &o, || cancel && o.work.join("rootfs").exists())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error
+                .to_lowercase()
+                .contains(if cancel { "cancel" } else { "limit" }),
+            "{error}"
+        );
+        assert!(!o.output.exists());
+        let intermediate = stages(t.path());
+        assert!(!intermediate.join("stage-0-image").exists());
+        assert_eq!(fs::read_dir(o.cache.as_ref().unwrap()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn no_cache_from_dependencies_and_explicit_targets_still_export() {
+    for target in [None, Some("producer".to_owned())] {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        o.no_cache = true;
+        o.export_mode = build::ExportMode::Layered;
+        o.target = target;
+        write(&o.context.join("payload"), "inherited");
+        let source = "FROM scratch AS producer\nARG VALUE=kept\nENV INHERITED=yes\nCOPY payload /payload\nFROM producer AS child\nENV ARG=$VALUE\nCOPY --from=producer /payload /copy\nFROM scratch AS unused\nCOPY absent /absent\nFROM child AS final\n";
+        build::build(source, &o, never_cancel).unwrap();
+        let result = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+        assert!(
+            result.config["config"]["Env"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("INHERITED=yes"))
+        );
+        if o.target.is_none() {
+            let intermediate = stages(t.path());
+            assert!(intermediate.join("stage-0-image/index.json").is_file());
+            assert!(intermediate.join("stage-1-image/index.json").is_file());
+            assert!(!intermediate.join("stage-2-work").exists());
+            assert!(
+                result.config["config"]["Env"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("ARG=kept"))
+            );
+            assert_eq!(fs::read(o.work.join("rootfs/copy")).unwrap(), b"inherited");
+        }
+    }
+}
+
 fn options(root: &Path) -> BuildOptions {
     let context = root.join("context");
     let cache = root.join("cache");
