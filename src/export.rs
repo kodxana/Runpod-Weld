@@ -1075,6 +1075,28 @@ mod linux {
             Ok(())
         }
     }
+    fn layered_payload_peak(delta: u64, base: u64) -> Result<u64, Error> {
+        // The verifier's spool is dropped before inherit() copies base blobs.
+        delta
+            .checked_add(delta.max(base))
+            .ok_or(Error::Limit("export space estimate"))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn layered_admission_counts_only_coexisting_payloads() {
+        let mib = 1024 * 1024;
+        // The verification spool is gone before inherited base blobs are copied.
+        // At 400 MiB free, a 120 MiB peak keeps the 256 MiB reserve intact.
+        assert_eq!(layered_payload_peak(60 * mib, 60 * mib).unwrap(), 120 * mib);
+        assert_eq!(
+            layered_payload_peak(60 * mib, 100 * mib).unwrap(),
+            160 * mib
+        );
+        assert_eq!(layered_payload_peak(60 * mib, 0).unwrap(), 120 * mib);
+        assert!(layered_payload_peak(u64::MAX, 1).is_err());
+    }
+
     #[cfg(test)]
     #[test]
     fn measured_export_space_deduplicates_payload_and_ignores_workload_ceiling() {
@@ -1543,15 +1565,13 @@ mod linux {
             let mut bytes = estimate.bytes;
             let mut inodes = 8u64;
             if let Some(base) = baseline {
-                // Delta verification keeps a second uncompressed spool. Base
-                // descriptors are copied into independent public output inodes.
-                bytes = bytes
-                    .checked_mul(2)
-                    .ok_or(Error::Limit("export space estimate"))?;
+                // Account for the larger of verification and base-copy phases.
+                // Public base blobs still receive independent output inodes.
+                let mut base_bytes = 0u64;
                 let mut seen = std::collections::BTreeSet::new();
                 for descriptor in &base.state.layers {
                     if seen.insert(&descriptor.digest) {
-                        bytes = bytes
+                        base_bytes = base_bytes
                             .checked_add(
                                 u64::try_from(descriptor.size)
                                     .map_err(|_| Error::Invalid("negative base blob size"))?,
@@ -1560,6 +1580,7 @@ mod linux {
                         inodes += 1;
                     }
                 }
+                bytes = layered_payload_peak(bytes, base_bytes)?;
             }
             bytes = bytes
                 .checked_add(65536)
