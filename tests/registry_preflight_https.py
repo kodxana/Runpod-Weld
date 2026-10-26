@@ -331,6 +331,26 @@ def main():
             huge = copy.deepcopy(original)
             huge['layers'][0]['size'] = 10 * 1024**3
             reject('per-layer', huge, 'manifest compressed layer bytes', '--max-layer-bytes', '1024')
+            # Declared sizes can fit explicit workload ceilings but not current
+            # download + verified-cache storage. Refuse before a layer GET.
+            capacity = copy.deepcopy(original)
+            capacity['layers'][0]['size'] = 300 * 1024**2
+            publish('disk-capacity', capacity)
+            resource_store = root/'bounded-store'
+            resource_store.mkdir(mode=0o700)
+            args, output = arguments('disk-capacity', [
+                '-t', 'test/preflight-capacity', '--no-cache',
+                '--max-layer-bytes', str(1024**3), '--max-rootfs-bytes', str(1024**3),
+                '--metadata-budget', str(64 * 1024**2), '--max-entries', '100000'])
+            before = len(layer_gets())
+            result = subprocess.run([
+                'unshare', '--mount', '--propagation', 'private', 'python3',
+                str(Path(__file__).resolve()), '--resource-exec', str(resource_store), *args
+            ], env=dict(env, RPWELD_HOME=str(resource_store)), capture_output=True, text=True, timeout=40)
+            assert result.returncode != 0 and 'downloading and storing declared compressed base blobs' in result.stderr, result.stderr
+            assert 'additional/reserved bytes' in result.stderr and len(layer_gets()) == before
+            assert not output.exists() and secret not in result.stdout + result.stderr
+            print('PASS measured download capacity refusal: zero layer GET', flush=True)
             total = copy.deepcopy(original)
             total['layers'] *= 2
             reject('aggregate', total, 'manifest total compressed layer bytes',
@@ -490,7 +510,11 @@ def main():
 
 
 if __name__ == '__main__':
-    if len(sys.argv) > 1 and sys.argv[1] == '--policy-exec':
+    if len(sys.argv) > 1 and sys.argv[1] == '--resource-exec':
+        subprocess.run(['mount', '-t', 'tmpfs', '-o', 'size=512m,nr_inodes=16384,mode=0700',
+                        'tmpfs', sys.argv[2]], check=True)
+        os.execv(sys.argv[3], sys.argv[3:])
+    elif len(sys.argv) > 1 and sys.argv[1] == '--policy-exec':
         # Only inside a private mount namespace: never replace the host policy.
         subprocess.run(['mount', '--bind', sys.argv[2], '/etc/containers/policy.json'], check=True)
         os.execv(sys.argv[3], sys.argv[3:])

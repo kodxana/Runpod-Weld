@@ -81,6 +81,8 @@ HTTPS and certificate verification are mandatory, including localhost. `--cert-d
 
 ### Install with the registry backend
 
+Registry builds inspect bounded manifest/config metadata before downloading layers, then pin the selected content digest. Declared compressed sizes are checked against workload limits and available download/cache storage; expansion is checked during replay. The original reference's system signature-policy scope is retained. Signed tag or index pulls that would change signing identity are explicitly unsupported; a directly pinned single-manifest digest retains backend signature enforcement. Metadata limits bound accepted output, not an exact network-byte quota: Skopeo's internal reads retain its own fixed bounds.
+
 On Debian/Ubuntu amd64, build the package with Rust 1.90 and `dpkg-deb`:
 
 ```sh
