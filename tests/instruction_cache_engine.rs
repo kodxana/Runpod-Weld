@@ -26,6 +26,69 @@ fn cached_parent_receipt_and_retained_metadata_share_the_limit() {
     cached_parent_receipt_fallback(260_000);
 }
 
+#[test]
+fn receipt_fallback_preserves_explicit_base_reference() {
+    use std::os::unix::fs::symlink;
+    for compression in [export::Compression::Uncompressed, export::Compression::Gzip] {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        o.export_mode = build::ExportMode::Layered;
+        o.compression = compression;
+        o.limits.image.max_descriptors = 500;
+        o.limits.export.max_metadata_bytes = 1_000_000;
+        for name in ["a", "b"] {
+            fs::create_dir(o.context.join(name)).unwrap();
+            symlink(name.repeat(4000), o.context.join(name).join("link")).unwrap();
+        }
+        let mut source = String::from("FROM scratch\n");
+        for i in 0..60 {
+            source.push_str(&format!(
+                "COPY {}/ /tree/\n",
+                if i % 2 == 0 { "a" } else { "b" }
+            ));
+        }
+        build::build(&source, &o, never_cancel).unwrap();
+        let layout = o.output.clone();
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&fs::read(layout.join("index.json")).unwrap()).unwrap();
+        let mut wanted = index["manifests"][0].clone();
+        wanted["annotations"] = serde_json::json!({"org.opencontainers.image.ref.name":"wanted"});
+        let mut other = wanted.clone();
+        other["annotations"] = serde_json::json!({"org.opencontainers.image.ref.name":"other"});
+        index["manifests"] = serde_json::json!([wanted, other]);
+        fs::write(
+            layout.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        assert!(image::load_layout(&layout, None, o.limits.image, never_cancel).is_err());
+        let base =
+            image::load_layout(&layout, Some("wanted"), o.limits.image, never_cancel).unwrap();
+        o.bases.insert(
+            "local".into(),
+            build::LocalBase {
+                layout,
+                reference: Some("wanted".into()),
+            },
+        );
+        o.no_cache = true;
+        for budget in [1_000_000, 160_000, 260_000] {
+            next(&mut o, t.path(), &format!("selected-{budget}"));
+            o.limits.export.max_metadata_bytes = budget;
+            build::build("FROM local\nLABEL selected=wanted\n", &o, never_cancel).unwrap();
+            let output = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+            assert_eq!(&output.layers[..base.layers.len()], &base.layers);
+            assert_eq!(&output.diff_ids[..base.diff_ids.len()], &base.diff_ids);
+            assert_eq!(output.config["config"]["Labels"]["selected"], "wanted");
+            assert_eq!(
+                fs::read_link(o.work.join("rootfs/tree/link")).unwrap(),
+                PathBuf::from("b".repeat(4000))
+            );
+            assert_eq!(fs::read_dir(o.work.join("spool")).unwrap().count(), 0);
+        }
+    }
+}
+
 fn cached_parent_receipt_fallback(metadata_limit: u64) {
     use std::os::unix::fs::symlink;
     let t = tempfile::tempdir().unwrap();

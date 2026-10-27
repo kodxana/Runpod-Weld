@@ -2741,7 +2741,7 @@ fn build_stage(
                         export::Baseline::capture_with_admission(
                             &root,
                             layout,
-                            None,
+                            binding.and_then(|base| base.reference.as_deref()),
                             &spool,
                             options.limits.export,
                             options.limits.image,
