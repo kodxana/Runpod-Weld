@@ -1,0 +1,4790 @@
+{
+  "date": "2026-10-27",
+  "comparison": "Published v0.1.0 versus frozen v0.2 candidate 503b741",
+  "pod_shape": {
+    "cpu": "cpu3g",
+    "vcpu": 8,
+    "memory_gb": 32,
+    "container_disk_gb": 80,
+    "data_center": "EU-CZ-1"
+  },
+  "notes": [
+    "Same Pod, serialized AB/BA ordering, independent replay outside build timings.",
+    "Whole-tree storage sampling can perturb timings; sampling time is recorded, not subtracted.",
+    "Reported sampled allocation peaks are lower bounds and include previous retained cases within each repetition.",
+    "Process I/O counters are not storage-device physical traffic. RSS can include fork/exec startup and does not establish a memory guarantee.",
+    "New layer bytes are descriptor bytes absent from the preceding output; no registry transfer was measured.",
+    "No GPU, network package installation, model download, Docker timing comparison, or full Nemotron run."
+  ],
+  "runs": [
+    {
+      "dependency_mib": 256,
+      "status": {
+        "builds": 32,
+        "status": "PASS"
+      },
+      "provenance": {
+        "baseline_revision": "63b716e1027ceba48bf9c887567419057b1bfd73",
+        "candidate_revision": "503b7419b8cfd6599f6c80a3825717f687d31a84",
+        "baseline_sha256": "24c09bd3b805a525d447f5c568991dc50da417fdd299445b52c981087a273686",
+        "candidate_sha256": "ecda01b49ba611f8f49a7e1bcc62e1bde2ad31e9f992af0141f410c774c1470f",
+        "repetitions": 4,
+        "small_files": 2048,
+        "scripts_sha256": {
+          "acceptance.py": "8c3fb5f48cbc282c8a582cb4a19ca21a0692a649299a8a58d1e9e052f53fc633",
+          "fixture.py": "bd8d49aabb5b8f9d750ebb63307fc69ba5dbdbbae6c16847ffc3a7bbc40db2c2",
+          "metrics.py": "a2b1446c56697248800176117132697f8c6368d89d4c4ea6f211a5671c886b51",
+          "pod-session.py": "6266a55cd1a332ff2f5fedfcc15fb20bfc46988c2d151664d0fc088912868e77",
+          "run.py": "8f67f030c3b6176e43faf6d74cfc1029062dfb3428cd904888794a33cbeae5cb",
+          "test_fixture.py": "fe539abb99ff9bd97455d5a0c67d5aa3651b1cb6f74f967b6d3a53a9e91719d8"
+        },
+        "oracle_sha256": {
+          "fixture_tar.py": "adf8e6c58df3dd8ed9c06e0b4dbab05b7619c8ac271cf2276ba593d103fd0ebc",
+          "oracle.py": "acc0d75c6079acfe58761c5b219675fdc0af2e6db1ead9f0e4c604771ad9d5fc"
+        },
+        "busybox_sha256": "dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14",
+        "notes": [
+          "cold = empty managed store; OS page cache is not dropped",
+          "ordinary default export, actual -t, no private fast flags",
+          "wall and CPU are build-only; independent validation follows each build",
+          "allocation st_blocks*512 deduplicated by device/inode; reflink extents not deduplicated",
+          "sampled allocation peaks are lower bounds; sampling overhead is recorded",
+          "proc I/O leader includes waited children; physical read_bytes can be zero from page cache",
+          "synthetic offline dependency workload, not pip/npm/Nemotron or power-loss/sandbox evidence"
+        ]
+      },
+      "cpu_model": "AMD EPYC 9654 96-Core Processor",
+      "affinity": [
+        27,
+        68,
+        79,
+        81,
+        123,
+        164,
+        175,
+        177
+      ],
+      "controllers": {
+        "/sys/fs/cgroup/cpu.max": "max 100000",
+        "/sys/fs/cgroup/cpuset.cpus.effective": "27,68,79,81,123,164,175,177",
+        "/sys/fs/cgroup/memory.high": "max",
+        "/sys/fs/cgroup/memory.max": "32000000000"
+      },
+      "filesystem": "overlay",
+      "container_capacity_bytes": 85899345920,
+      "evidence_archive_sha256": "e162794799e0501b80d0b17771fdca642dc02671e38cbe4de0f73dde530cb751",
+      "summary": {
+        "app-edit": {
+          "baseline": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 7444942848,
+              "median": 7184496640.0,
+              "minimum": 7184490496,
+              "raw": [
+                7184490496,
+                7184502784,
+                7444942848,
+                7184490496
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 5.975756,
+              "median": 5.7389385,
+              "minimum": 5.56603,
+              "raw": [
+                5.727485,
+                5.750392,
+                5.56603,
+                5.975756
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 11.103835,
+              "median": 11.078246,
+              "minimum": 10.97975,
+              "raw": [
+                11.073591,
+                11.103835,
+                10.97975,
+                11.082901
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 275852288,
+              "median": 275852288.0,
+              "minimum": 275852288,
+              "raw": [
+                275852288,
+                275852288,
+                275852288,
+                275852288
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 273701888,
+              "median": 273701888.0,
+              "minimum": 273701888,
+              "raw": [
+                273701888,
+                273701888,
+                273701888,
+                273701888
+              ]
+            },
+            "samples": 4,
+            "wall_seconds": {
+              "maximum": 17.382385639473796,
+              "median": 17.18522697361186,
+              "minimum": 17.04369314480573,
+              "raw": [
+                17.12632520403713,
+                17.244128743186593,
+                17.04369314480573,
+                17.382385639473796
+              ]
+            }
+          },
+          "candidate": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 2770141184,
+              "median": 2770130944.0,
+              "minimum": 2770124800,
+              "raw": [
+                2770141184,
+                2770132992,
+                2770128896,
+                2770124800
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 2.543755,
+              "median": 2.4614795000000003,
+              "minimum": 2.388761,
+              "raw": [
+                2.543755,
+                2.388761,
+                2.469208,
+                2.453751
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 7.987846,
+              "median": 7.9438365,
+              "minimum": 7.904268,
+              "raw": [
+                7.931374,
+                7.987846,
+                7.904268,
+                7.956299
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 275874304,
+              "median": 275874304.0,
+              "minimum": 275874304,
+              "raw": [
+                275874304,
+                275874304,
+                275874304,
+                275874304
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 17408,
+              "median": 17408.0,
+              "minimum": 17408,
+              "raw": [
+                17408,
+                17408,
+                17408,
+                17408
+              ]
+            },
+            "samples": 4,
+            "wall_seconds": {
+              "maximum": 10.597453800961375,
+              "median": 10.548566882032901,
+              "minimum": 10.497483096085489,
+              "raw": [
+                10.597453800961375,
+                10.50683117005974,
+                10.497483096085489,
+                10.590302594006062
+              ]
+            }
+          },
+          "paired_baseline_over_candidate_wall": [
+            1.6160792512710431,
+            1.6412302114766488,
+            1.62359805572455,
+            1.6413492896144386
+          ]
+        },
+        "cold": {
+          "baseline": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 4394348544,
+              "median": 4264132608.0,
+              "minimum": 4133912576,
+              "raw": [
+                4133912576,
+                4133920768,
+                4394348544,
+                4394344448
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 8.553804,
+              "median": 8.238810999999998,
+              "minimum": 8.009951,
+              "raw": [
+                8.009951,
+                8.06088,
+                8.553804,
+                8.416742
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 18.198529,
+              "median": 18.1865185,
+              "minimum": 17.941002,
+              "raw": [
+                18.181606,
+                18.198529,
+                17.941002,
+                18.191431
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 275852288,
+              "median": 275852288.0,
+              "minimum": 275852288,
+              "raw": [
+                275852288,
+                275852288,
+                275852288,
+                275852288
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 275852288,
+              "median": 275852288.0,
+              "minimum": 275852288,
+              "raw": [
+                275852288,
+                275852288,
+                275852288,
+                275852288
+              ]
+            },
+            "samples": 4,
+            "wall_seconds": {
+              "maximum": 26.931099859066308,
+              "median": 26.769010493531823,
+              "minimum": 26.50139258801937,
+              "raw": [
+                26.50139258801937,
+                26.630266019143164,
+                26.907754967920482,
+                26.931099859066308
+              ]
+            }
+          },
+          "candidate": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 1384116224,
+              "median": 1384112128.0,
+              "minimum": 1384108032,
+              "raw": [
+                1384116224,
+                1384112128,
+                1384112128,
+                1384108032
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 4.439656,
+              "median": 4.145154,
+              "minimum": 3.8064299999999998,
+              "raw": [
+                3.8064299999999998,
+                4.439656,
+                4.029674,
+                4.260634
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 12.419544,
+              "median": 12.386529,
+              "minimum": 12.314054,
+              "raw": [
+                12.355836,
+                12.419544,
+                12.417222,
+                12.314054
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 275874304,
+              "median": 275874304.0,
+              "minimum": 275874304,
+              "raw": [
+                275874304,
+                275874304,
+                275874304,
+                275874304
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 275874304,
+              "median": 275874304.0,
+              "minimum": 275874304,
+              "raw": [
+                275874304,
+                275874304,
+                275874304,
+                275874304
+              ]
+            },
+            "samples": 4,
+            "wall_seconds": {
+              "maximum": 17.075663497671485,
+              "median": 16.691254433244467,
+              "minimum": 16.332986404187977,
+              "raw": [
+                16.332986404187977,
+                17.075663497671485,
+                16.615095443092287,
+                16.767413423396647
+              ]
+            }
+          },
+          "paired_baseline_over_candidate_wall": [
+            1.6225687043506074,
+            1.5595450228200263,
+            1.619476400847722,
+            1.6061570845201214
+          ]
+        },
+        "no-cache": {
+          "baseline": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 7999922176,
+              "median": 7999913984.0,
+              "minimum": 7999905792,
+              "raw": [
+                7999905792,
+                7999922176,
+                7999922176,
+                7999905792
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 1.169873,
+              "median": 1.1430575,
+              "minimum": 1.098114,
+              "raw": [
+                1.129555,
+                1.098114,
+                1.169873,
+                1.15656
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 0.941294,
+              "median": 0.9210335000000001,
+              "minimum": 0.893803,
+              "raw": [
+                0.893803,
+                0.941294,
+                0.916578,
+                0.925489
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 275852288,
+              "median": 275852288.0,
+              "minimum": 275852288,
+              "raw": [
+                275852288,
+                275852288,
+                275852288,
+                275852288
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 0,
+              "median": 0.0,
+              "minimum": 0,
+              "raw": [
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "samples": 4,
+            "wall_seconds": {
+              "maximum": 2.38680499792099,
+              "median": 2.347023557405919,
+              "minimum": 2.2970799608156085,
+              "raw": [
+                2.309719811193645,
+                2.38680499792099,
+                2.3843273036181927,
+                2.2970799608156085
+              ]
+            }
+          },
+          "candidate": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 3585548288,
+              "median": 3325083648.0,
+              "minimum": 3325071360,
+              "raw": [
+                3325087744,
+                3325079552,
+                3585548288,
+                3325071360
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 1.196224,
+              "median": 1.1589895000000001,
+              "minimum": 1.075434,
+              "raw": [
+                1.196224,
+                1.153885,
+                1.075434,
+                1.164094
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 0.933848,
+              "median": 0.921638,
+              "minimum": 0.9066339999999999,
+              "raw": [
+                0.9257799999999999,
+                0.933848,
+                0.917496,
+                0.9066339999999999
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 275852288,
+              "median": 275852288.0,
+              "minimum": 275852288,
+              "raw": [
+                275852288,
+                275852288,
+                275852288,
+                275852288
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 273701888,
+              "median": 273701888.0,
+              "minimum": 273701888,
+              "raw": [
+                273701888,
+                273701888,
+                273701888,
+                273701888
+              ]
+            },
+            "samples": 4,
+            "wall_seconds": {
+              "maximum": 2.1883398480713367,
+              "median": 2.1527472962625325,
+              "minimum": 2.0691519863903522,
+              "raw": [
+                2.1883398480713367,
+                2.161638606339693,
+                2.0691519863903522,
+                2.143855986185372
+              ]
+            }
+          },
+          "paired_baseline_over_candidate_wall": [
+            1.0554666877858505,
+            1.1041646790175401,
+            1.1523210084618605,
+            1.07147120684299
+          ]
+        },
+        "warm": {
+          "baseline": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 4688863232,
+              "median": 4688861184.0,
+              "minimum": 4688855040,
+              "raw": [
+                4688855040,
+                4688863232,
+                4688863232,
+                4688859136
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 0.6777869999999999,
+              "median": 0.6534899999999999,
+              "minimum": 0.640643,
+              "raw": [
+                0.64869,
+                0.6582899999999999,
+                0.6777869999999999,
+                0.640643
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 1.016447,
+              "median": 0.9995645,
+              "minimum": 0.986529,
+              "raw": [
+                0.986529,
+                1.016447,
+                0.9936889999999999,
+                1.00544
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 275852288,
+              "median": 275852288.0,
+              "minimum": 275852288,
+              "raw": [
+                275852288,
+                275852288,
+                275852288,
+                275852288
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 0,
+              "median": 0.0,
+              "minimum": 0,
+              "raw": [
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "samples": 4,
+            "wall_seconds": {
+              "maximum": 1.793812831863761,
+              "median": 1.6829641913063824,
+              "minimum": 1.6465152828022838,
+              "raw": [
+                1.6465152828022838,
+                1.793812831863761,
+                1.6985748168081045,
+                1.6673535658046603
+              ]
+            }
+          },
+          "candidate": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 1939095552,
+              "median": 1939089408.0,
+              "minimum": 1939083264,
+              "raw": [
+                1939095552,
+                1939091456,
+                1939087360,
+                1939083264
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 0.745799,
+              "median": 0.7193425,
+              "minimum": 0.697932,
+              "raw": [
+                0.7359399999999999,
+                0.745799,
+                0.702745,
+                0.697932
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 1.0219,
+              "median": 1.0146795000000002,
+              "minimum": 1.004919,
+              "raw": [
+                1.004919,
+                1.007729,
+                1.02163,
+                1.0219
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 275874304,
+              "median": 275874304.0,
+              "minimum": 275874304,
+              "raw": [
+                275874304,
+                275874304,
+                275874304,
+                275874304
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 0,
+              "median": 0.0,
+              "minimum": 0,
+              "raw": [
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "samples": 4,
+            "wall_seconds": {
+              "maximum": 1.830395720899105,
+              "median": 1.8279439629986882,
+              "minimum": 1.7947279810905457,
+              "raw": [
+                1.830395720899105,
+                1.7947279810905457,
+                1.8278939723968506,
+                1.8279939536005259
+              ]
+            }
+          },
+          "paired_baseline_over_candidate_wall": [
+            0.8995406097177184,
+            0.9994900902886528,
+            0.9292523759355831,
+            0.9121220354807746
+          ]
+        }
+      },
+      "measurements": [
+        {
+          "repetition": 0,
+          "case": "cold",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 26.50139258801937,
+          "cpu_user_seconds": 18.181606,
+          "cpu_system_seconds": 8.009951,
+          "maxrss_kib": 28200,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 15021008,
+          "proc_io": {
+            "cancelled_write_bytes": 3833901056,
+            "cpu_ticks_including_waited_children": 2618,
+            "rchar": 31120358320,
+            "read_bytes": 0,
+            "syscr": 841232,
+            "syscw": 391952,
+            "wchar": 7683940224,
+            "write_bytes": 7690756096
+          },
+          "allocated_before": {
+            "allocated_bytes": 276922368,
+            "logical_bytes": 270587220,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 4133912576,
+            "logical_bytes": 7698181591,
+            "unique_inodes": 4397
+          },
+          "allocated_sampled_peak_bytes": 4133912576,
+          "allocation_sampling_seconds": 3.564236997626722,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 4133912576,
+              "logical_bytes": 7698181591,
+              "unique_inodes": 4397
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857798,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1644679168,
+              "logical_bytes": 5221771984,
+              "unique_inodes": 190
+            },
+            "work": {
+              "allocated_bytes": 1936437248,
+              "logical_bytes": 1929964467,
+              "unique_inodes": 2136
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 275852288,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 9.051,
+            "Verifying checkpoint delta (keeping working filesystem)": 3.75,
+            "Publishing instruction cache": 9.223,
+            "Publishing stage image (export or verified cache reuse)": 1.513,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.624
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "cold",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 16.332986404187977,
+          "cpu_user_seconds": 12.355836,
+          "cpu_system_seconds": 3.8064299999999998,
+          "maxrss_kib": 558416,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 3235688,
+          "proc_io": {
+            "cancelled_write_bytes": 549621760,
+            "cpu_ticks_including_waited_children": 1615,
+            "rchar": 21776552417,
+            "read_bytes": 0,
+            "syscr": 414787,
+            "syscw": 66659,
+            "wchar": 1649923029,
+            "write_bytes": 1656672256
+          },
+          "allocated_before": {
+            "allocated_bytes": 276926464,
+            "logical_bytes": 270587228,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 1384116224,
+            "logical_bytes": 4957168472,
+            "unique_inodes": 4372
+          },
+          "allocated_sampled_peak_bytes": 1384116224,
+          "allocation_sampling_seconds": 2.2859185161069036,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 1384116224,
+              "logical_bytes": 4957168472,
+              "unique_inodes": 4372
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881527,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276205568,
+              "logical_bytes": 2482835056,
+              "unique_inodes": 173
+            },
+            "work": {
+              "allocated_bytes": 555077632,
+              "logical_bytes": 1927864543,
+              "unique_inodes": 2122
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 275874304,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 4.659,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.545,
+            "Publishing instruction cache": 6.905,
+            "Publishing stage image (export or verified cache reuse)": 0.728,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.176
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "warm",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 1.6465152828022838,
+          "cpu_user_seconds": 0.986529,
+          "cpu_system_seconds": 0.64869,
+          "maxrss_kib": 562192,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 74526720,
+            "cpu_ticks_including_waited_children": 162,
+            "rchar": 2212175875,
+            "read_bytes": 0,
+            "syscr": 49826,
+            "syscw": 14653,
+            "wchar": 824369376,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 4133912576,
+            "logical_bytes": 7698181591,
+            "unique_inodes": 4397
+          },
+          "allocated_retained": {
+            "allocated_bytes": 4688855040,
+            "logical_bytes": 8246751460,
+            "unique_inodes": 6478
+          },
+          "allocated_sampled_peak_bytes": 4688855040,
+          "allocation_sampling_seconds": 0.18010964710265398,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 4688855040,
+              "logical_bytes": 8246751460,
+              "unique_inodes": 6478
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857768,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1644683264,
+              "logical_bytes": 5221772923,
+              "unique_inodes": 192
+            },
+            "work": {
+              "allocated_bytes": 279064576,
+              "logical_bytes": 272711118,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.718,
+            "Publishing stage image (export or verified cache reuse)": 0.058
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "warm",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 1.830395720899105,
+          "cpu_user_seconds": 1.004919,
+          "cpu_system_seconds": 0.7359399999999999,
+          "maxrss_kib": 562216,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622672,
+          "proc_io": {
+            "cancelled_write_bytes": 108118016,
+            "cpu_ticks_including_waited_children": 173,
+            "rchar": 2213217198,
+            "read_bytes": 0,
+            "syscr": 51352,
+            "syscw": 14666,
+            "wchar": 824415145,
+            "write_bytes": 830808064
+          },
+          "allocated_before": {
+            "allocated_bytes": 1384116224,
+            "logical_bytes": 4957168472,
+            "unique_inodes": 4372
+          },
+          "allocated_retained": {
+            "allocated_bytes": 1939095552,
+            "logical_bytes": 5505762053,
+            "unique_inodes": 6459
+          },
+          "allocated_sampled_peak_bytes": 1939095552,
+          "allocation_sampling_seconds": 0.30580251198261976,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 1939095552,
+              "logical_bytes": 5505762053,
+              "unique_inodes": 6459
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881473,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276209664,
+              "logical_bytes": 2482836002,
+              "unique_inodes": 175
+            },
+            "work": {
+              "allocated_bytes": 279068672,
+              "logical_bytes": 272711118,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.832,
+            "Publishing stage image (export or verified cache reuse)": 0.059
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "app-edit",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 17.12632520403713,
+          "cpu_user_seconds": 11.073591,
+          "cpu_system_seconds": 5.727485,
+          "maxrss_kib": 564208,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 10244488,
+          "proc_io": {
+            "cancelled_write_bytes": 1885855744,
+            "cpu_ticks_including_waited_children": 1677,
+            "rchar": 19854998758,
+            "read_bytes": 0,
+            "syscr": 510373,
+            "syscw": 204722,
+            "wchar": 5219710998,
+            "write_bytes": 5245177856
+          },
+          "allocated_before": {
+            "allocated_bytes": 4688855040,
+            "logical_bytes": 8246751460,
+            "unique_inodes": 6478
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7184490496,
+            "logical_bytes": 12091797836,
+            "unique_inodes": 14847
+          },
+          "allocated_sampled_peak_bytes": 7184490496,
+          "allocation_sampling_seconds": 5.4135785130783916,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7184490496,
+              "logical_bytes": 12091797836,
+              "unique_inodes": 14847
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857822,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 2192207872,
+              "logical_bytes": 7144149905,
+              "unique_inodes": 255
+            },
+            "work": {
+              "allocated_bytes": 1672232960,
+              "logical_bytes": 1646807641,
+              "unique_inodes": 8297
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 273701888,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 3.149,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.314,
+            "Publishing instruction cache": 3.104,
+            "Publishing stage image (export or verified cache reuse)": 1.579,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.627
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "app-edit",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 10.597453800961375,
+          "cpu_user_seconds": 7.931374,
+          "cpu_system_seconds": 2.543755,
+          "maxrss_kib": 565328,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 2161856,
+          "proc_io": {
+            "cancelled_write_bytes": 11669504,
+            "cpu_ticks_including_waited_children": 1046,
+            "rchar": 14057016777,
+            "read_bytes": 0,
+            "syscr": 255417,
+            "syscw": 19191,
+            "wchar": 1100342666,
+            "write_bytes": 1106870272
+          },
+          "allocated_before": {
+            "allocated_bytes": 1939095552,
+            "logical_bytes": 5505762053,
+            "unique_inodes": 6459
+          },
+          "allocated_retained": {
+            "allocated_bytes": 2770141184,
+            "logical_bytes": 7433786198,
+            "unique_inodes": 8629
+          },
+          "allocated_sampled_peak_bytes": 2770141184,
+          "allocation_sampling_seconds": 2.451929126866162,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 2770141184,
+              "logical_bytes": 7433786198,
+              "unique_inodes": 8629
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881527,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276353024,
+              "logical_bytes": 3310517925,
+              "unique_inodes": 238
+            },
+            "work": {
+              "allocated_bytes": 554991616,
+              "logical_bytes": 824456764,
+              "unique_inodes": 2092
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 17408,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 1.351,
+            "Verifying checkpoint delta (keeping working filesystem)": 0.354,
+            "Publishing instruction cache": 2.188,
+            "Publishing stage image (export or verified cache reuse)": 0.72,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.176
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "no-cache",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 2.309719811193645,
+          "cpu_user_seconds": 0.893803,
+          "cpu_system_seconds": 1.129555,
+          "maxrss_kib": 565328,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 275853312,
+            "cpu_ticks_including_waited_children": 200,
+            "rchar": 1655349259,
+            "read_bytes": 0,
+            "syscr": 71903,
+            "syscw": 53693,
+            "wchar": 824370596,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 7184490496,
+            "logical_bytes": 12091797836,
+            "unique_inodes": 14847
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7739432960,
+            "logical_bytes": 12640367810,
+            "unique_inodes": 16931
+          },
+          "allocated_sampled_peak_bytes": 7999905792,
+          "allocation_sampling_seconds": 0.7859494863077998,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7739432960,
+              "logical_bytes": 12640367810,
+              "unique_inodes": 16931
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857822,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 2192211968,
+              "logical_bytes": 7144150870,
+              "unique_inodes": 257
+            },
+            "work": {
+              "allocated_bytes": 279064576,
+              "logical_bytes": 272711187,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 1.468
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "no-cache",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 2.1883398480713367,
+          "cpu_user_seconds": 0.9257799999999999,
+          "cpu_system_seconds": 1.196224,
+          "maxrss_kib": 565328,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 275853312,
+            "cpu_ticks_including_waited_children": 211,
+            "rchar": 1655349270,
+            "read_bytes": 0,
+            "syscr": 71903,
+            "syscw": 53689,
+            "wchar": 824370670,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 2770141184,
+            "logical_bytes": 7433786198,
+            "unique_inodes": 8629
+          },
+          "allocated_retained": {
+            "allocated_bytes": 3325087744,
+            "logical_bytes": 7982356178,
+            "unique_inodes": 10713
+          },
+          "allocated_sampled_peak_bytes": 3325087744,
+          "allocation_sampling_seconds": 0.6067466419190168,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 3325087744,
+              "logical_bytes": 7982356178,
+              "unique_inodes": 10713
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857822,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 276357120,
+              "logical_bytes": 3310518896,
+              "unique_inodes": 240
+            },
+            "work": {
+              "allocated_bytes": 279068672,
+              "logical_bytes": 272711187,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 273701888,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 1.577
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "cold",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 17.075663497671485,
+          "cpu_user_seconds": 12.419544,
+          "cpu_system_seconds": 4.439656,
+          "maxrss_kib": 565920,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 3235688,
+          "proc_io": {
+            "cancelled_write_bytes": 549621760,
+            "cpu_ticks_including_waited_children": 1684,
+            "rchar": 21776563279,
+            "read_bytes": 0,
+            "syscr": 414905,
+            "syscw": 66659,
+            "wchar": 1649922971,
+            "write_bytes": 1656672256
+          },
+          "allocated_before": {
+            "allocated_bytes": 276922368,
+            "logical_bytes": 270587228,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 1384112128,
+            "logical_bytes": 4957168524,
+            "unique_inodes": 4372
+          },
+          "allocated_sampled_peak_bytes": 1384112128,
+          "allocation_sampling_seconds": 2.417060307227075,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 1384112128,
+              "logical_bytes": 4957168524,
+              "unique_inodes": 4372
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881519,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276205568,
+              "logical_bytes": 2482835028,
+              "unique_inodes": 173
+            },
+            "work": {
+              "allocated_bytes": 555077632,
+              "logical_bytes": 1927864631,
+              "unique_inodes": 2122
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 275874304,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 4.895,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.661,
+            "Publishing instruction cache": 7.201,
+            "Publishing stage image (export or verified cache reuse)": 0.779,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.178
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "cold",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 26.630266019143164,
+          "cpu_user_seconds": 18.198529,
+          "cpu_system_seconds": 8.06088,
+          "maxrss_kib": 566948,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 15020992,
+          "proc_io": {
+            "cancelled_write_bytes": 3833901056,
+            "cpu_ticks_including_waited_children": 2623,
+            "rchar": 31120357816,
+            "read_bytes": 0,
+            "syscr": 841232,
+            "syscw": 391952,
+            "wchar": 7683940166,
+            "write_bytes": 7690747904
+          },
+          "allocated_before": {
+            "allocated_bytes": 276926464,
+            "logical_bytes": 270587172,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 4133920768,
+            "logical_bytes": 7698181451,
+            "unique_inodes": 4397
+          },
+          "allocated_sampled_peak_bytes": 4133920768,
+          "allocation_sampling_seconds": 3.855200294405222,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 4133920768,
+              "logical_bytes": 7698181451,
+              "unique_inodes": 4397
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587100,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857822,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1644679168,
+              "logical_bytes": 5221771828,
+              "unique_inodes": 190
+            },
+            "work": {
+              "allocated_bytes": 1936441344,
+              "logical_bytes": 1929964519,
+              "unique_inodes": 2136
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 275852288,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 9.03,
+            "Verifying checkpoint delta (keeping working filesystem)": 3.829,
+            "Publishing instruction cache": 9.274,
+            "Publishing stage image (export or verified cache reuse)": 1.515,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.639
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "warm",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 1.7947279810905457,
+          "cpu_user_seconds": 1.007729,
+          "cpu_system_seconds": 0.745799,
+          "maxrss_kib": 570340,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622672,
+          "proc_io": {
+            "cancelled_write_bytes": 61980672,
+            "cpu_ticks_including_waited_children": 174,
+            "rchar": 2213217015,
+            "read_bytes": 0,
+            "syscr": 51352,
+            "syscw": 14666,
+            "wchar": 824415145,
+            "write_bytes": 830808064
+          },
+          "allocated_before": {
+            "allocated_bytes": 1384112128,
+            "logical_bytes": 4957168524,
+            "unique_inodes": 4372
+          },
+          "allocated_retained": {
+            "allocated_bytes": 1939091456,
+            "logical_bytes": 5505762097,
+            "unique_inodes": 6459
+          },
+          "allocated_sampled_peak_bytes": 1939091456,
+          "allocation_sampling_seconds": 0.2694943929091096,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 1939091456,
+              "logical_bytes": 5505762097,
+              "unique_inodes": 6459
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881465,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276209664,
+              "logical_bytes": 2482835974,
+              "unique_inodes": 175
+            },
+            "work": {
+              "allocated_bytes": 279068672,
+              "logical_bytes": 272711118,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.837,
+            "Publishing stage image (export or verified cache reuse)": 0.059
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "warm",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 1.793812831863761,
+          "cpu_user_seconds": 1.016447,
+          "cpu_system_seconds": 0.6582899999999999,
+          "maxrss_kib": 570340,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 74526720,
+            "cpu_ticks_including_waited_children": 166,
+            "rchar": 2212175807,
+            "read_bytes": 0,
+            "syscr": 49826,
+            "syscw": 14653,
+            "wchar": 824369376,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 4133920768,
+            "logical_bytes": 7698181451,
+            "unique_inodes": 4397
+          },
+          "allocated_retained": {
+            "allocated_bytes": 4688863232,
+            "logical_bytes": 8246751296,
+            "unique_inodes": 6478
+          },
+          "allocated_sampled_peak_bytes": 4688863232,
+          "allocation_sampling_seconds": 0.2722389083355665,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 4688863232,
+              "logical_bytes": 8246751296,
+              "unique_inodes": 6478
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587100,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857744,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1644683264,
+              "logical_bytes": 5221772767,
+              "unique_inodes": 192
+            },
+            "work": {
+              "allocated_bytes": 279064576,
+              "logical_bytes": 272711118,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.773,
+            "Publishing stage image (export or verified cache reuse)": 0.069
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "app-edit",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 10.50683117005974,
+          "cpu_user_seconds": 7.987846,
+          "cpu_system_seconds": 2.388761,
+          "maxrss_kib": 570340,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 2161864,
+          "proc_io": {
+            "cancelled_write_bytes": 62001152,
+            "cpu_ticks_including_waited_children": 1035,
+            "rchar": 14057015943,
+            "read_bytes": 0,
+            "syscr": 255417,
+            "syscw": 19191,
+            "wchar": 1100342650,
+            "write_bytes": 1106874368
+          },
+          "allocated_before": {
+            "allocated_bytes": 1939091456,
+            "logical_bytes": 5505762097,
+            "unique_inodes": 6459
+          },
+          "allocated_retained": {
+            "allocated_bytes": 2770132992,
+            "logical_bytes": 7433786237,
+            "unique_inodes": 8629
+          },
+          "allocated_sampled_peak_bytes": 2770132992,
+          "allocation_sampling_seconds": 2.2837891979143023,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 2770132992,
+              "logical_bytes": 7433786237,
+              "unique_inodes": 8629
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881527,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276353024,
+              "logical_bytes": 3310517864,
+              "unique_inodes": 238
+            },
+            "work": {
+              "allocated_bytes": 554987520,
+              "logical_bytes": 824456792,
+              "unique_inodes": 2092
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 17408,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 1.345,
+            "Verifying checkpoint delta (keeping working filesystem)": 0.354,
+            "Publishing instruction cache": 2.15,
+            "Publishing stage image (export or verified cache reuse)": 0.716,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.177
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "app-edit",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 17.244128743186593,
+          "cpu_user_seconds": 11.103835,
+          "cpu_system_seconds": 5.750392,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 10244488,
+          "proc_io": {
+            "cancelled_write_bytes": 1894244352,
+            "cpu_ticks_including_waited_children": 1683,
+            "rchar": 19854997693,
+            "read_bytes": 0,
+            "syscr": 510373,
+            "syscw": 204722,
+            "wchar": 5219710982,
+            "write_bytes": 5245177856
+          },
+          "allocated_before": {
+            "allocated_bytes": 4688863232,
+            "logical_bytes": 8246751296,
+            "unique_inodes": 6478
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7184502784,
+            "logical_bytes": 12091797600,
+            "unique_inodes": 14847
+          },
+          "allocated_sampled_peak_bytes": 7184502784,
+          "allocation_sampling_seconds": 5.472188011743128,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7184502784,
+              "logical_bytes": 12091797600,
+              "unique_inodes": 14847
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587100,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857822,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 2192207872,
+              "logical_bytes": 7144149709,
+              "unique_inodes": 255
+            },
+            "work": {
+              "allocated_bytes": 1672237056,
+              "logical_bytes": 1646807609,
+              "unique_inodes": 8297
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 273701888,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 3.176,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.333,
+            "Publishing instruction cache": 3.163,
+            "Publishing stage image (export or verified cache reuse)": 1.591,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.649
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "no-cache",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 2.161638606339693,
+          "cpu_user_seconds": 0.933848,
+          "cpu_system_seconds": 1.153885,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 275853312,
+            "cpu_ticks_including_waited_children": 207,
+            "rchar": 1655349269,
+            "read_bytes": 0,
+            "syscr": 71903,
+            "syscw": 53689,
+            "wchar": 824370666,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 2770132992,
+            "logical_bytes": 7433786237,
+            "unique_inodes": 8629
+          },
+          "allocated_retained": {
+            "allocated_bytes": 3325079552,
+            "logical_bytes": 7982356208,
+            "unique_inodes": 10713
+          },
+          "allocated_sampled_peak_bytes": 3325079552,
+          "allocation_sampling_seconds": 0.6062074629589915,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 3325079552,
+              "logical_bytes": 7982356208,
+              "unique_inodes": 10713
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857814,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 276357120,
+              "logical_bytes": 3310518834,
+              "unique_inodes": 240
+            },
+            "work": {
+              "allocated_bytes": 279068672,
+              "logical_bytes": 272711187,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 273701888,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 1.559
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "no-cache",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 2.38680499792099,
+          "cpu_user_seconds": 0.941294,
+          "cpu_system_seconds": 1.098114,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 275853312,
+            "cpu_ticks_including_waited_children": 202,
+            "rchar": 1655349294,
+            "read_bytes": 0,
+            "syscr": 71903,
+            "syscw": 53693,
+            "wchar": 824370596,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 7184502784,
+            "logical_bytes": 12091797600,
+            "unique_inodes": 14847
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7739449344,
+            "logical_bytes": 12640367550,
+            "unique_inodes": 16931
+          },
+          "allocated_sampled_peak_bytes": 7999922176,
+          "allocation_sampling_seconds": 0.7715938547626138,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7739449344,
+              "logical_bytes": 12640367550,
+              "unique_inodes": 16931
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587100,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857798,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 2192211968,
+              "logical_bytes": 7144150674,
+              "unique_inodes": 257
+            },
+            "work": {
+              "allocated_bytes": 279068672,
+              "logical_bytes": 272711187,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 1.774
+          }
+        },
+        {
+          "repetition": 2,
+          "case": "cold",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 26.907754967920482,
+          "cpu_user_seconds": 17.941002,
+          "cpu_system_seconds": 8.553804,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 15021008,
+          "proc_io": {
+            "cancelled_write_bytes": 3833901056,
+            "cpu_ticks_including_waited_children": 2647,
+            "rchar": 31120357904,
+            "read_bytes": 0,
+            "syscr": 841232,
+            "syscw": 391952,
+            "wchar": 7683940160,
+            "write_bytes": 7690756096
+          },
+          "allocated_before": {
+            "allocated_bytes": 276926464,
+            "logical_bytes": 270587228,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 4133920768,
+            "logical_bytes": 7698181581,
+            "unique_inodes": 4397
+          },
+          "allocated_sampled_peak_bytes": 4394348544,
+          "allocation_sampling_seconds": 3.8548009358346462,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 4133920768,
+              "logical_bytes": 7698181581,
+              "unique_inodes": 4397
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857822,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1644679168,
+              "logical_bytes": 5221771894,
+              "unique_inodes": 190
+            },
+            "work": {
+              "allocated_bytes": 1936441344,
+              "logical_bytes": 1929964519,
+              "unique_inodes": 2136
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 275852288,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 9.133,
+            "Verifying checkpoint delta (keeping working filesystem)": 3.88,
+            "Publishing instruction cache": 9.371,
+            "Publishing stage image (export or verified cache reuse)": 1.523,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.644
+          }
+        },
+        {
+          "repetition": 2,
+          "case": "cold",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 16.615095443092287,
+          "cpu_user_seconds": 12.417222,
+          "cpu_system_seconds": 4.029674,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 3235688,
+          "proc_io": {
+            "cancelled_write_bytes": 549621760,
+            "cpu_ticks_including_waited_children": 1642,
+            "rchar": 21776551981,
+            "read_bytes": 0,
+            "syscr": 414787,
+            "syscw": 66659,
+            "wchar": 1649922976,
+            "write_bytes": 1656672256
+          },
+          "allocated_before": {
+            "allocated_bytes": 276922368,
+            "logical_bytes": 270587228,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 1384112128,
+            "logical_bytes": 4957168413,
+            "unique_inodes": 4372
+          },
+          "allocated_sampled_peak_bytes": 1384112128,
+          "allocation_sampling_seconds": 2.3577156299725175,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 1384112128,
+              "logical_bytes": 4957168413,
+              "unique_inodes": 4372
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881527,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276205568,
+              "logical_bytes": 2482834897,
+              "unique_inodes": 173
+            },
+            "work": {
+              "allocated_bytes": 555077632,
+              "logical_bytes": 1927864647,
+              "unique_inodes": 2122
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 275874304,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 4.818,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.592,
+            "Publishing instruction cache": 6.952,
+            "Publishing stage image (export or verified cache reuse)": 0.748,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.177
+          }
+        },
+        {
+          "repetition": 2,
+          "case": "warm",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 1.6985748168081045,
+          "cpu_user_seconds": 0.9936889999999999,
+          "cpu_system_seconds": 0.6777869999999999,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 45166592,
+            "cpu_ticks_including_waited_children": 166,
+            "rchar": 2212175826,
+            "read_bytes": 0,
+            "syscr": 49826,
+            "syscw": 14653,
+            "wchar": 824369376,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 4133920768,
+            "logical_bytes": 7698181581,
+            "unique_inodes": 4397
+          },
+          "allocated_retained": {
+            "allocated_bytes": 4688863232,
+            "logical_bytes": 8246751442,
+            "unique_inodes": 6478
+          },
+          "allocated_sampled_peak_bytes": 4688863232,
+          "allocation_sampling_seconds": 0.18510624673217535,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 4688863232,
+              "logical_bytes": 8246751442,
+              "unique_inodes": 6478
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857760,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1644683264,
+              "logical_bytes": 5221772833,
+              "unique_inodes": 192
+            },
+            "work": {
+              "allocated_bytes": 279064576,
+              "logical_bytes": 272711118,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.735,
+            "Publishing stage image (export or verified cache reuse)": 0.058
+          }
+        },
+        {
+          "repetition": 2,
+          "case": "warm",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 1.8278939723968506,
+          "cpu_user_seconds": 1.02163,
+          "cpu_system_seconds": 0.702745,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622672,
+          "proc_io": {
+            "cancelled_write_bytes": 11649024,
+            "cpu_ticks_including_waited_children": 172,
+            "rchar": 2213217224,
+            "read_bytes": 0,
+            "syscr": 51352,
+            "syscw": 14666,
+            "wchar": 824415145,
+            "write_bytes": 830808064
+          },
+          "allocated_before": {
+            "allocated_bytes": 1384112128,
+            "logical_bytes": 4957168413,
+            "unique_inodes": 4372
+          },
+          "allocated_retained": {
+            "allocated_bytes": 1939087360,
+            "logical_bytes": 5505761986,
+            "unique_inodes": 6459
+          },
+          "allocated_sampled_peak_bytes": 1939087360,
+          "allocation_sampling_seconds": 0.30215634126216173,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 1939087360,
+              "logical_bytes": 5505761986,
+              "unique_inodes": 6459
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881465,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276209664,
+              "logical_bytes": 2482835843,
+              "unique_inodes": 175
+            },
+            "work": {
+              "allocated_bytes": 279064576,
+              "logical_bytes": 272711118,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.821,
+            "Publishing stage image (export or verified cache reuse)": 0.06
+          }
+        },
+        {
+          "repetition": 2,
+          "case": "app-edit",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 17.04369314480573,
+          "cpu_user_seconds": 10.97975,
+          "cpu_system_seconds": 5.56603,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 10244488,
+          "proc_io": {
+            "cancelled_write_bytes": 1999101952,
+            "cpu_ticks_including_waited_children": 1653,
+            "rchar": 19854986373,
+            "read_bytes": 0,
+            "syscr": 510255,
+            "syscw": 204722,
+            "wchar": 5219710974,
+            "write_bytes": 5245177856
+          },
+          "allocated_before": {
+            "allocated_bytes": 4688863232,
+            "logical_bytes": 8246751442,
+            "unique_inodes": 6478
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7184506880,
+            "logical_bytes": 12091797789,
+            "unique_inodes": 14847
+          },
+          "allocated_sampled_peak_bytes": 7444942848,
+          "allocation_sampling_seconds": 4.927174024283886,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7184506880,
+              "logical_bytes": 12091797789,
+              "unique_inodes": 14847
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857814,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 2192207872,
+              "logical_bytes": 7144149802,
+              "unique_inodes": 255
+            },
+            "work": {
+              "allocated_bytes": 1672241152,
+              "logical_bytes": 1646807633,
+              "unique_inodes": 8297
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 273701888,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 3.027,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.264,
+            "Publishing instruction cache": 3.095,
+            "Publishing stage image (export or verified cache reuse)": 1.497,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.618
+          }
+        },
+        {
+          "repetition": 2,
+          "case": "app-edit",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 10.497483096085489,
+          "cpu_user_seconds": 7.904268,
+          "cpu_system_seconds": 2.469208,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 2161856,
+          "proc_io": {
+            "cancelled_write_bytes": 36835328,
+            "cpu_ticks_including_waited_children": 1035,
+            "rchar": 14057016426,
+            "read_bytes": 0,
+            "syscr": 255417,
+            "syscw": 19191,
+            "wchar": 1100342657,
+            "write_bytes": 1106870272
+          },
+          "allocated_before": {
+            "allocated_bytes": 1939087360,
+            "logical_bytes": 5505761986,
+            "unique_inodes": 6459
+          },
+          "allocated_retained": {
+            "allocated_bytes": 2770128896,
+            "logical_bytes": 7433786102,
+            "unique_inodes": 8629
+          },
+          "allocated_sampled_peak_bytes": 2770128896,
+          "allocation_sampling_seconds": 2.318389649502933,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 2770128896,
+              "logical_bytes": 7433786102,
+              "unique_inodes": 8629
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881527,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276353024,
+              "logical_bytes": 3310517753,
+              "unique_inodes": 238
+            },
+            "work": {
+              "allocated_bytes": 554987520,
+              "logical_bytes": 824456748,
+              "unique_inodes": 2092
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 17408,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 1.347,
+            "Verifying checkpoint delta (keeping working filesystem)": 0.354,
+            "Publishing instruction cache": 2.153,
+            "Publishing stage image (export or verified cache reuse)": 0.719,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.177
+          }
+        },
+        {
+          "repetition": 2,
+          "case": "no-cache",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 2.3843273036181927,
+          "cpu_user_seconds": 0.916578,
+          "cpu_system_seconds": 1.169873,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 275853312,
+            "cpu_ticks_including_waited_children": 207,
+            "rchar": 1655349392,
+            "read_bytes": 0,
+            "syscr": 71903,
+            "syscw": 53693,
+            "wchar": 824370592,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 7184506880,
+            "logical_bytes": 12091797789,
+            "unique_inodes": 14847
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7739449344,
+            "logical_bytes": 12640367762,
+            "unique_inodes": 16931
+          },
+          "allocated_sampled_peak_bytes": 7999922176,
+          "allocation_sampling_seconds": 0.8632921241223812,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7739449344,
+              "logical_bytes": 12640367762,
+              "unique_inodes": 16931
+            },
+            "context": {
+              "allocated_bytes": 276926464,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857822,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 2192211968,
+              "logical_bytes": 7144150766,
+              "unique_inodes": 257
+            },
+            "work": {
+              "allocated_bytes": 279064576,
+              "logical_bytes": 272711187,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 1.551
+          }
+        },
+        {
+          "repetition": 2,
+          "case": "no-cache",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 2.0691519863903522,
+          "cpu_user_seconds": 0.917496,
+          "cpu_system_seconds": 1.075434,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 275853312,
+            "cpu_ticks_including_waited_children": 197,
+            "rchar": 1655349447,
+            "read_bytes": 0,
+            "syscr": 71903,
+            "syscw": 53689,
+            "wchar": 824370670,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 2770128896,
+            "logical_bytes": 7433786102,
+            "unique_inodes": 8629
+          },
+          "allocated_retained": {
+            "allocated_bytes": 3325075456,
+            "logical_bytes": 7982356074,
+            "unique_inodes": 10713
+          },
+          "allocated_sampled_peak_bytes": 3585548288,
+          "allocation_sampling_seconds": 0.5430313413962722,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 3325075456,
+              "logical_bytes": 7982356074,
+              "unique_inodes": 10713
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857814,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 276357120,
+              "logical_bytes": 3310518724,
+              "unique_inodes": 240
+            },
+            "work": {
+              "allocated_bytes": 279068672,
+              "logical_bytes": 272711187,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 273701888,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 1.472
+          }
+        },
+        {
+          "repetition": 3,
+          "case": "cold",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 16.767413423396647,
+          "cpu_user_seconds": 12.314054,
+          "cpu_system_seconds": 4.260634,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 3235688,
+          "proc_io": {
+            "cancelled_write_bytes": 549621760,
+            "cpu_ticks_including_waited_children": 1656,
+            "rchar": 21776552197,
+            "read_bytes": 0,
+            "syscr": 414787,
+            "syscw": 66659,
+            "wchar": 1649922979,
+            "write_bytes": 1656672256
+          },
+          "allocated_before": {
+            "allocated_bytes": 276922368,
+            "logical_bytes": 270587228,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 1384108032,
+            "logical_bytes": 4957168508,
+            "unique_inodes": 4372
+          },
+          "allocated_sampled_peak_bytes": 1384108032,
+          "allocation_sampling_seconds": 2.3659716099500656,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 1384108032,
+              "logical_bytes": 4957168508,
+              "unique_inodes": 4372
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881519,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276205568,
+              "logical_bytes": 2482835020,
+              "unique_inodes": 173
+            },
+            "work": {
+              "allocated_bytes": 555073536,
+              "logical_bytes": 1927864623,
+              "unique_inodes": 2122
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 275874304,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem": 0.003,
+            "Exporting instruction checkpoint": 4.866,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.647,
+            "Publishing instruction cache": 7.004,
+            "Publishing stage image (export or verified cache reuse)": 0.759,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.176
+          }
+        },
+        {
+          "repetition": 3,
+          "case": "cold",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 26.931099859066308,
+          "cpu_user_seconds": 18.191431,
+          "cpu_system_seconds": 8.416742,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 15021008,
+          "proc_io": {
+            "cancelled_write_bytes": 3699683328,
+            "cpu_ticks_including_waited_children": 2659,
+            "rchar": 31120358189,
+            "read_bytes": 0,
+            "syscr": 841232,
+            "syscw": 391952,
+            "wchar": 7683940165,
+            "write_bytes": 7690756096
+          },
+          "allocated_before": {
+            "allocated_bytes": 276922368,
+            "logical_bytes": 270587172,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 4133916672,
+            "logical_bytes": 7698181463,
+            "unique_inodes": 4397
+          },
+          "allocated_sampled_peak_bytes": 4394344448,
+          "allocation_sampling_seconds": 3.644176498055458,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 4133916672,
+              "logical_bytes": 7698181463,
+              "unique_inodes": 4397
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587100,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857806,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1644679168,
+              "logical_bytes": 5221771848,
+              "unique_inodes": 190
+            },
+            "work": {
+              "allocated_bytes": 1936441344,
+              "logical_bytes": 1929964527,
+              "unique_inodes": 2136
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 275852288,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 9.21,
+            "Verifying checkpoint delta (keeping working filesystem)": 3.875,
+            "Publishing instruction cache": 9.308,
+            "Publishing stage image (export or verified cache reuse)": 1.539,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.635
+          }
+        },
+        {
+          "repetition": 3,
+          "case": "warm",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 1.8279939536005259,
+          "cpu_user_seconds": 1.0219,
+          "cpu_system_seconds": 0.697932,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622672,
+          "proc_io": {
+            "cancelled_write_bytes": 24231936,
+            "cpu_ticks_including_waited_children": 171,
+            "rchar": 2213217145,
+            "read_bytes": 0,
+            "syscr": 51352,
+            "syscw": 14666,
+            "wchar": 824415129,
+            "write_bytes": 830808064
+          },
+          "allocated_before": {
+            "allocated_bytes": 1384108032,
+            "logical_bytes": 4957168508,
+            "unique_inodes": 4372
+          },
+          "allocated_retained": {
+            "allocated_bytes": 1939083264,
+            "logical_bytes": 5505762049,
+            "unique_inodes": 6459
+          },
+          "allocated_sampled_peak_bytes": 1939083264,
+          "allocation_sampling_seconds": 0.3026439594104886,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 1939083264,
+              "logical_bytes": 5505762049,
+              "unique_inodes": 6459
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881473,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276209664,
+              "logical_bytes": 2482835962,
+              "unique_inodes": 175
+            },
+            "work": {
+              "allocated_bytes": 279064576,
+              "logical_bytes": 272711082,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.826,
+            "Publishing stage image (export or verified cache reuse)": 0.059
+          }
+        },
+        {
+          "repetition": 3,
+          "case": "warm",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 1.6673535658046603,
+          "cpu_user_seconds": 1.00544,
+          "cpu_system_seconds": 0.640643,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 99692544,
+            "cpu_ticks_including_waited_children": 164,
+            "rchar": 2212175829,
+            "read_bytes": 0,
+            "syscr": 49826,
+            "syscw": 14653,
+            "wchar": 824369380,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 4133916672,
+            "logical_bytes": 7698181463,
+            "unique_inodes": 4397
+          },
+          "allocated_retained": {
+            "allocated_bytes": 4688859136,
+            "logical_bytes": 8246751277,
+            "unique_inodes": 6478
+          },
+          "allocated_sampled_peak_bytes": 4688859136,
+          "allocation_sampling_seconds": 0.1811839798465371,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 4688859136,
+              "logical_bytes": 8246751277,
+              "unique_inodes": 6478
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587100,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857768,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1644683264,
+              "logical_bytes": 5221772788,
+              "unique_inodes": 192
+            },
+            "work": {
+              "allocated_bytes": 279064576,
+              "logical_bytes": 272711062,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.732,
+            "Publishing stage image (export or verified cache reuse)": 0.06
+          }
+        },
+        {
+          "repetition": 3,
+          "case": "app-edit",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 10.590302594006062,
+          "cpu_user_seconds": 7.956299,
+          "cpu_system_seconds": 2.453751,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 2161856,
+          "proc_io": {
+            "cancelled_write_bytes": 99749888,
+            "cpu_ticks_including_waited_children": 1038,
+            "rchar": 14057016232,
+            "read_bytes": 0,
+            "syscr": 255417,
+            "syscw": 19191,
+            "wchar": 1100342660,
+            "write_bytes": 1106870272
+          },
+          "allocated_before": {
+            "allocated_bytes": 1939083264,
+            "logical_bytes": 5505762049,
+            "unique_inodes": 6459
+          },
+          "allocated_retained": {
+            "allocated_bytes": 2770124800,
+            "logical_bytes": 7433786228,
+            "unique_inodes": 8629
+          },
+          "allocated_sampled_peak_bytes": 2770124800,
+          "allocation_sampling_seconds": 2.440723715350032,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 2770124800,
+              "logical_bytes": 7433786228,
+              "unique_inodes": 8629
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275906560,
+              "logical_bytes": 275881527,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 276353024,
+              "logical_bytes": 3310517899,
+              "unique_inodes": 238
+            },
+            "work": {
+              "allocated_bytes": 554987520,
+              "logical_bytes": 824456784,
+              "unique_inodes": 2092
+            }
+          },
+          "layer_bytes": 275874304,
+          "new_layer_bytes": 17408,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 1.34,
+            "Verifying checkpoint delta (keeping working filesystem)": 0.353,
+            "Publishing instruction cache": 2.165,
+            "Publishing stage image (export or verified cache reuse)": 0.714,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.176
+          }
+        },
+        {
+          "repetition": 3,
+          "case": "app-edit",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 17.382385639473796,
+          "cpu_user_seconds": 11.082901,
+          "cpu_system_seconds": 5.975756,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 10244504,
+          "proc_io": {
+            "cancelled_write_bytes": 1961353216,
+            "cpu_ticks_including_waited_children": 1703,
+            "rchar": 19854997709,
+            "read_bytes": 0,
+            "syscr": 510373,
+            "syscw": 204722,
+            "wchar": 5219710984,
+            "write_bytes": 5245186048
+          },
+          "allocated_before": {
+            "allocated_bytes": 4688859136,
+            "logical_bytes": 8246751277,
+            "unique_inodes": 6478
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7184490496,
+            "logical_bytes": 12091797555,
+            "unique_inodes": 14847
+          },
+          "allocated_sampled_peak_bytes": 7184490496,
+          "allocation_sampling_seconds": 5.550190380774438,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7184490496,
+              "logical_bytes": 12091797555,
+              "unique_inodes": 14847
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587100,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857798,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 2192207872,
+              "logical_bytes": 7144149716,
+              "unique_inodes": 255
+            },
+            "work": {
+              "allocated_bytes": 1672228864,
+              "logical_bytes": 1646807621,
+              "unique_inodes": 8297
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 273701888,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 3.207,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.349,
+            "Publishing instruction cache": 3.166,
+            "Publishing stage image (export or verified cache reuse)": 1.631,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.676
+          }
+        },
+        {
+          "repetition": 3,
+          "case": "no-cache",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 2.143855986185372,
+          "cpu_user_seconds": 0.9066339999999999,
+          "cpu_system_seconds": 1.164094,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 275853312,
+            "cpu_ticks_including_waited_children": 206,
+            "rchar": 1655349345,
+            "read_bytes": 0,
+            "syscr": 71903,
+            "syscw": 53689,
+            "wchar": 824370670,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 2770124800,
+            "logical_bytes": 7433786228,
+            "unique_inodes": 8629
+          },
+          "allocated_retained": {
+            "allocated_bytes": 3325071360,
+            "logical_bytes": 7982356208,
+            "unique_inodes": 10713
+          },
+          "allocated_sampled_peak_bytes": 3325071360,
+          "allocation_sampling_seconds": 0.48767643608152866,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 3325071360,
+              "logical_bytes": 7982356208,
+              "unique_inodes": 10713
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587148,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857822,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 276357120,
+              "logical_bytes": 3310518870,
+              "unique_inodes": 240
+            },
+            "work": {
+              "allocated_bytes": 279068672,
+              "logical_bytes": 272711187,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 273701888,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 1.53
+          }
+        },
+        {
+          "repetition": 3,
+          "case": "no-cache",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 2.2970799608156085,
+          "cpu_user_seconds": 0.925489,
+          "cpu_system_seconds": 1.15656,
+          "maxrss_kib": 571988,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 1622536,
+          "proc_io": {
+            "cancelled_write_bytes": 275853312,
+            "cpu_ticks_including_waited_children": 206,
+            "rchar": 1655349324,
+            "read_bytes": 0,
+            "syscr": 71903,
+            "syscw": 53693,
+            "wchar": 824370584,
+            "write_bytes": 830738432
+          },
+          "allocated_before": {
+            "allocated_bytes": 7184490496,
+            "logical_bytes": 12091797555,
+            "unique_inodes": 14847
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7739432960,
+            "logical_bytes": 12640367466,
+            "unique_inodes": 16931
+          },
+          "allocated_sampled_peak_bytes": 7999905792,
+          "allocation_sampling_seconds": 0.769950496032834,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7739432960,
+              "logical_bytes": 12640367466,
+              "unique_inodes": 16931
+            },
+            "context": {
+              "allocated_bytes": 276922368,
+              "logical_bytes": 270587100,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 275873792,
+              "logical_bytes": 275857822,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 2192211968,
+              "logical_bytes": 7144150678,
+              "unique_inodes": 257
+            },
+            "work": {
+              "allocated_bytes": 279064576,
+              "logical_bytes": 272711127,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 275852288,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 1.524
+          }
+        }
+      ]
+    },
+    {
+      "dependency_mib": 1024,
+      "status": {
+        "builds": 16,
+        "status": "PASS"
+      },
+      "provenance": {
+        "baseline_revision": "63b716e1027ceba48bf9c887567419057b1bfd73",
+        "candidate_revision": "503b7419b8cfd6599f6c80a3825717f687d31a84",
+        "baseline_sha256": "24c09bd3b805a525d447f5c568991dc50da417fdd299445b52c981087a273686",
+        "candidate_sha256": "ecda01b49ba611f8f49a7e1bcc62e1bde2ad31e9f992af0141f410c774c1470f",
+        "repetitions": 2,
+        "small_files": 2048,
+        "scripts_sha256": {
+          "acceptance.py": "8c3fb5f48cbc282c8a582cb4a19ca21a0692a649299a8a58d1e9e052f53fc633",
+          "fixture.py": "bd8d49aabb5b8f9d750ebb63307fc69ba5dbdbbae6c16847ffc3a7bbc40db2c2",
+          "metrics.py": "a2b1446c56697248800176117132697f8c6368d89d4c4ea6f211a5671c886b51",
+          "pod-session.py": "6266a55cd1a332ff2f5fedfcc15fb20bfc46988c2d151664d0fc088912868e77",
+          "run.py": "8f67f030c3b6176e43faf6d74cfc1029062dfb3428cd904888794a33cbeae5cb",
+          "test_fixture.py": "fe539abb99ff9bd97455d5a0c67d5aa3651b1cb6f74f967b6d3a53a9e91719d8"
+        },
+        "oracle_sha256": {
+          "fixture_tar.py": "adf8e6c58df3dd8ed9c06e0b4dbab05b7619c8ac271cf2276ba593d103fd0ebc",
+          "oracle.py": "acc0d75c6079acfe58761c5b219675fdc0af2e6db1ead9f0e4c604771ad9d5fc"
+        },
+        "busybox_sha256": "dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14",
+        "notes": [
+          "cold = empty managed store; OS page cache is not dropped",
+          "ordinary default export, actual -t, no private fast flags",
+          "wall and CPU are build-only; independent validation follows each build",
+          "allocation st_blocks*512 deduplicated by device/inode; reflink extents not deduplicated",
+          "sampled allocation peaks are lower bounds; sampling overhead is recorded",
+          "proc I/O leader includes waited children; physical read_bytes can be zero from page cache",
+          "synthetic offline dependency workload, not pip/npm/Nemotron or power-loss/sandbox evidence"
+        ]
+      },
+      "cpu_model": "AMD EPYC 9654 96-Core Processor",
+      "affinity": [
+        27,
+        68,
+        79,
+        81,
+        123,
+        164,
+        175,
+        177
+      ],
+      "controllers": {
+        "/sys/fs/cgroup/cpu.max": "max 100000",
+        "/sys/fs/cgroup/cpuset.cpus.effective": "27,68,79,81,123,164,175,177",
+        "/sys/fs/cgroup/memory.high": "max",
+        "/sys/fs/cgroup/memory.max": "32000000000"
+      },
+      "filesystem": "overlay",
+      "container_capacity_bytes": 85899345920,
+      "evidence_archive_sha256": "cede11cb71afae4d747a319aad3b2cc622e1d1b5a29038a8f1582c564de07d17",
+      "summary": {
+        "app-edit": {
+          "baseline": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 29188198400,
+              "median": 29188196352.0,
+              "minimum": 29188194304,
+              "raw": [
+                29188198400,
+                29188194304
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 16.511781,
+              "median": 15.987791,
+              "minimum": 15.463801,
+              "raw": [
+                15.463801,
+                16.511781
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 42.498054,
+              "median": 42.4765295,
+              "minimum": 42.455005,
+              "raw": [
+                42.455005,
+                42.498054
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 1081158656,
+              "median": 1081158656.0,
+              "minimum": 1081158656,
+              "raw": [
+                1081158656,
+                1081158656
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 1079008256,
+              "median": 1079008256.0,
+              "minimum": 1079008256,
+              "raw": [
+                1079008256,
+                1079008256
+              ]
+            },
+            "samples": 2,
+            "wall_seconds": {
+              "maximum": 60.04400694929063,
+              "median": 59.362716384232044,
+              "minimum": 58.681425819173455,
+              "raw": [
+                58.681425819173455,
+                60.04400694929063
+              ]
+            }
+          },
+          "candidate": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 10823192576,
+              "median": 10823190528.0,
+              "minimum": 10823188480,
+              "raw": [
+                10823192576,
+                10823188480
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 7.735977,
+              "median": 6.7434215,
+              "minimum": 5.750866,
+              "raw": [
+                5.750866,
+                7.735977
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 30.668987,
+              "median": 30.6277915,
+              "minimum": 30.586596,
+              "raw": [
+                30.586596,
+                30.668987
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 1081180672,
+              "median": 1081180672.0,
+              "minimum": 1081180672,
+              "raw": [
+                1081180672,
+                1081180672
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 17408,
+              "median": 17408.0,
+              "minimum": 17408,
+              "raw": [
+                17408,
+                17408
+              ]
+            },
+            "samples": 2,
+            "wall_seconds": {
+              "maximum": 38.94657073915005,
+              "median": 37.731803190428764,
+              "minimum": 36.51703564170748,
+              "raw": [
+                36.51703564170748,
+                38.94657073915005
+              ]
+            }
+          },
+          "paired_baseline_over_candidate_wall": [
+            1.6069602799891893,
+            1.5417020243308077
+          ]
+        },
+        "cold": {
+          "baseline": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 17279242240,
+              "median": 17279242240.0,
+              "minimum": 17279242240,
+              "raw": [
+                17279242240,
+                17279242240
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 25.256991,
+              "median": 24.499387499999997,
+              "minimum": 23.741784,
+              "raw": [
+                23.741784,
+                25.256991
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 69.698269,
+              "median": 69.6190135,
+              "minimum": 69.539758,
+              "raw": [
+                69.539758,
+                69.698269
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 1081158656,
+              "median": 1081158656.0,
+              "minimum": 1081158656,
+              "raw": [
+                1081158656,
+                1081158656
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 1081158656,
+              "median": 1081158656.0,
+              "minimum": 1081158656,
+              "raw": [
+                1081158656,
+                1081158656
+              ]
+            },
+            "samples": 2,
+            "wall_seconds": {
+              "maximum": 95.64930513035506,
+              "median": 95.1434826143086,
+              "minimum": 94.63766009826213,
+              "raw": [
+                94.63766009826213,
+                95.64930513035506
+              ]
+            }
+          },
+          "candidate": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 6478491648,
+              "median": 5944565760.0,
+              "minimum": 5410639872,
+              "raw": [
+                6478491648,
+                5410639872
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 12.260127,
+              "median": 11.587597500000001,
+              "minimum": 10.915068,
+              "raw": [
+                10.915068,
+                12.260127
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 47.682852,
+              "median": 47.6564565,
+              "minimum": 47.630061,
+              "raw": [
+                47.630061,
+                47.682852
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 1081180672,
+              "median": 1081180672.0,
+              "minimum": 1081180672,
+              "raw": [
+                1081180672,
+                1081180672
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 1081180672,
+              "median": 1081180672.0,
+              "minimum": 1081180672,
+              "raw": [
+                1081180672,
+                1081180672
+              ]
+            },
+            "samples": 2,
+            "wall_seconds": {
+              "maximum": 60.257415141910315,
+              "median": 59.551041963510215,
+              "minimum": 58.844668785110116,
+              "raw": [
+                58.844668785110116,
+                60.257415141910315
+              ]
+            }
+          },
+          "paired_baseline_over_candidate_wall": [
+            1.6082622615119377,
+            1.5873449749726973
+          ]
+        },
+        "no-cache": {
+          "baseline": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 31353794560,
+              "median": 31353790464.0,
+              "minimum": 31353786368,
+              "raw": [
+                31353794560,
+                31353786368
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 2.804222,
+              "median": 2.7247645,
+              "minimum": 2.645307,
+              "raw": [
+                2.645307,
+                2.804222
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 3.363414,
+              "median": 3.352975,
+              "minimum": 3.342536,
+              "raw": [
+                3.363414,
+                3.342536
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 1081158656,
+              "median": 1081158656.0,
+              "minimum": 1081158656,
+              "raw": [
+                1081158656,
+                1081158656
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 0,
+              "median": 0.0,
+              "minimum": 0,
+              "raw": [
+                0,
+                0
+              ]
+            },
+            "samples": 2,
+            "wall_seconds": {
+              "maximum": 6.228777984157205,
+              "median": 6.186689798720181,
+              "minimum": 6.144601613283157,
+              "raw": [
+                6.144601613283157,
+                6.228777984157205
+              ]
+            }
+          },
+          "candidate": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 14054526976,
+              "median": 14054526976.0,
+              "minimum": 14054526976,
+              "raw": [
+                14054526976,
+                14054526976
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 2.934975,
+              "median": 2.776019,
+              "minimum": 2.617063,
+              "raw": [
+                2.617063,
+                2.934975
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 3.349083,
+              "median": 3.324197,
+              "minimum": 3.299311,
+              "raw": [
+                3.299311,
+                3.349083
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 1081158656,
+              "median": 1081158656.0,
+              "minimum": 1081158656,
+              "raw": [
+                1081158656,
+                1081158656
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 1079008256,
+              "median": 1079008256.0,
+              "minimum": 1079008256,
+              "raw": [
+                1079008256,
+                1079008256
+              ]
+            },
+            "samples": 2,
+            "wall_seconds": {
+              "maximum": 6.447514198720455,
+              "median": 6.316735872067511,
+              "minimum": 6.185957545414567,
+              "raw": [
+                6.185957545414567,
+                6.447514198720455
+              ]
+            }
+          },
+          "paired_baseline_over_candidate_wall": [
+            0.9933145464016213,
+            0.9660743337941528
+          ]
+        },
+        "warm": {
+          "baseline": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 18379063296,
+              "median": 18379063296.0,
+              "minimum": 18379063296,
+              "raw": [
+                18379063296,
+                18379063296
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 1.489124,
+              "median": 1.4615779999999998,
+              "minimum": 1.434032,
+              "raw": [
+                1.489124,
+                1.434032
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 3.774718,
+              "median": 3.739757,
+              "minimum": 3.704796,
+              "raw": [
+                3.704796,
+                3.774718
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 1081158656,
+              "median": 1081158656.0,
+              "minimum": 1081158656,
+              "raw": [
+                1081158656,
+                1081158656
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 0,
+              "median": 0.0,
+              "minimum": 0,
+              "raw": [
+                0,
+                0
+              ]
+            },
+            "samples": 2,
+            "wall_seconds": {
+              "maximum": 5.395514640957117,
+              "median": 5.392940546851605,
+              "minimum": 5.390366452746093,
+              "raw": [
+                5.390366452746093,
+                5.395514640957117
+              ]
+            }
+          },
+          "candidate": {
+            "allocated_sampled_peak_bytes": {
+              "maximum": 7576231936,
+              "median": 7576229888.0,
+              "minimum": 7576227840,
+              "raw": [
+                7576231936,
+                7576227840
+              ]
+            },
+            "cpu_system_seconds": {
+              "maximum": 2.035255,
+              "median": 1.7701924999999998,
+              "minimum": 1.5051299999999999,
+              "raw": [
+                1.5051299999999999,
+                2.035255
+              ]
+            },
+            "cpu_user_seconds": {
+              "maximum": 3.855589,
+              "median": 3.7984565000000003,
+              "minimum": 3.741324,
+              "raw": [
+                3.741324,
+                3.855589
+              ]
+            },
+            "layer_bytes": {
+              "maximum": 1081180672,
+              "median": 1081180672.0,
+              "minimum": 1081180672,
+              "raw": [
+                1081180672,
+                1081180672
+              ]
+            },
+            "new_layer_bytes": {
+              "maximum": 0,
+              "median": 0.0,
+              "minimum": 0,
+              "raw": [
+                0,
+                0
+              ]
+            },
+            "samples": 2,
+            "wall_seconds": {
+              "maximum": 6.029945870861411,
+              "median": 5.714185989461839,
+              "minimum": 5.398426108062267,
+              "raw": [
+                5.398426108062267,
+                6.029945870861411
+              ]
+            }
+          },
+          "paired_baseline_over_candidate_wall": [
+            0.9985070360962915,
+            0.8947865795993187
+          ]
+        }
+      },
+      "measurements": [
+        {
+          "repetition": 0,
+          "case": "cold",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 94.63766009826213,
+          "cpu_user_seconds": 69.539758,
+          "cpu_system_seconds": 23.741784,
+          "maxrss_kib": 24700,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 59061376,
+          "proc_io": {
+            "cancelled_write_bytes": 2470752256,
+            "cpu_ticks_including_waited_children": 9326,
+            "rchar": 122120768656,
+            "read_bytes": 0,
+            "syscr": 2839912,
+            "syscw": 1338170,
+            "wchar": 30232518931,
+            "write_bytes": 30239424512
+          },
+          "allocated_before": {
+            "allocated_bytes": 1082228736,
+            "logical_bytes": 1075893588,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 16213508096,
+            "logical_bytes": 30246759870,
+            "unique_inodes": 4397
+          },
+          "allocated_sampled_peak_bytes": 17279242240,
+          "allocation_sampling_seconds": 13.746243094094098,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 16213508096,
+              "logical_bytes": 30246759870,
+              "unique_inodes": 4397
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164191,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 6476517376,
+              "logical_bytes": 20522592952,
+              "unique_inodes": 190
+            },
+            "work": {
+              "allocated_bytes": 7573581824,
+              "logical_bytes": 7567109017,
+              "unique_inodes": 2136
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 1081158656,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 30.495,
+            "Verifying checkpoint delta (keeping working filesystem)": 14.773,
+            "Publishing instruction cache": 35.2,
+            "Publishing stage image (export or verified cache reuse)": 5.056,
+            "Verifying stage checkpoint (keeping working filesystem)": 2.428
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "cold",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 58.844668785110116,
+          "cpu_user_seconds": 47.630061,
+          "cpu_system_seconds": 10.915068,
+          "maxrss_kib": 2128416,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 12672944,
+          "proc_io": {
+            "cancelled_write_bytes": 284323840,
+            "cpu_ticks_including_waited_children": 5852,
+            "rchar": 85396242583,
+            "read_bytes": 0,
+            "syscr": 1476511,
+            "syscw": 226438,
+            "wchar": 6481761512,
+            "write_bytes": 6488547328
+          },
+          "allocated_before": {
+            "allocated_bytes": 1082228736,
+            "logical_bytes": 1075893596,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 5410643968,
+            "logical_bytes": 19452683038,
+            "unique_inodes": 4372
+          },
+          "allocated_sampled_peak_bytes": 6478491648,
+          "allocation_sampling_seconds": 8.385621690191329,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 5410643968,
+              "logical_bytes": 19452683038,
+              "unique_inodes": 4372
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081212928,
+              "logical_bytes": 1081187896,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 1081511936,
+              "logical_bytes": 9730592207,
+              "unique_inodes": 173
+            },
+            "work": {
+              "allocated_bytes": 2165690368,
+              "logical_bytes": 7565009221,
+              "unique_inodes": 2122
+            }
+          },
+          "layer_bytes": 1081180672,
+          "new_layer_bytes": 1081180672,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 16.295,
+            "Verifying checkpoint delta (keeping working filesystem)": 6.042,
+            "Publishing instruction cache": 26.786,
+            "Publishing stage image (export or verified cache reuse)": 2.463,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.685
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "warm",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 5.390366452746093,
+          "cpu_user_seconds": 3.704796,
+          "cpu_system_seconds": 1.489124,
+          "maxrss_kib": 2129924,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 6341136,
+          "proc_io": {
+            "cancelled_write_bytes": 2150400,
+            "cpu_ticks_including_waited_children": 518,
+            "rchar": 8654673568,
+            "read_bytes": 0,
+            "syscr": 148602,
+            "syscw": 51517,
+            "wchar": 3240288652,
+            "write_bytes": 3246661632
+          },
+          "allocated_before": {
+            "allocated_bytes": 16213508096,
+            "logical_bytes": 30246759870,
+            "unique_inodes": 4397
+          },
+          "allocated_retained": {
+            "allocated_bytes": 18379063296,
+            "logical_bytes": 32405942486,
+            "unique_inodes": 6478
+          },
+          "allocated_sampled_peak_bytes": 18379063296,
+          "allocation_sampling_seconds": 0.8387385113164783,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 18379063296,
+              "logical_bytes": 32405942486,
+              "unique_inodes": 6478
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164113,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 6476521472,
+              "logical_bytes": 20522593925,
+              "unique_inodes": 192
+            },
+            "work": {
+              "allocated_bytes": 1084370944,
+              "logical_bytes": 1078017486,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 2.089,
+            "Publishing stage image (export or verified cache reuse)": 0.306
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "warm",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 5.398426108062267,
+          "cpu_user_seconds": 3.741324,
+          "cpu_system_seconds": 1.5051299999999999,
+          "maxrss_kib": 2131120,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 6341272,
+          "proc_io": {
+            "cancelled_write_bytes": 2203648,
+            "cpu_ticks_including_waited_children": 524,
+            "rchar": 8655714951,
+            "read_bytes": 0,
+            "syscr": 150128,
+            "syscw": 51530,
+            "wchar": 3240334424,
+            "write_bytes": 3246731264
+          },
+          "allocated_before": {
+            "allocated_bytes": 5410643968,
+            "logical_bytes": 19452683038,
+            "unique_inodes": 4372
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7576231936,
+            "logical_bytes": 21611889331,
+            "unique_inodes": 6459
+          },
+          "allocated_sampled_peak_bytes": 7576231936,
+          "allocation_sampling_seconds": 0.8471475327387452,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7576231936,
+              "logical_bytes": 21611889331,
+              "unique_inodes": 6459
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081212928,
+              "logical_bytes": 1081187842,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 1081516032,
+              "logical_bytes": 9730593188,
+              "unique_inodes": 175
+            },
+            "work": {
+              "allocated_bytes": 1084370944,
+              "logical_bytes": 1078017426,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 1081180672,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 2.149,
+            "Publishing stage image (export or verified cache reuse)": 0.283
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "app-edit",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 58.681425819173455,
+          "cpu_user_seconds": 42.455005,
+          "cpu_system_seconds": 15.463801,
+          "maxrss_kib": 2135844,
+          "rusage_input_blocks": 24,
+          "rusage_output_blocks": 40128976,
+          "proc_io": {
+            "cancelled_write_bytes": 1129754624,
+            "cpu_ticks_including_waited_children": 5790,
+            "rchar": 77837539578,
+            "read_bytes": 12288,
+            "syscr": 1657995,
+            "syscw": 696266,
+            "wchar": 20520532289,
+            "write_bytes": 20546035712
+          },
+          "allocated_before": {
+            "allocated_bytes": 18379063296,
+            "logical_bytes": 32405942486,
+            "unique_inodes": 6478
+          },
+          "allocated_retained": {
+            "allocated_bytes": 28122456064,
+            "logical_bytes": 47525277970,
+            "unique_inodes": 14847
+          },
+          "allocated_sampled_peak_bytes": 29188198400,
+          "allocation_sampling_seconds": 18.88137946743518,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 28122456064,
+              "logical_bytes": 47525277970,
+              "unique_inodes": 14847
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164167,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 8634658816,
+              "logical_bytes": 28082115492,
+              "unique_inodes": 255
+            },
+            "work": {
+              "allocated_bytes": 6504071168,
+              "logical_bytes": 6478645819,
+              "unique_inodes": 8297
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 1079008256,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 11.02,
+            "Verifying checkpoint delta (keeping working filesystem)": 5.028,
+            "Publishing instruction cache": 11.815,
+            "Publishing stage image (export or verified cache reuse)": 5.371,
+            "Verifying stage checkpoint (keeping working filesystem)": 2.511
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "app-edit",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 36.51703564170748,
+          "cpu_user_seconds": 30.586596,
+          "cpu_system_seconds": 5.750866,
+          "maxrss_kib": 2135844,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 8453336,
+          "proc_io": {
+            "cancelled_write_bytes": 2224128,
+            "cpu_ticks_including_waited_children": 3632,
+            "rchar": 55127951103,
+            "read_bytes": 0,
+            "syscr": 885173,
+            "syscw": 68363,
+            "wchar": 4321568384,
+            "write_bytes": 4328108032
+          },
+          "allocated_before": {
+            "allocated_bytes": 7576231936,
+            "logical_bytes": 21611889331,
+            "unique_inodes": 6459
+          },
+          "allocated_retained": {
+            "allocated_bytes": 10823192576,
+            "logical_bytes": 29177058072,
+            "unique_inodes": 8629
+          },
+          "allocated_sampled_peak_bytes": 10823192576,
+          "allocation_sampling_seconds": 7.956928436644375,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 10823192576,
+              "logical_bytes": 29177058072,
+              "unique_inodes": 8629
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081212928,
+              "logical_bytes": 1081187896,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 1081659392,
+              "logical_bytes": 12974194212,
+              "unique_inodes": 238
+            },
+            "work": {
+              "allocated_bytes": 2165600256,
+              "logical_bytes": 3240375890,
+              "unique_inodes": 2092
+            }
+          },
+          "layer_bytes": 1081180672,
+          "new_layer_bytes": 17408,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 4.546,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.374,
+            "Publishing instruction cache": 8.268,
+            "Publishing stage image (export or verified cache reuse)": 2.379,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.688
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "no-cache",
+          "variant": "baseline",
+          "position": 0,
+          "wall_seconds": 6.144601613283157,
+          "cpu_user_seconds": 3.363414,
+          "cpu_system_seconds": 2.645307,
+          "maxrss_kib": 2135844,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 6341144,
+          "proc_io": {
+            "cancelled_write_bytes": 175190016,
+            "cpu_ticks_including_waited_children": 598,
+            "rchar": 6487237116,
+            "read_bytes": 0,
+            "syscr": 232119,
+            "syscw": 176573,
+            "wchar": 3240289871,
+            "write_bytes": 3246665728
+          },
+          "allocated_before": {
+            "allocated_bytes": 28122456064,
+            "logical_bytes": 47525277970,
+            "unique_inodes": 14847
+          },
+          "allocated_retained": {
+            "allocated_bytes": 30288015360,
+            "logical_bytes": 49684460699,
+            "unique_inodes": 16931
+          },
+          "allocated_sampled_peak_bytes": 31353794560,
+          "allocation_sampling_seconds": 2.206753979437053,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 30288015360,
+              "logical_bytes": 49684460699,
+              "unique_inodes": 16931
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164191,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 8634662912,
+              "logical_bytes": 28082116491,
+              "unique_inodes": 257
+            },
+            "work": {
+              "allocated_bytes": 1084375040,
+              "logical_bytes": 1078017539,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.007,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 5.288
+          }
+        },
+        {
+          "repetition": 0,
+          "case": "no-cache",
+          "variant": "candidate",
+          "position": 1,
+          "wall_seconds": 6.185957545414567,
+          "cpu_user_seconds": 3.299311,
+          "cpu_system_seconds": 2.617063,
+          "maxrss_kib": 2136148,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 6341144,
+          "proc_io": {
+            "cancelled_write_bytes": 32583680,
+            "cpu_ticks_including_waited_children": 589,
+            "rchar": 6487237286,
+            "read_bytes": 0,
+            "syscr": 232119,
+            "syscw": 176569,
+            "wchar": 3240289945,
+            "write_bytes": 3246665728
+          },
+          "allocated_before": {
+            "allocated_bytes": 10823192576,
+            "logical_bytes": 29177058072,
+            "unique_inodes": 8629
+          },
+          "allocated_retained": {
+            "allocated_bytes": 12988747776,
+            "logical_bytes": 31336240823,
+            "unique_inodes": 10713
+          },
+          "allocated_sampled_peak_bytes": 14054526976,
+          "allocation_sampling_seconds": 1.6374224722385406,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 12988747776,
+              "logical_bytes": 31336240823,
+              "unique_inodes": 10713
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164191,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1081663488,
+              "logical_bytes": 12974195217,
+              "unique_inodes": 240
+            },
+            "work": {
+              "allocated_bytes": 1084370944,
+              "logical_bytes": 1078017555,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 1079008256,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 5.247
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "cold",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 60.257415141910315,
+          "cpu_user_seconds": 47.682852,
+          "cpu_system_seconds": 12.260127,
+          "maxrss_kib": 2137056,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 12672936,
+          "proc_io": {
+            "cancelled_write_bytes": 637702144,
+            "cpu_ticks_including_waited_children": 5993,
+            "rchar": 85396282507,
+            "read_bytes": 0,
+            "syscr": 1476747,
+            "syscw": 226438,
+            "wchar": 6481761612,
+            "write_bytes": 6488543232
+          },
+          "allocated_before": {
+            "allocated_bytes": 1082228736,
+            "logical_bytes": 1075893568,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 5410639872,
+            "logical_bytes": 19452683163,
+            "unique_inodes": 4372
+          },
+          "allocated_sampled_peak_bytes": 5410639872,
+          "allocation_sampling_seconds": 8.655398176051676,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 5410639872,
+              "logical_bytes": 19452683163,
+              "unique_inodes": 4372
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893496,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081212928,
+              "logical_bytes": 1081187872,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 1081511936,
+              "logical_bytes": 9730592440,
+              "unique_inodes": 173
+            },
+            "work": {
+              "allocated_bytes": 2165686272,
+              "logical_bytes": 7565009161,
+              "unique_inodes": 2122
+            }
+          },
+          "layer_bytes": 1081180672,
+          "new_layer_bytes": 1081180672,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Exporting instruction checkpoint": 16.919,
+            "Verifying checkpoint delta (keeping working filesystem)": 6.419,
+            "Publishing instruction cache": 27.088,
+            "Publishing stage image (export or verified cache reuse)": 2.521,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.689
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "cold",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 95.64930513035506,
+          "cpu_user_seconds": 69.698269,
+          "cpu_system_seconds": 25.256991,
+          "maxrss_kib": 2139768,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 59061376,
+          "proc_io": {
+            "cancelled_write_bytes": 2951057408,
+            "cpu_ticks_including_waited_children": 9494,
+            "rchar": 122120802464,
+            "read_bytes": 0,
+            "syscr": 2840030,
+            "syscw": 1338170,
+            "wchar": 30232518918,
+            "write_bytes": 30239424512
+          },
+          "allocated_before": {
+            "allocated_bytes": 1082228736,
+            "logical_bytes": 1075893596,
+            "unique_inodes": 2060
+          },
+          "allocated_retained": {
+            "allocated_bytes": 16213508096,
+            "logical_bytes": 30246760003,
+            "unique_inodes": 4397
+          },
+          "allocated_sampled_peak_bytes": 17279242240,
+          "allocation_sampling_seconds": 12.912614485248923,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 16213508096,
+              "logical_bytes": 30246760003,
+              "unique_inodes": 4397
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164191,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 6476517376,
+              "logical_bytes": 20522593013,
+              "unique_inodes": 190
+            },
+            "work": {
+              "allocated_bytes": 7573581824,
+              "logical_bytes": 7567109085,
+              "unique_inodes": 2136
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 1081158656,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 30.88,
+            "Verifying checkpoint delta (keeping working filesystem)": 14.934,
+            "Publishing instruction cache": 35.55,
+            "Publishing stage image (export or verified cache reuse)": 5.127,
+            "Verifying stage checkpoint (keeping working filesystem)": 2.479
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "warm",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 6.029945870861411,
+          "cpu_user_seconds": 3.855589,
+          "cpu_system_seconds": 2.035255,
+          "maxrss_kib": 2139768,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 6341272,
+          "proc_io": {
+            "cancelled_write_bytes": 2203648,
+            "cpu_ticks_including_waited_children": 588,
+            "rchar": 8655719708,
+            "read_bytes": 0,
+            "syscr": 150128,
+            "syscw": 51530,
+            "wchar": 3240334421,
+            "write_bytes": 3246731264
+          },
+          "allocated_before": {
+            "allocated_bytes": 5410639872,
+            "logical_bytes": 19452683163,
+            "unique_inodes": 4372
+          },
+          "allocated_retained": {
+            "allocated_bytes": 7576227840,
+            "logical_bytes": 21611889463,
+            "unique_inodes": 6459
+          },
+          "allocated_sampled_peak_bytes": 7576227840,
+          "allocation_sampling_seconds": 0.8878561723977327,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 7576227840,
+              "logical_bytes": 21611889463,
+              "unique_inodes": 6459
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893496,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081212928,
+              "logical_bytes": 1081187842,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 1081516032,
+              "logical_bytes": 9730593420,
+              "unique_inodes": 175
+            },
+            "work": {
+              "allocated_bytes": 1084370944,
+              "logical_bytes": 1078017434,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 1081180672,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 2.496,
+            "Publishing stage image (export or verified cache reuse)": 0.326
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "warm",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 5.395514640957117,
+          "cpu_user_seconds": 3.774718,
+          "cpu_system_seconds": 1.434032,
+          "maxrss_kib": 2139796,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 6341136,
+          "proc_io": {
+            "cancelled_write_bytes": 2150400,
+            "cpu_ticks_including_waited_children": 520,
+            "rchar": 8654676037,
+            "read_bytes": 0,
+            "syscr": 148602,
+            "syscw": 51517,
+            "wchar": 3240288647,
+            "write_bytes": 3246661632
+          },
+          "allocated_before": {
+            "allocated_bytes": 16213508096,
+            "logical_bytes": 30246760003,
+            "unique_inodes": 4397
+          },
+          "allocated_retained": {
+            "allocated_bytes": 18379063296,
+            "logical_bytes": 32405942642,
+            "unique_inodes": 6478
+          },
+          "allocated_sampled_peak_bytes": 18379063296,
+          "allocation_sampling_seconds": 0.8422081433236599,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 18379063296,
+              "logical_bytes": 32405942642,
+              "unique_inodes": 6478
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164137,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 6476521472,
+              "logical_bytes": 20522593985,
+              "unique_inodes": 192
+            },
+            "work": {
+              "allocated_bytes": 1084370944,
+              "logical_bytes": 1078017486,
+              "unique_inodes": 2070
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 2.092,
+            "Publishing stage image (export or verified cache reuse)": 0.287
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "app-edit",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 38.94657073915005,
+          "cpu_user_seconds": 30.668987,
+          "cpu_system_seconds": 7.735977,
+          "maxrss_kib": 2141312,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 8453336,
+          "proc_io": {
+            "cancelled_write_bytes": 2224128,
+            "cpu_ticks_including_waited_children": 3839,
+            "rchar": 55127978518,
+            "read_bytes": 0,
+            "syscr": 885409,
+            "syscw": 68363,
+            "wchar": 4321568401,
+            "write_bytes": 4328108032
+          },
+          "allocated_before": {
+            "allocated_bytes": 7576227840,
+            "logical_bytes": 21611889463,
+            "unique_inodes": 6459
+          },
+          "allocated_retained": {
+            "allocated_bytes": 10823188480,
+            "logical_bytes": 29177058221,
+            "unique_inodes": 8629
+          },
+          "allocated_sampled_peak_bytes": 10823188480,
+          "allocation_sampling_seconds": 8.669160960242152,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 10823188480,
+              "logical_bytes": 29177058221,
+              "unique_inodes": 8629
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893496,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081212928,
+              "logical_bytes": 1081187896,
+              "unique_inodes": 15
+            },
+            "store": {
+              "allocated_bytes": 1081659392,
+              "logical_bytes": 12974194453,
+              "unique_inodes": 238
+            },
+            "work": {
+              "allocated_bytes": 2165600256,
+              "logical_bytes": 3240375898,
+              "unique_inodes": 2092
+            }
+          },
+          "layer_bytes": 1081180672,
+          "new_layer_bytes": 17408,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.003,
+            "Exporting instruction checkpoint": 4.918,
+            "Verifying checkpoint delta (keeping working filesystem)": 1.434,
+            "Publishing instruction cache": 9.029,
+            "Publishing stage image (export or verified cache reuse)": 2.769,
+            "Verifying stage checkpoint (keeping working filesystem)": 0.774
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "app-edit",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 60.04400694929063,
+          "cpu_user_seconds": 42.498054,
+          "cpu_system_seconds": 16.511781,
+          "maxrss_kib": 2141312,
+          "rusage_input_blocks": 906496,
+          "rusage_output_blocks": 40129008,
+          "proc_io": {
+            "cancelled_write_bytes": 2630619136,
+            "cpu_ticks_including_waited_children": 5899,
+            "rchar": 77837564041,
+            "read_bytes": 464125952,
+            "syscr": 1658113,
+            "syscw": 696266,
+            "wchar": 20520532293,
+            "write_bytes": 20546052096
+          },
+          "allocated_before": {
+            "allocated_bytes": 18379063296,
+            "logical_bytes": 32405942642,
+            "unique_inodes": 6478
+          },
+          "allocated_retained": {
+            "allocated_bytes": 28122451968,
+            "logical_bytes": 47525278172,
+            "unique_inodes": 14847
+          },
+          "allocated_sampled_peak_bytes": 29188194304,
+          "allocation_sampling_seconds": 19.367535077035427,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 28122451968,
+              "logical_bytes": 47525278172,
+              "unique_inodes": 14847
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164191,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 8634658816,
+              "logical_bytes": 28082115550,
+              "unique_inodes": 255
+            },
+            "work": {
+              "allocated_bytes": 6504067072,
+              "logical_bytes": 6478645843,
+              "unique_inodes": 8297
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 1079008256,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Exporting instruction checkpoint": 10.792,
+            "Verifying checkpoint delta (keeping working filesystem)": 5.137,
+            "Publishing instruction cache": 12.162,
+            "Publishing stage image (export or verified cache reuse)": 5.544,
+            "Verifying stage checkpoint (keeping working filesystem)": 2.544
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "no-cache",
+          "variant": "candidate",
+          "position": 0,
+          "wall_seconds": 6.447514198720455,
+          "cpu_user_seconds": 3.349083,
+          "cpu_system_seconds": 2.934975,
+          "maxrss_kib": 2141312,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 6341144,
+          "proc_io": {
+            "cancelled_write_bytes": 286208000,
+            "cpu_ticks_including_waited_children": 627,
+            "rchar": 6487237283,
+            "read_bytes": 0,
+            "syscr": 232119,
+            "syscw": 176569,
+            "wchar": 3240289949,
+            "write_bytes": 3246665728
+          },
+          "allocated_before": {
+            "allocated_bytes": 10823188480,
+            "logical_bytes": 29177058221,
+            "unique_inodes": 8629
+          },
+          "allocated_retained": {
+            "allocated_bytes": 12988747776,
+            "logical_bytes": 31336240949,
+            "unique_inodes": 10713
+          },
+          "allocated_sampled_peak_bytes": 14054526976,
+          "allocation_sampling_seconds": 1.9050417728722095,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 12988747776,
+              "logical_bytes": 31336240949,
+              "unique_inodes": 10713
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893496,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164167,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 1081663488,
+              "logical_bytes": 12974195459,
+              "unique_inodes": 240
+            },
+            "work": {
+              "allocated_bytes": 1084375040,
+              "logical_bytes": 1078017555,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 1079008256,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 5.5
+          }
+        },
+        {
+          "repetition": 1,
+          "case": "no-cache",
+          "variant": "baseline",
+          "position": 1,
+          "wall_seconds": 6.228777984157205,
+          "cpu_user_seconds": 3.342536,
+          "cpu_system_seconds": 2.804222,
+          "maxrss_kib": 2142244,
+          "rusage_input_blocks": 0,
+          "rusage_output_blocks": 6341144,
+          "proc_io": {
+            "cancelled_write_bytes": 426848256,
+            "cpu_ticks_including_waited_children": 613,
+            "rchar": 6487237365,
+            "read_bytes": 0,
+            "syscr": 232119,
+            "syscw": 176573,
+            "wchar": 3240289867,
+            "write_bytes": 3246665728
+          },
+          "allocated_before": {
+            "allocated_bytes": 28122451968,
+            "logical_bytes": 47525278172,
+            "unique_inodes": 14847
+          },
+          "allocated_retained": {
+            "allocated_bytes": 30288007168,
+            "logical_bytes": 49684460916,
+            "unique_inodes": 16931
+          },
+          "allocated_sampled_peak_bytes": 31353786368,
+          "allocation_sampling_seconds": 2.3815082227811217,
+          "allocation_scopes": {
+            "all_retained": {
+              "allocated_bytes": 30288007168,
+              "logical_bytes": 49684460916,
+              "unique_inodes": 16931
+            },
+            "context": {
+              "allocated_bytes": 1082228736,
+              "logical_bytes": 1075893516,
+              "unique_inodes": 2057
+            },
+            "output": {
+              "allocated_bytes": 1081180160,
+              "logical_bytes": 1081164191,
+              "unique_inodes": 9
+            },
+            "store": {
+              "allocated_bytes": 8634662912,
+              "logical_bytes": 28082116548,
+              "unique_inodes": 257
+            },
+            "work": {
+              "allocated_bytes": 1084370944,
+              "logical_bytes": 1078017555,
+              "unique_inodes": 2073
+            }
+          },
+          "layer_bytes": 1081158656,
+          "new_layer_bytes": 0,
+          "phase_seconds_from_logs": {
+            "Preparing base layers": 0.008,
+            "Capturing verified base filesystem (no replay)": 0.002,
+            "Publishing stage image (export or verified cache reuse)": 5.333
+          }
+        }
+      ]
+    }
+  ],
+  "compression_helper": {
+    "records": [
+      {
+        "encode_cpu_ms": 60.67700000000001,
+        "encode_wall_ms": 71.198538,
+        "fixture": "compressible-text",
+        "iteration": 1,
+        "mode": "Uncompressed",
+        "observed_allocated_peak_bytes": 200806400,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 67112960,
+        "stored_bytes": 67110400,
+        "temporary_payload_peak_bytes": 134220800,
+        "verify_cpu_ms": 94.306,
+        "verify_wall_ms": 94.302447
+      },
+      {
+        "encode_cpu_ms": 58.77499999999996,
+        "encode_wall_ms": 59.725107,
+        "fixture": "compressible-text",
+        "iteration": 1,
+        "mode": "Gzip",
+        "observed_allocated_peak_bytes": 134197248,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 503808,
+        "stored_bytes": 500340,
+        "temporary_payload_peak_bytes": 67610740,
+        "verify_cpu_ms": 54.11899999999997,
+        "verify_wall_ms": 54.117299
+      },
+      {
+        "encode_cpu_ms": 58.88300000000002,
+        "encode_wall_ms": 59.811596,
+        "fixture": "compressible-text",
+        "iteration": 2,
+        "mode": "Gzip",
+        "observed_allocated_peak_bytes": 134197248,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 503808,
+        "stored_bytes": 500340,
+        "temporary_payload_peak_bytes": 67610740,
+        "verify_cpu_ms": 54.16800000000005,
+        "verify_wall_ms": 54.165771
+      },
+      {
+        "encode_cpu_ms": 60.04299999999996,
+        "encode_wall_ms": 70.756537,
+        "fixture": "compressible-text",
+        "iteration": 2,
+        "mode": "Uncompressed",
+        "observed_allocated_peak_bytes": 200806400,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 67112960,
+        "stored_bytes": 67110400,
+        "temporary_payload_peak_bytes": 134220800,
+        "verify_cpu_ms": 94.754,
+        "verify_wall_ms": 94.75174899999999
+      },
+      {
+        "encode_cpu_ms": 60.26900000000002,
+        "encode_wall_ms": 71.494481,
+        "fixture": "compressible-text",
+        "iteration": 3,
+        "mode": "Uncompressed",
+        "observed_allocated_peak_bytes": 200806400,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 67112960,
+        "stored_bytes": 67110400,
+        "temporary_payload_peak_bytes": 134220800,
+        "verify_cpu_ms": 94.862,
+        "verify_wall_ms": 94.85847899999999
+      },
+      {
+        "encode_cpu_ms": 58.66700000000002,
+        "encode_wall_ms": 59.462213,
+        "fixture": "compressible-text",
+        "iteration": 3,
+        "mode": "Gzip",
+        "observed_allocated_peak_bytes": 134197248,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 503808,
+        "stored_bytes": 500340,
+        "temporary_payload_peak_bytes": 67610740,
+        "verify_cpu_ms": 54.199,
+        "verify_wall_ms": 54.195936
+      },
+      {
+        "encode_cpu_ms": 61.187000000000104,
+        "encode_wall_ms": 71.498508,
+        "fixture": "incompressible-bytes",
+        "iteration": 1,
+        "mode": "Uncompressed",
+        "observed_allocated_peak_bytes": 200806400,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 67112960,
+        "stored_bytes": 67110400,
+        "temporary_payload_peak_bytes": 134220800,
+        "verify_cpu_ms": 94.86900000000009,
+        "verify_wall_ms": 94.86604999999999
+      },
+      {
+        "encode_cpu_ms": 426.75600000000014,
+        "encode_wall_ms": 443.361017,
+        "fixture": "incompressible-bytes",
+        "iteration": 1,
+        "mode": "Gzip",
+        "observed_allocated_peak_bytes": 200863744,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 67170304,
+        "stored_bytes": 67166984,
+        "temporary_payload_peak_bytes": 134277384,
+        "verify_cpu_ms": 288.83500000000015,
+        "verify_wall_ms": 288.832004
+      },
+      {
+        "encode_cpu_ms": 427.057,
+        "encode_wall_ms": 441.670379,
+        "fixture": "incompressible-bytes",
+        "iteration": 2,
+        "mode": "Gzip",
+        "observed_allocated_peak_bytes": 200863744,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 67170304,
+        "stored_bytes": 67166984,
+        "temporary_payload_peak_bytes": 134277384,
+        "verify_cpu_ms": 288.9520000000001,
+        "verify_wall_ms": 288.959204
+      },
+      {
+        "encode_cpu_ms": 60.61100000000019,
+        "encode_wall_ms": 71.591166,
+        "fixture": "incompressible-bytes",
+        "iteration": 2,
+        "mode": "Uncompressed",
+        "observed_allocated_peak_bytes": 200806400,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 67112960,
+        "stored_bytes": 67110400,
+        "temporary_payload_peak_bytes": 134220800,
+        "verify_cpu_ms": 94.76799999999974,
+        "verify_wall_ms": 94.76529000000001
+      },
+      {
+        "encode_cpu_ms": 60.26499999999979,
+        "encode_wall_ms": 73.440482,
+        "fixture": "incompressible-bytes",
+        "iteration": 3,
+        "mode": "Uncompressed",
+        "observed_allocated_peak_bytes": 200806400,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 67112960,
+        "stored_bytes": 67110400,
+        "temporary_payload_peak_bytes": 134220800,
+        "verify_cpu_ms": 95.31799999999978,
+        "verify_wall_ms": 95.315212
+      },
+      {
+        "encode_cpu_ms": 426.99,
+        "encode_wall_ms": 443.86562200000003,
+        "fixture": "incompressible-bytes",
+        "iteration": 3,
+        "mode": "Gzip",
+        "observed_allocated_peak_bytes": 200863744,
+        "raw_tar_bytes": 67110400,
+        "stored_allocated_bytes": 67170304,
+        "stored_bytes": 67166984,
+        "temporary_payload_peak_bytes": 134277384,
+        "verify_cpu_ms": 288.6970000000004,
+        "verify_wall_ms": 288.693967
+      }
+    ],
+    "scope": "64 MiB synthetic text/random; encode+sync and separate verification, not full production publication",
+    "executable_sha256": "e70cacbfb6d52ef9aabc13f9b748b82b3c34c5a9016fc5ccc5e010cfb921a1e9"
+  },
+  "mount_smoke": {
+    "status": "PASS",
+    "candidate_commit": "503b7419b8cfd6599f6c80a3825717f687d31a84",
+    "binary_sha256": "ecda01b49ba611f8f49a7e1bcc62e1bde2ad31e9f992af0141f410c774c1470f",
+    "busybox_sha256": "dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14",
+    "filesystem": "overlay",
+    "builds": [
+      {
+        "case": "secret-success",
+        "expected_success": true,
+        "returncode": 0,
+        "elapsed_seconds": 0.644,
+        "verified_gzip_layers": 6,
+        "restored": true
+      },
+      {
+        "case": "secret-failure",
+        "expected_success": false,
+        "returncode": 2,
+        "elapsed_seconds": 0.155,
+        "restored": true
+      },
+      {
+        "case": "cache-create",
+        "expected_success": true,
+        "returncode": 0,
+        "elapsed_seconds": 0.48,
+        "verified_gzip_layers": 5,
+        "restored": true
+      },
+      {
+        "case": "cache-failure",
+        "expected_success": false,
+        "returncode": 2,
+        "elapsed_seconds": 0.168,
+        "restored": true
+      },
+      {
+        "case": "cache-reuse",
+        "expected_success": true,
+        "returncode": 0,
+        "elapsed_seconds": 0.168,
+        "verified_gzip_layers": 1,
+        "restored": true
+      }
+    ],
+    "inspection": {
+      "entries": 496,
+      "bytes_inspected": 358664529
+    },
+    "failed_cache_preserved": true,
+    "no_cache_reused_packages": true
+  },
+  "supplemental_evidence_archive_sha256": "22267fe42594f6ba7739b655317d22af3c49a016a0c59b76f60b2e6f5c4d2b14",
+  "teardown": {
+    "delete_status": 204,
+    "fresh_get_status": 404,
+    "complete_inventory_count": 0,
+    "verified_at": "2026-10-27 14:00:13 UTC",
+    "verified_evidence_files": 335
+  }
+}

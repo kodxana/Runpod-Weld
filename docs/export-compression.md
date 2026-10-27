@@ -10,8 +10,31 @@ Both stage and instruction cache identities include compression. Builder identit
 also changes with the executable, covering encoder/backend changes.
 
 Gzip is opt-in: the local random-data benchmark below found roughly 6.8x slower
-encoding. Smaller blobs are not a build-speed guarantee; no Pod performance claim
-or registry compatibility result is made here.
+encoding, and the separate Pod helper run found roughly 6.2x. Smaller blobs are
+not a build-speed guarantee. Neither helper benchmark measures full production
+publication or registry push performance.
+
+## Pod helper measurements (2026-10-27)
+
+On the [same CPU Pod used for checkpoint comparisons](performance-v02.md), the
+frozen `503b741` helper ran after all build timings completed. Three iterations
+per input/mode used the existing 64 MiB fixture, alternating mode order. Medians:
+
+| Input/mode | Stored bytes | Encode + sync | Separate verification |
+| --- | ---: | ---: | ---: |
+| Text, raw | 67,110,400 | 71.20 ms | 94.75 ms |
+| Text, gzip | 500,340 | 59.73 ms | 54.17 ms |
+| Incompressible, raw | 67,110,400 | 71.59 ms | 94.87 ms |
+| Incompressible, gzip | 67,166,984 | 443.36 ms | 288.83 ms |
+
+This retains the helper's original scope: fixture generation is outside timing,
+and production publication's additional verification is omitted. The observed
+allocated peak for raw output was 200,806,400 bytes, versus a 134,220,800-byte
+logical payload peak; for text gzip it was 134,197,248 versus 67,610,740 bytes.
+Filesystem allocation behavior can make these metrics differ. The byte formula
+is not a physical-allocation quota. All twelve records and the helper hash are in
+[the Pod data](v02-pod-performance.json); the earlier local records below remain
+unchanged.
 
 ## Integration contract
 

@@ -3,6 +3,16 @@
 Measurements below are from Linux Runpod Pods with native container storage,
 optimized Weld binaries, and layered export. They are not Docker parity claims.
 
+## Incremental instruction checkpoints (2026-10-27)
+
+The v0.2 candidate adds incremental instruction layers and extends verified-root
+handoff to cached parents. A same-Pod comparison against published v0.1.0 measures
+cold, unchanged, application-edit and no-cache builds, with exact independent
+filesystem/config/cache checks. See [the new measurements and remaining
+bottlenecks](performance-v02.md) and [raw repeated data](v02-pod-performance.json).
+The older full Nemotron timings below are historical results for earlier changes;
+they are not measurements of this candidate.
+
 ## Verified-root reuse (October 2026)
 
 Layered builds retain a verified base-replay receipt instead of replaying the base

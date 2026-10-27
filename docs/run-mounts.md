@@ -147,6 +147,19 @@ channels. Such exfiltration is outside this profile; suppression and cleanup are
 not an isolation boundary. Do not put credentials directly in Dockerfile text,
 ARG/ENV, package caches or build context. Tests use synthetic markers only.
 
+## Pod verification
+
+The frozen `503b741` release-mode binary passed five offline build cases on a
+Runpod CPU Pod: nonroot secret permissions and mutation, secret failure cleanup,
+managed package-cache creation, failed cache publication preserving previous
+data/modes/owners, and nonroot special-mode reuse with `--no-cache`. Successful
+outputs used gzip and passed every-layer descriptor/diff-ID and temporary-path
+checks. Recursive inspection found no synthetic secret bytes or source paths in
+work, exported images, stores, caches or logs. The two deliberate RUN failures
+were expected and had execution/restoration assertions. See
+[the report and limitations](performance-v02.md#compression-and-run-mounts-on-the-same-pod).
+No real package-network install or abrupt machine-failure test is claimed.
+
 ## Local verification
 
 `cargo test --test run_mounts` covers source/target confinement, byte/metadata
