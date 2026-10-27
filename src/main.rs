@@ -746,13 +746,13 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
             #[cfg(target_os = "linux")]
             if let Some(r) = cli.record.as_mut() {
                 if let Some(resources) = cli.resources.as_ref() {
-                    rpweld::build::build_recorded_with_resources(
+                    rpweld::build::build_managed_recorded(
                         &source,
                         &cli.options,
                         lease,
                         r,
                         resources,
-                        cancelled,
+                        &CANCELLED,
                     )
                 } else {
                     rpweld::build::build_recorded(&source, &cli.options, lease, r, cancelled)
@@ -1405,9 +1405,24 @@ fn main() {
         eprintln!("rpweld: cannot install cancellation handlers: {error}");
         std::process::exit(2);
     }
+    // Retain actual sinks through all final/error reporting, including alias failures.
+    #[cfg(target_os = "linux")]
+    let output = match rpweld::progress::Output::capture() {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("rpweld: cannot capture output sinks: {error}");
+            std::process::exit(2);
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let _scope = output.enter();
+    #[cfg(target_os = "linux")]
+    let mut stdout = output.stdout();
+    #[cfg(not(target_os = "linux"))]
+    let mut stdout = io::stdout();
     // RUN output readers write concurrently; never hold stdout's lock across a build.
-    if let Err(error) = execute(&args, &mut io::stdout()) {
-        eprintln!("rpweld: {error}");
+    if let Err(error) = execute(&args, &mut stdout) {
+        rpweld::progress::diagnostic(format_args!("rpweld: {error}"));
         std::process::exit(2);
     }
 }

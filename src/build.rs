@@ -16,6 +16,7 @@
 use crate::{
     build_plan::{self, Base, CopySource, InstructionKind as I, Protocol, Run},
     context, export, image, layer,
+    managed_control::ManagedControl,
     oci::{BlobStore, Descriptor},
     rootfs,
 };
@@ -29,9 +30,15 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::{process::Stdio, time::Duration};
 
+macro_rules! report {
+    ($($arg:tt)*) => { crate::progress::diagnostic(format_args!($($arg)*)) };
+}
+
 /// Errors include underlying parser, image, filesystem, worker and export errors.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
-type Result<T> = std::result::Result<T, Error>;
+#[cfg(target_os = "linux")]
+pub use crate::managed_control::build_managed_recorded;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 fn copy_limits(limits: Limits, used: &context::Summary) -> context::Limits {
     context::Limits {
@@ -1584,6 +1591,8 @@ fn verify_fresh_checkpoint(
 }
 
 struct StageCache<'a> {
+    // Provenance is explicit; resource policy and reporting scopes never grant it.
+    control: Option<&'a ManagedControl<'a>>,
     root: PathBuf,
     lease: Option<&'a crate::store_lease::StoreLease>,
     #[cfg(target_os = "linux")]
@@ -1598,6 +1607,9 @@ impl StageCache<'_> {
         instructions: usize,
         cancelled: &impl Fn() -> bool,
     ) -> Result<bool> {
+        if let Some(control) = self.control {
+            control.check_output()?;
+        }
         #[cfg(target_os = "linux")]
         if let Some(managed) = &self.managed {
             let key = entry
@@ -1627,6 +1639,11 @@ impl StageCache<'_> {
         resources: Option<&crate::build_resources::Policy>,
         cancelled: &impl Fn() -> bool,
     ) -> Result<()> {
+        if let Some(control) = self.control {
+            // PublicationSession admission belongs here once an owned exporter
+            // checkpoint is available; this slice retains all existing hashes.
+            control.check_output()?;
+        }
         let shared_pool = {
             #[cfg(target_os = "linux")]
             {
@@ -1675,6 +1692,7 @@ impl StageCache<'_> {
 
 #[allow(clippy::too_many_arguments)]
 fn export_stage(
+    control: Option<&ManagedControl<'_>>,
     root: &Path,
     destination: &Path,
     config: &Value,
@@ -1687,6 +1705,9 @@ fn export_stage(
     cancelled: &impl Fn() -> bool,
     created: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<Descriptor> {
+    if let Some(control) = control {
+        control.check_output()?;
+    }
     let exported = export::export_created_with_resources(
         root,
         destination,
@@ -1852,7 +1873,7 @@ pub fn build_recorded(
     result
 }
 
-/// Managed CLI entry point with current-capacity checks. These are observations,
+/// Conservative callback entry point with current-capacity checks. These are observations,
 /// not quotas; trusted RUN commands can allocate faster than cooperative polling.
 #[cfg(target_os = "linux")]
 pub fn build_recorded_with_resources(
@@ -1872,6 +1893,38 @@ pub fn build_recorded_with_resources(
         Some(resources),
         cancelled,
     );
+    if result.is_err() && record.record.manifest.is_none() {
+        record.update(lease, |r| r.phase = crate::build_record::Phase::Failed)?;
+    }
+    result
+}
+
+// Only the concrete entry can provide ManagedControl. Internal fixed closures
+// adapt cooperative polling; callback-based public entries always pass None.
+#[cfg(target_os = "linux")]
+pub(crate) fn build_managed_inner(
+    source: &str,
+    options: &BuildOptions,
+    lease: &crate::store_lease::StoreLease,
+    record: &mut crate::build_record::BuildRecord,
+    resources: &crate::build_resources::Policy,
+    control: &ManagedControl<'_>,
+) -> Result<BuildResult> {
+    control.check_output()?;
+    record.update(lease, |r| r.phase = crate::build_record::Phase::Building)?;
+    let result = build_inner_checked(
+        source,
+        options,
+        Some(lease),
+        Some(record),
+        Some(resources),
+        Some(control),
+        || control.poll(),
+    )
+    .map_err(|original| match control.check() {
+        Err(error) => format!("{error}; stopped operation: {original}").into(),
+        Ok(()) => original,
+    });
     if result.is_err() && record.record.manifest.is_none() {
         record.update(lease, |r| r.phase = crate::build_record::Phase::Failed)?;
     }
@@ -1924,9 +1977,9 @@ fn build_inner(
 ) -> Result<BuildResult> {
     match resources {
         Some(policy) => with_resource_policy(policy, "build in progress", cancelled, |stop| {
-            build_inner_checked(source, options, lease, record, resources, stop)
+            build_inner_checked(source, options, lease, record, resources, None, stop)
         }),
-        None => build_inner_checked(source, options, lease, record, None, cancelled),
+        None => build_inner_checked(source, options, lease, record, None, None, cancelled),
     }
 }
 
@@ -1955,6 +2008,7 @@ fn build_inner_checked(
     lease: Option<&crate::store_lease::StoreLease>,
     mut record: Option<&mut crate::build_record::BuildRecord>,
     resources: Option<&crate::build_resources::Policy>,
+    control: Option<&ManagedControl<'_>>,
     cancelled: impl Fn() -> bool,
 ) -> Result<BuildResult> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -2216,6 +2270,7 @@ fn build_inner_checked(
             lease,
             resources,
             &mut measurements,
+            control,
             || {
                 phase.tick();
                 cancelled()
@@ -2255,6 +2310,7 @@ fn build_stage(
     lease: Option<&crate::store_lease::StoreLease>,
     resources: Option<&crate::build_resources::Policy>,
     measurements: &mut LayerMeasurements,
+    control: Option<&ManagedControl<'_>>,
     cancelled: impl Fn() -> bool,
 ) -> Result<StageResult> {
     check(&cancelled)?;
@@ -2364,6 +2420,7 @@ fn build_stage(
             let lease = lease.ok_or("managed cache requires a borrowed store lease")?;
             let managed = crate::oci::ManagedCache::open(store, lease, &cancelled)?;
             Some(StageCache {
+                control,
                 root: fs::canonicalize(store)?.join("cache-v2/entries"),
                 lease: Some(lease),
                 managed: Some(managed),
@@ -2376,6 +2433,7 @@ fn build_stage(
         }
     } else {
         options.cache.as_ref().map(|root| StageCache {
+            control,
             root: root.clone(),
             lease,
             #[cfg(target_os = "linux")]
@@ -2524,7 +2582,7 @@ fn build_stage(
         checkpoints.clear();
         cache_hit = true;
         if options.progress {
-            eprintln!("  CACHED (verified local stage); all instructions");
+            report!("  CACHED (verified local stage); all instructions");
         }
     }
     #[cfg(target_os = "linux")]
@@ -2533,7 +2591,7 @@ fn build_stage(
     }
     if !*notice && steps.iter().any(|s| matches!(s, Step::Run { .. })) {
         *notice = true;
-        eprintln!(
+        report!(
             "Note: Weld runs trusted Dockerfiles only; RUN commands can access the Pod's devices and process information."
         );
     }
@@ -2579,7 +2637,7 @@ fn build_stage(
                         replay_receipt = Some(prepared.receipt);
                         transferred = true;
                         if options.progress {
-                            eprintln!(
+                            report!(
                                 "[weld]   Reusing owned parent filesystem at its last FROM use (no replay)"
                             );
                         }
@@ -2719,13 +2777,13 @@ fn build_stage(
                 match recorded {
                     Ok(Some(baseline)) => {
                         if options.progress {
-                            eprintln!("[weld]   Using verified replay receipt (no replay)");
+                            report!("[weld]   Using verified replay receipt (no replay)");
                         }
                         baseline
                     }
                     Ok(None) | Err(export::Error::Limit(_)) => {
                         if options.progress {
-                            eprintln!(
+                            report!(
                                 "[weld]   Replay receipt budget: using bounded verified baseline capture"
                             );
                         }
@@ -2831,7 +2889,7 @@ fn build_stage(
     for boundary in &checkpoints {
         let started = std::time::Instant::now();
         if options.progress {
-            eprintln!(
+            report!(
                 "[weld] [stage {} instruction {}] {} START",
                 index + 1,
                 boundary.ordinal,
@@ -2848,7 +2906,7 @@ fn build_stage(
                 .all(|step| matches!(step, Step::Directory { path, .. } if path == "/"))
         {
             if options.progress {
-                eprintln!(
+                report!(
                     "[weld] [stage {} instruction {}] FROM DONE (verified base reused)",
                     index + 1,
                     boundary.ordinal
@@ -2865,7 +2923,7 @@ fn build_stage(
                     if let crate::run_mounts::Mount::Secret { id, .. } = mount
                         && !options.run_mounts.secrets.contains_key(id)
                     {
-                        eprintln!(
+                        report!(
                             "Note: optional secret {id}: no secret supplied; target verified absent."
                         );
                     }
@@ -2999,9 +3057,7 @@ fn build_stage(
                 metadata = Some(checkpoint);
                 base_replay_usage = usage;
                 if options.progress {
-                    eprintln!(
-                        "[weld]   Applied cached instruction delta; retained verified prefix"
-                    );
+                    report!("[weld]   Applied cached instruction delta; retained verified prefix");
                 }
                 manifest
             } else {
@@ -3024,7 +3080,7 @@ fn build_stage(
             last_checkpoint = Some((entry.clone(), manifest, boundary.config.clone()));
             instruction_hits += 1;
             if options.progress {
-                eprintln!(
+                report!(
                     "  CACHED instruction {} {} [stage {}] {:.3}s",
                     boundary.ordinal,
                     boundary.operation,
@@ -3038,7 +3094,7 @@ fn build_stage(
         if builder_identity.is_some() {
             instruction_misses += 1;
             if options.progress && options.verbose {
-                eprintln!(
+                report!(
                     "[weld]   Cache miss: {}",
                     if entry.is_some() {
                         "no checkpoint for these inputs and predecessor; executing instruction"
@@ -3132,7 +3188,7 @@ fn build_stage(
                     };
                     let result = worker(
                         &root, &run_state, command, workdir, env, user, options, lease, &run_label,
-                        mounts, resources, &cancelled,
+                        mounts, resources, control, &cancelled,
                     );
                     // Restore even on failed/cancelled RUN; restoration errors are fatal.
                     if let Some(dns) = dns {
@@ -3176,6 +3232,7 @@ fn build_stage(
                 measurements.exported(manifest)
             } else {
                 export_stage(
+                    control,
                     &root,
                     &snapshot,
                     &checkpoint_config,
@@ -3278,7 +3335,7 @@ fn build_stage(
             last_checkpoint = Some((snapshot, manifest, boundary.config.clone()));
         }
         if options.progress {
-            eprintln!(
+            report!(
                 "[weld] [stage {} instruction {}] {} DONE {:.3}s",
                 index + 1,
                 boundary.ordinal,
@@ -3290,7 +3347,7 @@ fn build_stage(
     }
     check(&cancelled)?;
     if options.progress && builder_identity.is_some() {
-        eprintln!(
+        report!(
             "[weld] Stage {} cache: {} instruction hits, {} misses; {} new layer bytes",
             index + 1,
             instruction_hits,
@@ -3300,7 +3357,7 @@ fn build_stage(
     }
     if !export_image {
         if options.progress {
-            eprintln!("[weld]   Keeping COPY-only stage filesystem; no intermediate image export");
+            report!("[weld]   Keeping COPY-only stage filesystem; no intermediate image export");
         }
         return Ok(StageResult {
             work,
@@ -3375,6 +3432,7 @@ fn build_stage(
         manifest.clone()
     } else {
         export_stage(
+            control,
             &root,
             &output,
             &config,
@@ -3601,6 +3659,7 @@ fn worker(
     log_label: &str,
     mounts: &[crate::run_mounts::Mount],
     resources: Option<&crate::build_resources::Policy>,
+    control: Option<&ManagedControl<'_>>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -3648,7 +3707,7 @@ fn worker(
             _ => false,
         });
         if hide_output {
-            eprintln!("[weld] Secret RUN: stdout/stderr suppressed to protect secret data.");
+            report!("[weld] Secret RUN: stdout/stderr suppressed to protect secret data.");
         }
         let failure = std::cell::RefCell::new(None);
         let last = std::cell::Cell::new(std::time::Instant::now());
@@ -3675,6 +3734,7 @@ fn worker(
             lease,
             log_label,
             hide_output,
+            control,
             &monitor,
         );
         // worker_command returns only after the lease guard has reaped descendants.
@@ -3695,7 +3755,7 @@ fn worker(
     {
         let _ = (
             root, state, command, wd, env, user, options, lease, log_label, mounts, resources,
-            cancelled,
+            control, cancelled,
         );
         Err("RUN mounts require Linux".into())
     }
@@ -3717,8 +3777,12 @@ fn worker_command(
     lease: Option<&crate::store_lease::StoreLease>,
     log_label: &str,
     hide_output: bool,
+    control: Option<&ManagedControl<'_>>,
     c: &impl Fn() -> bool,
 ) -> Result<()> {
+    if let Some(control) = control {
+        control.check_output()?;
+    }
     let timeout = options.limits.run_timeout_seconds;
     let mut cmd = crate::lease_process::command(std::env::current_exe()?, lease)?;
     cmd.env("RPWELD_BUILD_WORKER", "1").env(
@@ -3747,10 +3811,14 @@ fn worker_command(
     #[cfg(target_os = "linux")]
     let sinks = if options.progress && !hide_output {
         use std::os::fd::AsFd;
-        Some((
-            crate::progress::RunOutput::new(io::stdout().as_fd(), stop_output.clone())?,
-            crate::progress::RunOutput::new(io::stderr().as_fd(), stop_output.clone())?,
-        ))
+        Some(if let Some(control) = control {
+            control.output().forwarding(stop_output.clone())?
+        } else {
+            (
+                crate::progress::RunOutput::new(io::stdout().as_fd(), stop_output.clone())?,
+                crate::progress::RunOutput::new(io::stderr().as_fd(), stop_output.clone())?,
+            )
+        })
     } else {
         None
     };
@@ -3758,6 +3826,9 @@ fn worker_command(
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     } else if options.progress {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    } else if let Some(control) = control {
+        let (stdout, stderr) = control.output().inherited()?;
+        cmd.stdout(stdout).stderr(stderr);
     }
     #[cfg(target_os = "linux")]
     let started = std::time::Instant::now();
@@ -4197,6 +4268,76 @@ mod tests {
     }
     #[test]
     #[cfg(target_os = "linux")]
+    fn concrete_managed_entry_exports_and_preserves_atomic_and_resource_failures() {
+        use crate::{build_record, build_resources, store_lease::StoreLease};
+        use std::sync::atomic::AtomicBool;
+
+        for outcome in ["success", "cancelled", "resource"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut o = options(temp.path());
+            let store = tempfile::tempdir_in(temp.path()).unwrap();
+            let lease = StoreLease::shared(store.path(), &|| false).unwrap();
+            let mut record = build_record::BuildRecord::allocate(
+                store.path(),
+                &lease,
+                None,
+                None,
+                vec![],
+                false,
+            )
+            .unwrap();
+            o.work = record.path.join("work");
+            o.output = record.path.join("image");
+            o.managed_cache = Some(store.path().to_owned());
+            o.export_mode = ExportMode::Layered;
+            fs::write(o.context.join("payload"), b"managed bytes").unwrap();
+            let paths = build_resources::Paths {
+                work: o.work.clone(),
+                output: o.output.clone(),
+                store: store.path().to_owned(),
+            };
+            let snapshot = build_resources::Snapshot::observe(&paths).unwrap();
+            let mut policy =
+                build_resources::Policy::resolve(paths, &snapshot, Default::default(), 1, 0)
+                    .unwrap();
+            if outcome == "resource" {
+                policy.paths.work = temp.path().join("not-a-directory");
+                fs::write(&policy.paths.work, b"resource observation must refuse this").unwrap();
+            }
+            let cancelled = AtomicBool::new(outcome == "cancelled");
+            let result = build_managed_recorded(
+                "FROM scratch\nCOPY payload /payload\n",
+                &o,
+                &lease,
+                &mut record,
+                &policy,
+                &cancelled,
+            );
+            if outcome == "success" {
+                let result = result.unwrap();
+                assert_eq!(record.record.phase, build_record::Phase::ImageReady);
+                let image =
+                    image::load_layout(&result.output, None, o.limits.image, || false).unwrap();
+                assert_eq!(image.selected, result.manifest);
+                assert!(store.path().join("cache-v2/entries").is_dir());
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(if outcome == "cancelled" {
+                        "build cancelled"
+                    } else {
+                        "resource observation"
+                    }),
+                    "{error}"
+                );
+                assert_eq!(record.record.phase, build_record::Phase::Failed);
+                assert!(!o.work.exists() && !o.output.exists());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn generated_gzip_measurement_is_bound_and_admitted_before_checkpoint_respool() {
         let t = tempfile::tempdir().unwrap();
         let o = options(t.path());
@@ -4207,6 +4348,7 @@ mod tests {
         let config = json!({"os":"linux","architecture":"amd64","config":{}});
         let mut measurements = LayerMeasurements::default();
         export_stage(
+            None,
             &root,
             &o.output,
             &config,

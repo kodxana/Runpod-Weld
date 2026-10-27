@@ -1048,7 +1048,9 @@ impl MountGuard {
 impl Drop for MountGuard {
     fn drop(&mut self) {
         if !self.finished && (self.restore().is_err() || self.remove_discard().is_err()) {
-            eprintln!("rpweld: RUN mount restoration failed; no checkpoint may be published");
+            crate::progress::diagnostic(format_args!(
+                "rpweld: RUN mount restoration failed; no checkpoint may be published"
+            ));
         }
     }
 }

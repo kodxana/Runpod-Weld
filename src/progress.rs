@@ -58,15 +58,29 @@ pub(crate) fn forward_output(
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::RunOutput;
+#[cfg(target_os = "linux")]
+pub use linux::{Output, OutputScope, OutputWriter};
+
+/// Report through the current pinned sinks, when a CLI/build scope is active.
+pub fn diagnostic(args: std::fmt::Arguments<'_>) {
+    #[cfg(target_os = "linux")]
+    if let Some(output) = Output::current() {
+        output.diagnostic(args);
+        return;
+    }
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{args}");
+}
 
 #[cfg(target_os = "linux")]
 mod linux {
     use std::{
+        cell::RefCell,
         fs::{File, OpenOptions},
         io::{self, Write},
         os::{
-            fd::{AsRawFd, BorrowedFd},
-            unix::fs::OpenOptionsExt,
+            fd::{AsFd, AsRawFd, BorrowedFd},
+            unix::fs::{MetadataExt, OpenOptionsExt},
         },
         sync::{
             Arc,
@@ -74,11 +88,162 @@ mod linux {
         },
     };
 
+    struct Sink {
+        file: File,
+        blocked: AtomicBool,
+    }
+
+    /// Pinned actual stdout/stderr objects, shared by CLI reporting and the build.
+    /// Replacing fd 1/2 does not redirect these handles. The cooperative process
+    /// contract excludes replacing our private descriptors or changing shared flags.
+    /// This is not an OS immutability or hostile-workload boundary.
+    #[derive(Clone)]
+    pub struct Output(Arc<[Sink; 2]>);
+
+    thread_local! {
+        static OUTPUT: RefCell<Option<Output>> = const { RefCell::new(None) };
+    }
+
+    /// Thread-local reporting scope; keep alive through final/failure reporting.
+    pub struct OutputScope {
+        previous: Option<Output>,
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for OutputScope {
+        fn drop(&mut self) {
+            OUTPUT.with(|output| *output.borrow_mut() = self.previous.take());
+        }
+    }
+
+    impl Output {
+        pub fn capture() -> io::Result<Self> {
+            Self::from_fds(io::stdout().as_fd(), io::stderr().as_fd())
+        }
+
+        fn from_fds(stdout: BorrowedFd<'_>, stderr: BorrowedFd<'_>) -> io::Result<Self> {
+            let sink = |fd: BorrowedFd<'_>| -> io::Result<Sink> {
+                Ok(Sink {
+                    file: File::from(fd.try_clone_to_owned()?),
+                    blocked: AtomicBool::new(false),
+                })
+            };
+            Ok(Self(Arc::new([sink(stdout)?, sink(stderr)?])))
+        }
+
+        pub fn enter(&self) -> OutputScope {
+            OutputScope {
+                previous: OUTPUT.with(|output| output.replace(Some(self.clone()))),
+                _thread: std::marker::PhantomData,
+            }
+        }
+
+        pub(crate) fn current() -> Option<Self> {
+            OUTPUT.with(|output| output.borrow().clone())
+        }
+
+        pub(crate) fn current_or_capture() -> io::Result<Self> {
+            Self::current().map_or_else(Self::capture, Ok)
+        }
+
+        pub fn stdout(&self) -> OutputWriter {
+            self.writer(0)
+        }
+
+        fn writer(&self, index: usize) -> OutputWriter {
+            OutputWriter {
+                output: self.clone(),
+                index,
+            }
+        }
+
+        pub fn diagnostic(&self, args: std::fmt::Arguments<'_>) {
+            let _ = writeln!(self.writer(1), "{args}");
+        }
+
+        pub(crate) fn check(&self) -> io::Result<()> {
+            self.writer(0).check()?;
+            self.writer(1).check()
+        }
+
+        /// Call only with quiescent RUN/forwarding writers, before admission.
+        /// An alias poisons the sink before returning, including on error unwind.
+        pub(crate) fn check_payload(&self, file: &File) -> io::Result<()> {
+            let result = (|| {
+                let payload = file.metadata()?;
+                for sink in self.0.iter() {
+                    let actual = sink.file.metadata()?;
+                    if (payload.dev(), payload.ino()) == (actual.dev(), actual.ino()) {
+                        sink.blocked.store(true, Ordering::Release);
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                for sink in self.0.iter() {
+                    sink.blocked.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
+            self.check()
+        }
+
+        pub(crate) fn inherited(&self) -> io::Result<(std::process::Stdio, std::process::Stdio)> {
+            self.check()?;
+            Ok((
+                self.0[0].file.try_clone()?.into(),
+                self.0[1].file.try_clone()?.into(),
+            ))
+        }
+
+        pub(crate) fn forwarding(
+            &self,
+            stop: Arc<AtomicBool>,
+        ) -> io::Result<(RunOutput, RunOutput)> {
+            self.check()?;
+            let mut out = RunOutput::new(self.0[0].file.as_fd(), stop.clone())?;
+            let mut err = RunOutput::new(self.0[1].file.as_fd(), stop)?;
+            out.protected = Some(self.writer(0));
+            err.protected = Some(self.writer(1));
+            Ok((out, err))
+        }
+    }
+
+    /// Concrete writer to the pinned stdout, with sticky alias rejection.
+    pub struct OutputWriter {
+        output: Output,
+        index: usize,
+    }
+
+    impl OutputWriter {
+        fn check(&self) -> io::Result<()> {
+            if self.output.0[self.index].blocked.load(Ordering::Acquire) {
+                Err(io::Error::other(
+                    "managed output sink aliases a protected payload; output disabled",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Write for OutputWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.check()?;
+            (&self.output.0[self.index].file).write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.check()?;
+            (&self.output.0[self.index].file).flush()
+        }
+    }
+
     /// Interruptible pipe/socket writes without holding Rust's global stdio locks.
     pub(crate) struct RunOutput {
         file: File,
         socket: bool,
         stop: Arc<AtomicBool>,
+        protected: Option<OutputWriter>,
     }
 
     impl RunOutput {
@@ -121,6 +286,7 @@ mod linux {
                 file,
                 socket: kind == libc::S_IFSOCK,
                 stop,
+                protected: None,
             })
         }
     }
@@ -128,6 +294,9 @@ mod linux {
     impl Write for RunOutput {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             loop {
+                if let Some(sink) = &self.protected {
+                    sink.check()?;
+                }
                 let n = unsafe {
                     if self.socket {
                         libc::send(
@@ -174,6 +343,155 @@ mod linux {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{managed_control::ManagedControl, progress::Phase};
+        use std::io::{Read, Seek, SeekFrom};
+
+        fn contents(file: &File) -> Vec<u8> {
+            let mut file = file.try_clone().unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        }
+
+        #[test]
+        fn aliases_disable_phase_forwarding_quiet_and_final_writes_before_error() {
+            for index in 0..2 {
+                for unlinked in [false, true] {
+                    let payload = tempfile::NamedTempFile::new().unwrap();
+                    std::fs::write(payload.path(), b"archived payload").unwrap();
+                    let read = File::open(payload.path()).unwrap();
+                    let writable = OpenOptions::new()
+                        .append(true)
+                        .open(payload.path())
+                        .unwrap();
+                    let other = tempfile::tempfile().unwrap();
+                    let output = if index == 0 {
+                        Output::from_fds(writable.as_fd(), other.as_fd()).unwrap()
+                    } else {
+                        Output::from_fds(other.as_fd(), writable.as_fd()).unwrap()
+                    };
+                    if unlinked {
+                        std::fs::remove_file(payload.path()).unwrap();
+                    }
+                    let scope = output.enter();
+                    let cancelled = AtomicBool::new(false);
+                    let control = ManagedControl::for_test(&cancelled).unwrap();
+                    let (mut stdout, mut stderr) =
+                        output.forwarding(Arc::new(AtomicBool::new(false))).unwrap();
+                    // Existing phases retain their protected output across scope unwind.
+                    let mut pending = Phase::start(false, "pending");
+                    pending.enabled = true;
+                    let error = control
+                        .check_payload(&read.try_clone().unwrap())
+                        .unwrap_err();
+                    assert!(error.to_string().contains("output disabled"));
+                    let mut phase = Phase::start(true, "start");
+                    phase.started -= std::time::Duration::from_secs(11);
+                    phase.tick();
+                    phase.finish();
+                    Phase::start(true, "drop");
+                    crate::progress::diagnostic(format_args!("Secret RUN diagnostic"));
+                    output.diagnostic(format_args!("rpweld: {error}"));
+                    let writes = [
+                        stdout.write_all(b"RUN stdout"),
+                        stderr.write_all(b"RUN stderr"),
+                    ];
+                    assert!(writes[index].is_err());
+                    assert!(
+                        output.inherited().is_err(),
+                        "quiet worker must refuse poisoned output"
+                    );
+                    if index == 0 {
+                        assert!(writeln!(output.stdout(), "final result").is_err());
+                    }
+                    drop(scope);
+                    drop(pending);
+                    assert_eq!(
+                        contents(&read),
+                        b"archived payload",
+                        "index={index}, unlinked={unlinked}"
+                    );
+                    assert!(
+                        !control.cancelled(),
+                        "alias state is not the atomic cancellation token"
+                    );
+                    cancelled.store(true, Ordering::Relaxed);
+                    assert!(control.cancelled());
+                }
+            }
+        }
+
+        #[test]
+        fn pinned_objects_survive_caller_sink_replacement_and_are_cloexec() {
+            let original = tempfile::tempfile().unwrap();
+            let replacement = tempfile::tempfile().unwrap();
+            let caller = original.try_clone().unwrap();
+            let output = Output::from_fds(caller.as_fd(), caller.as_fd()).unwrap();
+            for sink in output.0.iter() {
+                assert_ne!(
+                    unsafe { libc::fcntl(sink.file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                    0
+                );
+            }
+            assert_eq!(
+                unsafe { libc::dup2(replacement.as_raw_fd(), caller.as_raw_fd()) },
+                caller.as_raw_fd()
+            );
+            output.check_payload(&replacement).unwrap();
+            writeln!(output.stdout(), "pinned").unwrap();
+            assert_eq!(contents(&original), b"pinned\n");
+            assert!(contents(&replacement).is_empty());
+            assert!(output.check_payload(&original).is_err());
+            output.diagnostic(format_args!("alias error"));
+            assert!(output.stdout().write_all(b"final").is_err());
+            assert_eq!(contents(&original), b"pinned\n");
+        }
+
+        #[test]
+        fn mount_cleanup_drop_respects_the_poisoned_diagnostic_sink() {
+            use crate::run_mounts::{self, MountGuard};
+            for blocked in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("root");
+                let state = temp.path().join("state");
+                std::fs::create_dir(&root).unwrap();
+                std::fs::create_dir(&state).unwrap();
+                let secret = tempfile::NamedTempFile::new_in(temp.path()).unwrap();
+                let mut options = run_mounts::Options::default();
+                options
+                    .secrets
+                    .insert("token".into(), secret.path().to_owned());
+                let (mounts, _) = run_mounts::parse("--mount=type=secret,id=token true").unwrap();
+                let guard =
+                    MountGuard::prepare(&root, &state, &mounts, &options, None, &|| false).unwrap();
+                // Force the no-replace cleanup rename to fail, exercising actual Drop.
+                std::fs::write(state.join("mount-discard-0"), b"collision").unwrap();
+                let sink = tempfile::tempfile().unwrap();
+                let output = Output::from_fds(sink.as_fd(), sink.as_fd()).unwrap();
+                let _scope = output.enter();
+                if blocked {
+                    assert!(output.check_payload(&sink).is_err());
+                }
+                drop(guard);
+                assert!(root.join("run/secrets/token").exists());
+                let bytes = contents(&sink);
+                if blocked {
+                    assert!(bytes.is_empty());
+                } else {
+                    assert!(
+                        String::from_utf8(bytes)
+                            .unwrap()
+                            .contains("RUN mount restoration failed")
+                    );
+                }
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -204,6 +522,8 @@ pub struct Phase {
     finished: bool,
     detail: RefCell<String>,
     id: u64,
+    #[cfg(target_os = "linux")]
+    output: Option<Output>,
 }
 
 impl Phase {
@@ -225,16 +545,18 @@ impl Phase {
             finished: false,
             detail: RefCell::new(String::new()),
             id,
+            #[cfg(target_os = "linux")]
+            output: Output::current(),
         };
         if enabled {
-            eprintln!("[weld] {}: START", phase.label);
+            phase.report(format_args!("[weld] {}: START", phase.label));
         }
         phase
     }
 
     pub fn tick(&self) {
         if self.enabled && self.is_current() && update_due(&self.last, self.started.elapsed()) {
-            eprintln!(
+            self.report(format_args!(
                 "[weld] {}: {} ({:.0}s elapsed)",
                 self.label,
                 if self.detail.borrow().is_empty() {
@@ -243,12 +565,21 @@ impl Phase {
                     self.detail.borrow().clone()
                 },
                 self.started.elapsed().as_secs_f64()
-            );
+            ));
         }
     }
 
     fn is_current(&self) -> bool {
         ACTIVE.with(|active| active.borrow().last() == Some(&self.id))
+    }
+
+    fn report(&self, args: std::fmt::Arguments<'_>) {
+        #[cfg(target_os = "linux")]
+        if let Some(output) = &self.output {
+            output.diagnostic(args);
+            return;
+        }
+        diagnostic(args);
     }
 
     pub fn detail(&self, detail: String) {
@@ -259,12 +590,12 @@ impl Phase {
     pub fn finish(mut self) {
         self.finished = true;
         if self.enabled {
-            eprintln!(
+            self.report(format_args!(
                 "[weld] {}: DONE {:.3}s {}",
                 self.label,
                 self.started.elapsed().as_secs_f64(),
                 self.detail.borrow()
-            );
+            ));
         }
     }
 }
@@ -275,11 +606,11 @@ impl Drop for Phase {
             ACTIVE.with(|active| active.borrow_mut().retain(|id| *id != self.id));
         }
         if self.enabled && !self.finished {
-            eprintln!(
+            self.report(format_args!(
                 "[weld] {}: FAILED/INTERRUPTED {:.3}s",
                 self.label,
                 self.started.elapsed().as_secs_f64()
-            );
+            ));
         }
     }
 }

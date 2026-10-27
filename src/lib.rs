@@ -21,6 +21,8 @@ mod export_compression;
 pub mod image;
 pub mod layer;
 mod lease_guard;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod managed_control;
 #[cfg(target_os = "linux")]
 pub mod lease_process;
 pub mod oci;

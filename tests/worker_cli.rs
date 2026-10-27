@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
             .unwrap()
             .success()
     );
-    for ((mode, cancel, command), pty) in [
+    for (((mode, cancel, command), pty), managed) in [
         ("plain", false, "flood"),
         ("plain", true, "flood"),
         ("plain", false, "complete"),
@@ -97,6 +97,7 @@ int main(int argc, char **argv) {
     .into_iter()
     .flat_map(|case| [false, true].map(|pty| (case, pty)))
     .filter(|((_, _, command), pty)| !pty || *command != "complete")
+    .flat_map(|case| [false, true].map(|managed| (case, managed)))
     {
         fs::write(
             context.join("Dockerfile"),
@@ -124,9 +125,14 @@ int main(int argc, char **argv) {
         let original_flags = writer
             .as_ref()
             .map(|fd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) });
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rpweld"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rpweld"));
+        cmd.env("RPWELD_HOME", run.path().join("store"));
+        cmd.arg("build");
+        if managed {
+            cmd.args(["-t", "test/managed-output"]);
+        }
+        let mut child = cmd
             .args([
-                "build",
                 "--no-cache",
                 "--progress",
                 mode,
@@ -274,10 +280,14 @@ int main(void) {
         "FROM scratch\nCOPY probe /bin/sh\nRUN ignored\n",
     )
     .unwrap();
-    for (mode, destination) in ["auto", "plain", "quiet"].into_iter().flat_map(|mode| {
-        ["file", "master-nonblocking", "master-blocking", "slave"]
-            .map(|destination| (mode, destination))
-    }) {
+    for ((mode, destination), managed) in ["auto", "plain", "quiet"]
+        .into_iter()
+        .flat_map(|mode| {
+            ["file", "master-nonblocking", "master-blocking", "slave"]
+                .map(|destination| (mode, destination))
+        })
+        .flat_map(|case| [false, true].map(|managed| (case, managed)))
+    {
         let run = tempfile::tempdir_in(tmp.path()).unwrap();
         let out = run.path().join("stdout");
         let err = run.path().join("stderr");
@@ -310,8 +320,14 @@ int main(void) {
             (writer, Some(reader))
         };
         let original_flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rpweld"))
-            .args(["build", "--no-cache", "--progress", mode, "--output"])
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rpweld"));
+        cmd.env("RPWELD_HOME", run.path().join("store"));
+        cmd.arg("build");
+        if managed {
+            cmd.args(["-t", "test/managed-output"]);
+        }
+        let mut child = cmd
+            .args(["--no-cache", "--progress", mode, "--output"])
             .arg(&image)
             .arg("--work-dir")
             .arg(&work)
@@ -375,7 +391,11 @@ int main(void) {
             mode != "quiet"
         );
         if mode == "quiet" {
-            assert!(stdout.starts_with("hello-out\r\npartial\n"));
+            if managed {
+                assert!(stdout.contains("hello-out\r\npartial\n"));
+            } else {
+                assert!(stdout.starts_with("hello-out\r\npartial\n"));
+            }
             // The existing trusted-RUN diagnostic remains visible in quiet mode.
             assert!(stderr.ends_with("hello-err\rtail"));
             assert!(!stderr.contains("[weld]"));
