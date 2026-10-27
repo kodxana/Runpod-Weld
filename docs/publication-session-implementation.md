@@ -4,7 +4,9 @@ The managed Linux CLI uses a per-stage publication session for layered instructi
 checkpoints, implementing [the checkpoint design](checkpoint-verification-design.md)
 with [concrete control and pinned output](managed-control-slice.md). It requires
 no new flag. Flattened, unmanaged and public callback-based builds retain full
-verification. Integrated validation and Pod timing remain pending.
+verification. [Integrated validation and Pod measurements](managed-session-performance.md)
+are complete. Cold builds improved consistently in the two measured pairs;
+application-edit wall time was mixed. No full Nemotron speedup is established.
 
 `ManagedCache::publication_session` borrows the store lease through the cache
 and borrows concrete `ManagedControl`. `publish_instruction` accepts only the
@@ -74,5 +76,6 @@ descriptors produce 29, zero and 27 respectively. Per-object/boundary assertions
 attribute the initial single-descriptor case to three source reads (including
 streamed ingest) and five cache-copy reads. A newly copied source object with an
 already retained digest is hashed independently. These are deterministic unit
-read counts, not a measured end-to-end throughput improvement; broader engine,
-independent review and Pod acceptance remain the parent integration gate.
+read counts, distinct from the end-to-end measurements linked above. Broader
+engine validation, independent review, actual cross-RUN descriptor checks,
+durable-prefix recovery and all 16 Pod acceptance cases subsequently passed.

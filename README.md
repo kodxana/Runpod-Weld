@@ -449,6 +449,12 @@ back to full verification. This applies to the concrete CLI control path under
 the existing cooperative store/trusted-RUN contract; callback-based library APIs
 remain conservative. See [the publication-session contract](docs/publication-session-implementation.md).
 
+A balanced 16-build Pod comparison measured cold builds at 48.9 → 32.4 seconds
+(33.6% less time) for a 1 GiB dependency plus 2,048 small files. Application-edit
+wall time was mixed, including a 53-second run with a blocked startup interval;
+its median was worse. All output checks passed. See [raw measurements and limits](docs/managed-session-performance.md);
+the full Nemotron image has not been remeasured with this change.
+
 With `--no-cache`, intermediate stages used only by `COPY --from` retain their
 owned filesystem without baseline inventory, image serialization, or checkpoint
 verification. The confined copier reads that filesystem directly under the existing

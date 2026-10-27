@@ -1,7 +1,9 @@
 # Managed checkpoint publication session
 
-Status: implemented in the managed Linux CLI; integrated validation and Pod
-measurement are pending. See [the implementation](publication-session-implementation.md)
+Status: implemented and independently reviewed in the managed Linux CLI.
+[Integrated validation and the balanced Pod comparison](managed-session-performance.md)
+are complete: cold builds improved, while application-edit wall time was mixed.
+See [the implementation](publication-session-implementation.md)
 and [the output boundary](managed-control-slice.md). The rationale and source-audit
 constraints below describe the contract this implementation must preserve.
 

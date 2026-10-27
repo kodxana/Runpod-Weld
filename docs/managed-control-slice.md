@@ -6,6 +6,12 @@ control layer does not skip hashes or change cache formats. The integrated
 [publication session](publication-session-implementation.md) uses its closed
 provenance and checked sinks to authorize bounded per-stage evidence reuse.
 
+The focused validation record below preserves this prerequisite slice's history.
+[Subsequent integrated validation](managed-session-performance.md) passed strict
+Clippy without the temporary dead-code exception, Windows GNU compilation/lint,
+actual admitted-session descriptor exclusion across RUN, and SIGKILL-prefix
+recovery. It also records the balanced Pod performance results and their limits.
+
 ## Closed entry and polling
 
 `build::build_managed_recorded(source, options, lease, record, &Policy,
@@ -102,7 +108,9 @@ It also exercises the hidden guard and the complete managed build → guard →
 tracer → static application chain with an identifiable non-CLOEXEC payload at fd
 1024 above a lowered soft limit. The application checks that no such payload
 handle survives. This tests the worker boundary independently of the separately
-implemented publication session, not an already admitted session object.
+implemented publication session, not an already admitted session object. The
+later `cached_managed_runs_close_retained_session_payload_handles`
+integration coverage additionally exercises actual retained session objects.
 
 [`tests/worker_cli.rs`](../tests/worker_cli.rs) retains all existing byte, flag,
 PTY, blocked-consumer, timeout, SIGINT and descendant-reaping assertions and runs

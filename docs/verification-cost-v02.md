@@ -5,9 +5,9 @@ work. For a 1 GiB payload plus 2,048 small files, the instrumented cold build to
 60.09 seconds. OCI verification consumed 47.98 seconds, including 40.01 seconds
 hashing 71.36 GB of data. This is measured attribution, not a claimed speedup.
 
-All eight builds passed independent acceptance. Production code was unchanged;
-the diagnostic only added component accounting. No hash-skipping optimization
-is enabled. Raw measurements, provenance and hashes are in
+All eight builds passed independent acceptance. Production code was unchanged
+during this diagnostic; it only added component accounting. Managed publication
+reuse had not yet been implemented. Raw measurements, provenance and hashes are in
 [v02-verification-cost.json](v02-verification-cost.json).
 
 ## Method
@@ -76,10 +76,11 @@ immutability, and public/cache inode isolation. Deliberate public-output mutatio
 also passed. The diagnostic's local differential tests covered 252 combinations
 of reads, callbacks, errors and output, preserving original operation order.
 
-The [managed publication-session proposal](checkpoint-verification-design.md)
-investigates reusing evidence for continuously owned payloads while still
-durably committing each completed instruction. Its complete write boundary
-remains an unresolved prerequisite. Existing arbitrary-callback APIs, corruption
+The [managed publication-session design](checkpoint-verification-design.md)
+subsequently implemented evidence reuse for continuously owned payloads while
+still durably committing each completed instruction. Its enforced write boundary,
+review, and [balanced Pod results](managed-session-performance.md) are recorded
+separately. Existing arbitrary-callback APIs, corruption
 and healthy-retry tests, ownership checks, durability and public inode isolation
 remain requirements. A publication-wide inode/size memo is not an integrity
 proof; the earlier failed hash-skipping implementation remains rolled back.
