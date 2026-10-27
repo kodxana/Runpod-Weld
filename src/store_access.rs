@@ -43,6 +43,21 @@ pub fn resolved(path: &Path) -> io::Result<PathBuf> {
 /// shortcut: unmarked arbitrary external directories are caller-owned; introduce
 /// ownership records before supporting maintenance of additional store formats.
 pub fn validate_path(path: &Path, lease: Option<&StoreLease>) -> io::Result<()> {
+    validate_path_policy(path, lease, false)
+}
+
+/// Persistent package caches cannot live in areas reserved for build/cache
+/// cleanup. Reject these locations even before an ownership record exists;
+/// later recording a component must not make its package cache disposable.
+pub fn validate_run_cache_path(path: &Path, lease: Option<&StoreLease>) -> io::Result<()> {
+    validate_path_policy(path, lease, true)
+}
+
+fn validate_path_policy(
+    path: &Path,
+    lease: Option<&StoreLease>,
+    persistent_cache: bool,
+) -> io::Result<()> {
     let path = resolved(path)?;
     let configured = resolved(&crate::store_inventory::resolve_store()?)?;
     for ancestor in path.ancestors() {
@@ -80,6 +95,22 @@ pub fn validate_path(path: &Path, lease: Option<&StoreLease>) -> io::Result<()> 
                     "cross-store managed input rejected; copy it outside managed stores first",
                 )
             })?;
+            if persistent_cache
+                && path
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(|p| p.components().next())
+                    .and_then(|c| c.as_os_str().to_str())
+                    .is_some_and(|area| {
+                        area.starts_with("build-")
+                            || area.starts_with(".cleanup-txn-")
+                            || matches!(area, "cache-v1" | "cache-v2" | "base-cache-v1")
+                    })
+            {
+                return Err(io::Error::other(
+                    "RUN cache directory cannot be inside cleanup-owned store areas; use the store's run-cache-v1 or a separate private directory outside build/cache/cleanup areas",
+                ));
+            }
         }
     }
     Ok(())

@@ -45,9 +45,10 @@ the simple identifier grammar above. `mode=0755,uid=0,gid=0` initialize only new
 caches. Existing data retains its ownership and mode. An inherited target must
 be a real directory; its complete tree is temporarily renamed into private
 worker state and restored with the same inode and metadata. Inherited contents
-are not used to seed a new cache. Files, ownership and permission bits are
-copied between package storage and the working target; cache xattrs and original
-timestamps are not part of this compatibility profile.
+are not used to seed a new cache. Files, ownership and permission bits (including
+RUN-created setuid, setgid and sticky bits) are copied between package storage
+and the working target; cache xattrs and original timestamps are not part of
+this compatibility profile.
 
 Omitted `sharing`, `sharing=shared`, and `sharing=locked` all serialize through
 one exclusive flock per package-cache root, including copy-in, RUN and copy-out.
@@ -73,6 +74,11 @@ disables instruction/stage cache reuse but retains package cache reuse.
 unmanaged explicit work/output builds. Its parent must exist. Use a new path;
 Weld never adopts an existing unmarked directory. Cache roots must be disjoint
 from context/work/output/base inputs, secrets and registry credentials/certs.
+Resolved paths beneath any store's reserved `build-*`, `cache-v1`, `cache-v2`,
+`base-cache-v1` or `.cleanup-txn-*` area are refused, including older builds,
+stage work/images and symlink aliases. Those areas can acquire cleanup ownership;
+a nested package-cache record does not protect their descendants from deletion.
+Choose the default `run-cache-v1` or a separate private directory instead.
 
 The root ownership/version record binds its device/inode and persistent lock
 identity. Each digest-named entry has its own record binding namespace, entry,

@@ -80,6 +80,7 @@ fn parser_supports_defaults_multiple_locked_shared_and_rejects_unsafe_profiles()
         "--mount=type=secret,id=x,env=X",
         "--mount=type=secret,id=x,uid=-1",
         "--mount=type=secret,id=x,mode=7777",
+        "--mount=type=cache,target=/a,mode=2775",
         "--mount=type=secret,id=x,required=maybe",
     ] {
         assert!(
@@ -416,6 +417,89 @@ fn namespace_stays_protected_from_cleanup_and_requires_its_store_lease() {
             .all(|e| !e.path.starts_with("run-cache-v1"))
     );
     assert_eq!(fs::read(cache.join("unknown")).unwrap(), b"not owned");
+}
+
+#[test]
+fn persistent_cache_locations_keep_store_boundaries_and_reject_future_cleanup_areas() {
+    let store = tempfile::tempdir().unwrap();
+    let lease = rpweld::store_lease::StoreLease::shared(store.path(), &|| false).unwrap();
+    let mut options = Options::default();
+    for relative in [
+        "build-current/work/packages",
+        "build-older/work/nested/packages",
+        "build-older/stages/stage-0-work/packages",
+        "build-older/stages/stage-0-image/packages",
+        "build-older/image/packages",
+        "cache-v1/stage-one/packages",
+        "cache-v2/staging-one/packages",
+        "base-cache-v1/staging-one/packages",
+        ".cleanup-txn-one/payload/packages",
+    ] {
+        // Reject even before a future build/retirement records these components.
+        let cache = store.path().join(relative);
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        options.cache_dir = Some(cache);
+        let error = run_mounts::validate_inputs(&options, &[], Some(&lease)).unwrap_err();
+        assert!(
+            error.to_string().contains("cleanup-owned"),
+            "{relative}: {error}"
+        );
+    }
+    let outside = tempfile::tempdir().unwrap();
+    let alias = outside.path().join("stage-alias");
+    symlink(store.path().join("build-older/stages"), &alias).unwrap();
+    options.cache_dir = Some(alias.join("stage-0-work/new-cache"));
+    assert!(
+        run_mounts::validate_inputs(&options, &[], Some(&lease))
+            .unwrap_err()
+            .to_string()
+            .contains("cleanup-owned")
+    );
+    for path in [
+        store.path().join("run-cache-v1"),
+        store.path().join("custom-packages"),
+    ] {
+        options.cache_dir = Some(path);
+        run_mounts::validate_inputs(&options, &[], Some(&lease)).unwrap();
+        assert!(run_mounts::validate_inputs(&options, &[], None).is_err());
+    }
+    let other = tempfile::tempdir().unwrap();
+    let other_lease = rpweld::store_lease::StoreLease::shared(other.path(), &|| false).unwrap();
+    options.cache_dir = Some(other.path().join("run-cache-v1"));
+    assert!(
+        run_mounts::validate_inputs(&options, &[], Some(&lease))
+            .unwrap_err()
+            .to_string()
+            .contains("cross-store")
+    );
+    run_mounts::validate_inputs(&options, &[], Some(&other_lease)).unwrap();
+    options.cache_dir = Some(outside.path().join("packages"));
+    run_mounts::validate_inputs(&options, &[], None).unwrap();
+}
+
+#[test]
+fn cache_copy_preserves_root_directory_and_file_special_mode_bits() {
+    let f = Fixture::new();
+    let guard = f.prepare("--mount=type=cache,id=modes,target=/cache");
+    fs::create_dir(f.root.join("cache/sticky")).unwrap();
+    fs::write(f.root.join("cache/executable"), b"contents").unwrap();
+    let modes = [
+        ("cache", 0o2775),
+        ("cache/sticky", 0o1777),
+        ("cache/executable", 0o6755),
+    ];
+    for (path, mode) in modes {
+        fs::set_permissions(f.root.join(path), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    guard.finish(true, None, &|| false).unwrap();
+    let guard = f.prepare("--mount=type=cache,id=modes,target=/cache");
+    for (path, mode) in modes {
+        let meta = fs::metadata(f.root.join(path)).unwrap();
+        assert_eq!(meta.mode() & 0o7777, mode, "{path}");
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        assert_eq!(meta.gid(), unsafe { libc::getegid() });
+    }
+    guard.finish(false, None, &|| false).unwrap();
 }
 
 #[test]

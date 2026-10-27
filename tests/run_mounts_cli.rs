@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -63,6 +63,181 @@ impl Fixture {
         );
         output
     }
+    fn automatic(&self, dockerfile: &str, cache: Option<&Path>) -> Output {
+        fs::write(self.context.join("Dockerfile"), dockerfile).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rpweld"));
+        cmd.env("RPWELD_HOME", &self.store)
+            .args(["build", "--no-host-dns", "--no-cache"]);
+        if let Some(cache) = cache {
+            cmd.arg("--cache-mount-dir").arg(cache);
+        } else {
+            cmd.args(["-t", "mount-test:local"]);
+        }
+        cmd.arg(&self.context).output().unwrap()
+    }
+    fn cleanup(&self, id: &str, dry_run: bool) -> serde_json::Value {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rpweld"));
+        cmd.env("RPWELD_HOME", &self.store)
+            .args(["builds", "rm", id, "--json"]);
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+}
+
+#[test]
+#[ignore = "requires root, static /bin/busybox, chroot and ptrace"]
+fn custom_cache_refuses_older_cleanup_owned_work_and_stages() {
+    let f = Fixture::new();
+    f.run(
+        "external-one",
+        "RUN --mount=type=cache,id=custom,target=/cache echo retained > /cache/value",
+        false,
+    );
+    let output = f.automatic("FROM scratch AS tools\nCOPY busybox /tool\nFROM scratch\nCOPY --from=tools /tool /bin/sh\n", None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let older = fs::read_dir(&f.store)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.join("build-record.json").is_file())
+        .unwrap();
+    let id = older.file_name().unwrap().to_str().unwrap();
+    assert!(older.join("stages/stage-0-work").is_dir());
+    fs::create_dir(older.join("work/nested")).unwrap();
+    let alias = f.temp.path().join("older-work-alias");
+    symlink(older.join("work"), &alias).unwrap();
+    let source = "FROM scratch\nCOPY busybox /bin/sh\nRUN --mount=type=cache,id=custom,target=/cache echo retained > /cache/value\n";
+    let paths = [
+        older.join("work/packages"),
+        older.join("work/nested/packages"),
+        older.join("stages/stage-0-work/packages"),
+        older.join("image/packages"),
+        alias.join("aliased-packages"),
+    ];
+    let results: Vec<_> = paths.iter().map(|p| f.automatic(source, Some(p))).collect();
+    // Exercise the actual CLI maintenance protocol, not merely a path predicate.
+    let plan = f.cleanup(id, true);
+    for component in ["work", "stages/stage-0-work"] {
+        let selected = format!("{id}/{component}");
+        assert!(
+            plan["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["path"] == selected),
+            "{plan}"
+        );
+    }
+    f.cleanup(id, false);
+    assert!(!older.join("work").exists());
+    assert!(!older.join("stages/stage-0-work").exists());
+    for (path, result) in paths.iter().zip(results) {
+        assert!(
+            !result.status.success(),
+            "accepted cleanup-owned cache {}; cleanup subsequently removed it: {}",
+            path.display(),
+            !path.exists()
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("cleanup-owned"),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    // An external private namespace survives cleanup and needs no store lease.
+    f.run(
+        "external-two",
+        "RUN --mount=type=cache,id=custom,target=/cache test -f /cache/value",
+        false,
+    );
+}
+
+#[test]
+#[ignore = "requires root and static /bin/busybox"]
+fn custom_cache_keeps_current_work_output_and_credential_guards() {
+    let f = Fixture::new();
+    let work = f.temp.path().join("work-current");
+    fs::create_dir(&work).unwrap();
+    let alias = f.temp.path().join("current-work-alias");
+    symlink(&work, &alias).unwrap();
+    for cache in [
+        work.join("packages"),
+        alias.join("packages"),
+        f.temp.path().join("out-current/packages"),
+    ] {
+        let output = f
+            .command("current", "RUN true", true)
+            .arg("--cache-mount-dir")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("must be disjoint"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!cache.exists());
+    }
+    let credentials = f.temp.path().join("credentials");
+    fs::create_dir(&credentials).unwrap();
+    fs::set_permissions(&credentials, fs::Permissions::from_mode(0o700)).unwrap();
+    let auth = credentials.join("auth.json");
+    fs::write(&auth, b"{}").unwrap();
+    fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+    for (option, path) in [("--authfile", &auth), ("--cert-dir", &credentials)] {
+        let output = f
+            .command("credentials", "RUN true", true)
+            .arg("--cache-mount-dir")
+            .arg(&credentials)
+            .arg(option)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("credentials and certificates must be disjoint"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(&auth).unwrap(), b"{}");
+        assert!(!credentials.join("owner.json").exists());
+    }
+}
+
+#[test]
+#[ignore = "requires root, static /bin/busybox, chroot and ptrace"]
+fn cache_preserves_special_modes_numeric_ownership_and_nonroot_reuse() {
+    let f = Fixture::new();
+    f.run("modes-create", "RUN --mount=type=cache,id=modes,target=/cache /bin/busybox mkdir /cache/group /cache/sticky; /bin/busybox chown 1234:2345 /cache/group /cache/sticky; /bin/busybox chmod 2775 /cache/group; /bin/busybox chmod 1777 /cache/sticky", false);
+    let data = fs::read_dir(f.temp.path().join("packages"))
+        .unwrap()
+        .map(|e| e.unwrap().path().join("data"))
+        .find(|p| p.is_dir())
+        .unwrap();
+    for (name, mode) in [("group", 0o2775), ("sticky", 0o1777)] {
+        let meta = fs::metadata(data.join(name)).unwrap();
+        assert_eq!(
+            (meta.mode() & 0o7777, meta.uid(), meta.gid()),
+            (mode, 1234, 2345)
+        );
+    }
+    f.run("modes-reuse", "USER 3456:2345\nRUN --mount=type=cache,id=modes,target=/cache test \"$(/bin/busybox stat -c %a /cache/group)\" = 2775 && test \"$(/bin/busybox stat -c %a /cache/sticky)\" = 1777 && echo group > /cache/group/child && echo sticky > /cache/sticky/child", false);
+    let meta = fs::metadata(data.join("group/child")).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (3456, 2345));
+    assert_eq!(fs::metadata(data.join("sticky/child")).unwrap().uid(), 3456);
 }
 
 fn assert_no_bytes(path: &Path, needle: &[u8]) {

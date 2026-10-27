@@ -149,7 +149,7 @@ pub fn validate_inputs(
         .map(crate::store_access::resolved)
         .transpose()?;
     if let Some(cache) = &cache {
-        crate::store_access::validate_path(cache, lease)?;
+        crate::store_access::validate_run_cache_path(cache, lease)?;
         if excluded
             .iter()
             .any(|p| cache.starts_with(p) || p.starts_with(cache))
@@ -602,9 +602,11 @@ fn scan_tree(
     Ok(())
 }
 fn set_metadata(file: &File, mode: u32, uid: u32, gid: u32) -> io::Result<()> {
-    // SAFETY: fd is owned and live, numeric IDs validated at the parser boundary.
+    // SAFETY: fd is owned and live. IDs come from the parser or source metadata.
     cvt(unsafe { libc::fchown(file.as_raw_fd(), uid, gid) })?;
-    file.set_permissions(fs::Permissions::from_mode(mode & 0o777))
+    // chown can clear special bits: restore the full copied mode afterward.
+    // The parser separately restricts initialization modes to 0777.
+    file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))
 }
 fn copy(
     source: &File,
