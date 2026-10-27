@@ -14,6 +14,7 @@ use std::{
 struct Fixture {
     temp: tempfile::TempDir,
     mount: CString,
+    metadata_budget: u64,
 }
 
 impl Fixture {
@@ -49,7 +50,11 @@ impl Fixture {
             },
             0
         );
-        Self { temp, mount }
+        Self {
+            temp,
+            mount,
+            metadata_budget: 64 << 20,
+        }
     }
 
     fn path(&self, path: &str) -> PathBuf {
@@ -84,11 +89,9 @@ impl Fixture {
                 "--max-layer-bytes",
                 "419430400",
                 "--metadata-budget",
-                "67108864",
-                "--max-entries",
-                "100000",
-                "--max-rootfs-bytes",
             ])
+            .arg(self.metadata_budget.to_string())
+            .args(["--max-entries", "100000", "--max-rootfs-bytes"])
             .arg(root_limit.to_string())
             .arg("--work-dir")
             .arg(self.path(work))
@@ -479,7 +482,7 @@ fn baseline_reuses_initial_replay_without_allocating_intermediate_roots() {
     }
     assert!(output.status.success(), "{}", log(&output));
     assert!(minimum >= 256 << 20, "baseline crossed reserve: {minimum}");
-    assert!(log(&output).contains("Capturing verified base filesystem (no replay)"));
+    assert!(log(&output).contains("Using verified replay receipt (no replay)"));
     assert!(fixture.path("output/index.json").is_file());
     let mut remaining: Vec<_> = fs::read_dir(fixture.path("limited/work"))
         .unwrap()
@@ -630,7 +633,7 @@ fn baseline_reuses_verified_gzip_without_a_second_decompression() {
         log(&output)
     );
     assert!(
-        log(&output).contains("Capturing verified base filesystem (no replay)"),
+        log(&output).contains("Using verified replay receipt (no replay)"),
         "{}",
         log(&output)
     );
@@ -639,4 +642,97 @@ fn baseline_reuses_verified_gzip_without_a_second_decompression() {
         "{}",
         log(&output)
     );
+}
+
+#[test]
+#[ignore = "requires root and CAP_SYS_ADMIN; disposable 512 MiB tmpfs"]
+fn receipt_fallback_admits_measured_gzip_spool_before_decompression() {
+    let mut fixture = Fixture::new(16384);
+    fixture.metadata_budget = 160_000;
+    let plain = [
+        fixture.plain_layer(&[("first", b'0', 120 << 20, None)]),
+        fixture.plain_layer(&[("second", b'0', 60 << 20, None)]),
+    ];
+    let mut ids: Vec<_> = plain.iter().map(|layer| layer["digest"].clone()).collect();
+    let mut layers: Vec<_> = plain
+        .iter()
+        .map(|layer| {
+            let encoded = layer["digest"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("sha256:")
+                .unwrap();
+            let mut file = fs::File::open(fixture.path("base/blobs/sha256").join(encoded)).unwrap();
+            let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::copy(&mut file, &mut gzip).unwrap();
+            fixture.blob(
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                &gzip.finish().unwrap(),
+            )
+        })
+        .collect();
+    // Historical targets exhaust only optional receipt storage; the final tree is small.
+    for i in 0..60 {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        tar.append_link(
+            &mut header,
+            "link",
+            if i % 2 == 0 { "a" } else { "b" }.repeat(4000),
+        )
+        .unwrap();
+        let bytes = tar.into_inner().unwrap();
+        let descriptor = fixture.blob("application/vnd.oci.image.layer.v1.tar", &bytes);
+        ids.push(descriptor["digest"].clone());
+        layers.push(descriptor);
+    }
+    fixture.base_layers(&layers, &ids);
+    let mut minimum = fixture.available();
+    let output = fixture.build_at(
+        "FROM local\nLABEL changed=yes\n",
+        400 << 20,
+        "limited/work",
+        "output",
+        || minimum = minimum.min(fixture.available()),
+    );
+    assert!(!output.status.success(), "{}", log(&output));
+    assert!(
+        log(&output).contains("using bounded verified baseline capture"),
+        "{}",
+        log(&output)
+    );
+    assert!(
+        log(&output).contains("verifying measured baseline spool"),
+        "{}",
+        log(&output)
+    );
+    assert!(
+        !log(&output).contains("Layer(Cancelled)"),
+        "{}",
+        log(&output)
+    );
+    assert!(minimum >= 256 << 20, "fallback crossed reserve: {minimum}");
+    eprintln!(
+        "fallback gzip minimum free bytes: {minimum}; reserve: {}",
+        256 << 20
+    );
+    let root = fixture.path("limited/work/rootfs");
+    for (name, size) in [("first", 120 << 20), ("second", 60 << 20)] {
+        assert_eq!(fs::metadata(root.join(name)).unwrap().len(), size);
+    }
+    assert_eq!(
+        fs::read_link(root.join("link")).unwrap(),
+        PathBuf::from("b".repeat(4000))
+    );
+    assert!(
+        fs::read_dir(fixture.path("limited/work/spool"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(!fixture.path("output/index.json").exists());
+    assert!(!fixture.path("store/tags").exists());
 }

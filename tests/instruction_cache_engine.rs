@@ -17,12 +17,22 @@ fn never_cancel() -> bool {
 
 #[test]
 fn cached_parent_receipt_exhaustion_falls_back_to_verified_replay() {
+    cached_parent_receipt_fallback(160_000);
+}
+
+#[test]
+fn cached_parent_receipt_and_retained_metadata_share_the_limit() {
+    // The historical receipt fits alone; retaining the manifest/config alongside it does not.
+    cached_parent_receipt_fallback(260_000);
+}
+
+fn cached_parent_receipt_fallback(metadata_limit: u64) {
     use std::os::unix::fs::symlink;
     let t = tempfile::tempdir().unwrap();
     let mut o = options(t.path());
     o.export_mode = build::ExportMode::Layered;
     o.limits.image.max_descriptors = 500;
-    o.limits.export.max_metadata_bytes = 160_000;
+    o.limits.export.max_metadata_bytes = metadata_limit;
     for name in ["a", "b"] {
         fs::create_dir(o.context.join(name)).unwrap();
         symlink(name.repeat(4000), o.context.join(name).join("link")).unwrap();
@@ -36,13 +46,24 @@ fn cached_parent_receipt_exhaustion_falls_back_to_verified_replay() {
     }
     source.push_str("FROM parent\nLABEL version=one\n");
     let mut cold = None;
-    for phase in ["cold", "warm"] {
-        if phase == "warm" {
+    for phase in ["cold", "warm", "child-edit", "edited-warm", "fresh-cache"] {
+        if phase != "cold" {
             next(&mut o, t.path(), phase);
+        }
+        if phase == "child-edit" {
+            source = source.replace("version=one", "version=two");
+            cold = None;
+        }
+        if phase == "fresh-cache" {
+            let cache = t.path().join("fresh-cache");
+            fs::create_dir(&cache).unwrap();
+            o.cache = Some(cache);
         }
         build::build(&source, &o, never_cancel).unwrap();
         let output = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
-        if let Some(manifest) = &cold {
+        if phase != "fresh-cache"
+            && let Some(manifest) = &cold
+        {
             assert_eq!(
                 &output.selected, manifest,
                 "warm replay preserves exact output"
@@ -50,6 +71,14 @@ fn cached_parent_receipt_exhaustion_falls_back_to_verified_replay() {
         } else {
             cold = Some(output.selected.clone());
         }
+        assert_eq!(
+            output.config["config"]["Labels"]["version"],
+            if matches!(phase, "cold" | "warm") {
+                "one"
+            } else {
+                "two"
+            }
+        );
         assert_eq!(
             fs::read_link(o.work.join("rootfs/tree/link")).unwrap(),
             PathBuf::from("b".repeat(4000))

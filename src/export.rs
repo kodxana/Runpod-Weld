@@ -60,13 +60,6 @@ pub struct Baseline {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        dead_code,
-        reason = "Standalone replay admission is exercised by internal regression tests; the engine uses replay receipts"
-    )
-)]
 pub(crate) enum CaptureAllocation<'a> {
     Spool {
         path: &'a Path,
@@ -1799,10 +1792,12 @@ mod linux {
         struct Capped {
             bytes: Vec<u8>,
             cap: u64,
+            exceeded: bool,
         }
         impl Write for Capped {
             fn write(&mut self, b: &[u8]) -> io::Result<usize> {
                 if b.len() as u64 > self.cap - self.bytes.len() as u64 {
+                    self.exceeded = true;
                     return Err(io::Error::other("metadata byte limit"));
                 }
                 self.bytes.extend_from_slice(b);
@@ -1815,10 +1810,31 @@ mod linux {
         let mut out = Capped {
             bytes: Vec::new(),
             cap: *remaining,
+            exceeded: false,
         };
-        serde_json::to_writer(&mut out, value)?;
+        let serialized = serde_json::to_writer(&mut out, value);
+        if out.exceeded {
+            return Err(Error::Limit("metadata bytes"));
+        }
+        serialized?;
         charge(remaining, out.bytes.len() as u64)?;
         Ok(out.bytes)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn json_metadata_limit_retains_its_error_kind() {
+        let value = json!({"label": "value"});
+        let expected = serde_json::to_vec(&value).unwrap();
+        let mut exact = expected.len() as u64;
+        assert_eq!(json_bytes(&value, &mut exact).unwrap(), expected);
+        assert_eq!(exact, 0);
+        let mut short = expected.len() as u64 - 1;
+        assert!(matches!(
+            json_bytes(&value, &mut short),
+            Err(Error::Limit("metadata bytes"))
+        ));
+        assert_eq!(short, expected.len() as u64 - 1);
     }
     fn blob(
         store: &BlobStore,

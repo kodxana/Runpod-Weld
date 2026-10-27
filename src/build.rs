@@ -2666,12 +2666,11 @@ fn build_stage(
                 phase.tick();
                 cancelled()
             };
-            if cache_hit
-                && let Some(receipt) = &replay_receipt
+            if let Some(receipt) = &replay_receipt
                 && !receipt.can_record(&root, &verified, applying)?
             {
-                // Cached-parent handoff is optional; continue verified replay
-                // without recording rather than failing or retrying a partial layer.
+                // Recording is an optimization. A child that needs a baseline
+                // can use bounded verified capture after replay completes.
                 replay_receipt = None;
             }
             if let Some(receipt) = &mut replay_receipt {
@@ -2700,24 +2699,109 @@ fn build_stage(
         preparation.finish();
     }
     let mut baseline = if export_image && options.export_mode == ExportMode::Layered && !cache_hit {
-        let phase = crate::progress::Phase::start(
-            options.progress,
-            "  Capturing verified base filesystem (no replay)",
-        );
+        let phase =
+            crate::progress::Phase::start(options.progress, "  Capturing verified base filesystem");
         let capturing = || {
             phase.tick();
             cancelled()
         };
         let baseline = match (&base_path, &metadata, replay_receipt.take()) {
-            (Some(layout), Some(metadata), Some(receipt)) => export::Baseline::capture_replayed(
-                &root,
-                layout,
-                metadata,
-                receipt,
-                options.limits.export,
-                options.limits.image.max_layer_bytes,
-                capturing,
-            )?,
+            (Some(layout), Some(metadata), receipt) => {
+                let recorded = receipt
+                    .map(|receipt| {
+                        export::Baseline::capture_replayed(
+                            &root,
+                            layout,
+                            metadata,
+                            receipt,
+                            options.limits.export,
+                            options.limits.image.max_layer_bytes,
+                            capturing,
+                        )
+                    })
+                    .transpose();
+                match recorded {
+                    Ok(Some(baseline)) => {
+                        if options.progress {
+                            eprintln!("[weld]   Using verified replay receipt (no replay)");
+                        }
+                        baseline
+                    }
+                    Ok(None) | Err(export::Error::Limit(_)) => {
+                        if options.progress {
+                            eprintln!(
+                                "[weld]   Replay receipt budget: using bounded verified baseline capture"
+                            );
+                        }
+                        resource_check(
+                            resources,
+                            "creating temporary baseline replay",
+                            &[crate::build_resources::Requirement {
+                                path: spool.clone(),
+                                bytes: 65536,
+                                inodes: 8,
+                            }],
+                        )?;
+                        export::Baseline::capture_with_admission(
+                            &root,
+                            layout,
+                            None,
+                            &spool,
+                            options.limits.export,
+                            options.limits.image,
+                            options.limits.layer,
+                            export::ReplayLimits {
+                                max_bytes: options.limits.max_replay_bytes,
+                                max_entries: options.limits.max_replay_entries,
+                            },
+                            |allocation| {
+                                let result: Result<()> = match allocation {
+                                    export::CaptureAllocation::Spool { path, descriptor } => {
+                                        let diff = metadata
+                                            .layers
+                                            .iter()
+                                            .zip(&metadata.diff_ids)
+                                            .find_map(|(known, diff)| {
+                                                (known == descriptor).then_some(diff)
+                                            })
+                                            .ok_or(export::Error::Invalid(
+                                                "baseline descriptor identity changed",
+                                            ))?;
+                                        let bytes = measurements
+                                            .spool_bytes(descriptor, diff)
+                                            .map_err(|error| {
+                                                export::Error::Io(io::Error::other(
+                                                    error.to_string(),
+                                                ))
+                                            })?
+                                            .ok_or(export::Error::Invalid(
+                                                "missing verified baseline spool measurement",
+                                            ))?;
+                                        resource_check(
+                                            resources,
+                                            "verifying measured baseline spool",
+                                            &[crate::build_resources::Requirement {
+                                                path: path.to_owned(),
+                                                bytes,
+                                                inodes: 1,
+                                            }],
+                                        )
+                                        .map_err(Into::into)
+                                    }
+                                    export::CaptureAllocation::Replay { root, layer } => {
+                                        check_replay_space(resources, root, layer, &capturing)
+                                    }
+                                };
+                                result.map_err(|error| {
+                                    export::Error::Io(io::Error::other(error.to_string()))
+                                })
+                            },
+                            capturing,
+                        )?
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             (None, None, None) => {
                 export::Baseline::scratch(&root, options.limits.export, capturing)?
             }
