@@ -13,9 +13,6 @@
 //! Errors leave partial owned work/output directories for manual inspection;
 //! nothing recursively deletes user trees. Never reuse a failed build directory.
 
-#[cfg(not(target_os = "linux"))]
-use std::process::Command;
-
 use crate::{
     build_plan::{self, Base, CopySource, InstructionKind as I, Protocol, Run},
     context, export, image, layer,
@@ -23,15 +20,14 @@ use crate::{
     rootfs,
 };
 use serde_json::{Value, json};
-#[cfg(target_os = "linux")]
-use std::time::Duration;
 use std::{
     collections::BTreeMap,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::Stdio,
 };
+#[cfg(target_os = "linux")]
+use std::{process::Stdio, time::Duration};
 
 /// Errors include underlying parser, image, filesystem, worker and export errors.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -3709,6 +3705,7 @@ fn worker(
     clippy::too_many_arguments,
     reason = "Retains captured RUN state alongside the existing process and lease parameters"
 )]
+#[cfg(target_os = "linux")]
 fn worker_command(
     root: &Path,
     state: &Path,
@@ -3723,13 +3720,7 @@ fn worker_command(
     c: &impl Fn() -> bool,
 ) -> Result<()> {
     let timeout = options.limits.run_timeout_seconds;
-    #[cfg(target_os = "linux")]
     let mut cmd = crate::lease_process::command(std::env::current_exe()?, lease)?;
-    #[cfg(not(target_os = "linux"))]
-    let mut cmd = {
-        let _ = lease;
-        Command::new(std::env::current_exe()?)
-    };
     cmd.env("RPWELD_BUILD_WORKER", "1").env(
         "RPWELD_TRACE_VERBOSE",
         if options.verbose { "1" } else { "0" },
@@ -3831,11 +3822,6 @@ fn worker_command(
             return Err(format!("RUN worker failed: {status}").into());
         }
         Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (child, timeout, c, log_label);
-        Err("RUN requires Linux".into())
     }
 }
 
