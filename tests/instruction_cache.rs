@@ -191,6 +191,16 @@ impl Project {
     }
 
     fn build_at(&self, serial: usize, args: &[&str], cancel_on_marker: bool, tag: &str) -> Build {
+        self.build_at_signal(serial, args, cancel_on_marker.then_some(libc::SIGINT), tag)
+    }
+
+    fn build_at_signal(
+        &self,
+        serial: usize,
+        args: &[&str],
+        signal: Option<i32>,
+        tag: &str,
+    ) -> Build {
         let work = self.temp.path().join(format!("work-{serial}"));
         let image = self.temp.path().join(format!("image-{serial}"));
         let stdout = self.temp.path().join(format!("stdout-{serial}"));
@@ -224,8 +234,11 @@ impl Project {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            if cancel_on_marker && !cancelled && work.join("rootfs/cancel-ready").exists() {
-                assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+            if let Some(signal) = signal
+                && !cancelled
+                && work.join("rootfs/cancel-ready").exists()
+            {
+                assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
                 cancelled = true;
             }
             if start.elapsed() > Duration::from_secs(90) {
@@ -238,7 +251,7 @@ impl Project {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        if cancel_on_marker {
+        if signal.is_some() {
             assert!(cancelled, "RUN did not reach cancellation marker");
         }
         Build {
@@ -802,6 +815,52 @@ fn failed_and_cancelled_runs_do_not_publish_success_or_replace_tag() {
         assert!(recovered.executed("recovery"), "{}", recovered.log);
         assert_eq!(recovered.read("result"), b"offline-example==1\n");
     }
+}
+
+#[test]
+#[ignore = "requires Linux root and RPWELD_TEST_LAYOUT (local Alpine OCI)"]
+fn killed_builder_preserves_completed_instruction_and_previous_tag() {
+    let mut p = Project::new("python");
+    p.build(&[]).ok();
+    let tag = p.tag();
+    let prefix = "FROM alpine\nCOPY requirements.txt /requirements\nRUN printf 'IC_EXEC_%s\\n' durable; cp /requirements /installed\n";
+    p.write("Dockerfile", &format!("{prefix}RUN printf 'IC_EXEC_%s\\n' interrupted; printf '%s' \"$$\" > /interrupted-pid; touch /cancel-ready; sleep 30\n"));
+    p.serial += 1;
+    let killed = p.build_at_signal(p.serial, &[], Some(libc::SIGKILL), "instruction-cache:test");
+    assert!(!killed.success, "{}", killed.log);
+    assert!(
+        killed.executed("durable"),
+        "prefix was not newly completed: {}",
+        killed.log
+    );
+    assert!(!killed.image.exists());
+    assert_eq!(tag, p.tag(), "abrupt exit replaced the previous tag");
+    let pid: i32 = String::from_utf8(killed.read("interrupted-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let started = Instant::now();
+    while Path::new("/proc").join(pid.to_string()).exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "killed builder left workload {pid}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    p.write(
+        "Dockerfile",
+        &format!("{prefix}RUN printf 'IC_EXEC_%s\\n' recovered; cp /installed /result\n"),
+    );
+    let retried = p.build(&[]);
+    retried.ok();
+    retried.cached(3, "RUN");
+    assert!(
+        !retried.executed("durable"),
+        "durable prefix lost: {}",
+        retried.log
+    );
+    assert!(retried.executed("recovered"), "{}", retried.log);
+    assert_eq!(retried.read("result"), b"offline-example==1\n");
 }
 
 #[test]

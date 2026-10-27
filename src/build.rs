@@ -1630,18 +1630,15 @@ impl StageCache<'_> {
         crate::build_cache::lookup(entry, self.lease)
     }
 
-    fn publish(
+    fn check_publication_space(
         &self,
         source: &Path,
         entry: &Path,
-        targets: &[Vec<Vec<u8>>],
         limits: Limits,
         resources: Option<&crate::build_resources::Policy>,
         cancelled: &impl Fn() -> bool,
     ) -> Result<()> {
         if let Some(control) = self.control {
-            // PublicationSession admission belongs here once an owned exporter
-            // checkpoint is available; this slice retains all existing hashes.
             control.check_output()?;
         }
         let shared_pool = {
@@ -1663,7 +1660,19 @@ impl StageCache<'_> {
             shared_pool.as_deref(),
             limits,
             cancelled,
-        )?;
+        )
+    }
+
+    fn publish(
+        &self,
+        source: &Path,
+        entry: &Path,
+        targets: &[Vec<Vec<u8>>],
+        limits: Limits,
+        resources: Option<&crate::build_resources::Policy>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<()> {
+        self.check_publication_space(source, entry, limits, resources, cancelled)?;
         #[cfg(target_os = "linux")]
         if let Some(managed) = &self.managed {
             let key = entry
@@ -2881,6 +2890,17 @@ fn build_stage(
         None
     };
     let mut prior_identity = metadata.as_ref().map(|m| m.selected.digest.to_string());
+    #[cfg(target_os = "linux")]
+    let mut publication_session: Option<crate::oci::PublicationSession<'_, '_, '_>> =
+        if builder_identity.is_some() && baseline.is_some() {
+            stage_cache
+                .as_ref()
+                .and_then(|cache| cache.managed.as_ref())
+                .zip(control)
+                .map(|(cache, control)| cache.publication_session(control, options.limits.image))
+        } else {
+            None
+        };
     let mut last_checkpoint: Option<(PathBuf, Descriptor, Value)> = None;
     let mut instruction_hits = 0usize;
     let mut instruction_misses = 0usize;
@@ -3211,23 +3231,58 @@ fn build_stage(
                 "  Exporting instruction checkpoint",
             );
             let mut next_baseline = None;
+            #[cfg(target_os = "linux")]
+            let mut owned_checkpoint = None;
             let exported = if let Some(base) = &baseline {
+                let encoding = export::Encoding {
+                    compression: options.compression,
+                    max_blob_bytes: options.limits.image.max_layer_bytes,
+                };
+                let exporting = || {
+                    phase.tick();
+                    cancelled()
+                };
+                #[cfg(target_os = "linux")]
+                let (mut manifest, next) =
+                    if let Some(control) = control.filter(|_| publication_session.is_some()) {
+                        export::export_managed_checkpoint(
+                            &root,
+                            &snapshot,
+                            &checkpoint_config,
+                            base,
+                            options.limits.export,
+                            encoding,
+                            resources,
+                            control,
+                            exporting,
+                        )?
+                    } else {
+                        export::export_checkpoint(
+                            &root,
+                            &snapshot,
+                            &checkpoint_config,
+                            base,
+                            options.limits.export,
+                            encoding,
+                            resources,
+                            exporting,
+                        )?
+                    };
+                #[cfg(not(target_os = "linux"))]
                 let (manifest, next) = export::export_checkpoint(
                     &root,
                     &snapshot,
                     &checkpoint_config,
                     base,
                     options.limits.export,
-                    export::Encoding {
-                        compression: options.compression,
-                        max_blob_bytes: options.limits.image.max_layer_bytes,
-                    },
+                    encoding,
                     resources,
-                    || {
-                        phase.tick();
-                        cancelled()
-                    },
+                    exporting,
                 )?;
+                #[cfg(target_os = "linux")]
+                {
+                    owned_checkpoint = manifest.owned_checkpoint.take();
+                }
                 next_baseline = Some(next);
                 measurements.exported(manifest)
             } else {
@@ -3313,22 +3368,57 @@ fn build_stage(
             phase.finish();
             check(&cancelled)?;
             if let Some(entry) = entry {
-                let publication = crate::progress::Phase::start(
-                    options.progress,
-                    "  Publishing instruction cache",
-                );
-                stage_cache.as_ref().unwrap().publish(
-                    &snapshot,
-                    &entry,
-                    &copy_targets[receipt_start..],
-                    options.limits,
-                    resources,
-                    &|| {
-                        publication.tick();
-                        cancelled()
-                    },
-                )?;
-                publication.finish();
+                #[cfg(target_os = "linux")]
+                let managed_publication = if let (Some(session), Some(checkpoint)) =
+                    (publication_session.as_mut(), owned_checkpoint.as_ref())
+                {
+                    let cache = stage_cache.as_ref().unwrap();
+                    cache.check_publication_space(
+                        &snapshot,
+                        &entry,
+                        options.limits,
+                        resources,
+                        &cancelled,
+                    )?;
+                    let key = entry
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or("invalid cache key")?;
+                    session.publish_instruction(
+                        checkpoint,
+                        key,
+                        options.limits.image,
+                        &copy_targets[receipt_start..],
+                        options.limits.layer.max_metadata_bytes,
+                    )?;
+                    true
+                } else {
+                    // Missing provenance or FD headroom ends reuse for this stage.
+                    if let Some(mut session) = publication_session.take() {
+                        session.invalidate();
+                    }
+                    false
+                };
+                #[cfg(not(target_os = "linux"))]
+                let managed_publication = false;
+                if !managed_publication {
+                    let publication = crate::progress::Phase::start(
+                        options.progress,
+                        "  Publishing instruction cache",
+                    );
+                    stage_cache.as_ref().unwrap().publish(
+                        &snapshot,
+                        &entry,
+                        &copy_targets[receipt_start..],
+                        options.limits,
+                        resources,
+                        &|| {
+                            publication.tick();
+                            cancelled()
+                        },
+                    )?;
+                    publication.finish();
+                }
             }
             // Even an unkeyable COPY must replace the prior filesystem identity.
             prior_identity = Some(manifest.digest.to_string());
@@ -3344,6 +3434,11 @@ fn build_stage(
             );
         }
         start = boundary.end;
+    }
+    // Public output and final stage publication always perform complete verification.
+    #[cfg(target_os = "linux")]
+    if let Some(mut session) = publication_session.take() {
+        session.invalidate();
     }
     check(&cancelled)?;
     if options.progress && builder_identity.is_some() {
