@@ -576,6 +576,135 @@ fn ingest_and_final_layout_validation_still_detect_mid_publication_corruption() 
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FinalVerificationBoundary {
+    BeforeBufferHash,
+    AfterLayoutVerification,
+}
+
+fn corrupt_at_final_verification_boundary(reused: bool, boundary: FinalVerificationBoundary) {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    if reused {
+        publish(&cache, &source, 1);
+    }
+    let root = t.path().join("cache-v2");
+    let pooled = layer_path(&root.join("content"), &layer);
+    let buffered = Cell::new(false);
+    let mutated = Cell::new(false);
+    let result = cache.publish(&source, &key(2), limits(), &[], 0, &|| {
+        if !mutated.get() {
+            // Observe this operation's pending layer handle, without depending
+            // on callback counts or opening another handle to the payload.
+            let pending_position = fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(Result::ok)
+                .find_map(|entry| {
+                    let path = fs::read_link(entry.path()).ok()?;
+                    let relative = path.strip_prefix(root.join("entries")).ok()?;
+                    if !relative
+                        .components()
+                        .next()?
+                        .as_os_str()
+                        .to_str()?
+                        .starts_with(".publish-")
+                        || path.file_name()? != &layer.digest[7..]
+                    {
+                        return None;
+                    }
+                    let info =
+                        fs::read_to_string(Path::new("/proc/self/fdinfo").join(entry.file_name()))
+                            .unwrap();
+                    Some(
+                        info.lines()
+                            .find_map(|line| line.strip_prefix("pos:"))
+                            .unwrap()
+                            .trim()
+                            .parse::<u64>()
+                            .unwrap(),
+                    )
+                });
+            if pending_position == Some(layer.size as u64) {
+                buffered.set(true);
+            }
+            let inject = match boundary {
+                // verify_stream calls cancellation after read, before hash.update.
+                FinalVerificationBoundary::BeforeBufferHash => {
+                    pending_position == Some(layer.size as u64)
+                }
+                // The last layer is hashed, rewound and closed before the next
+                // callback, at the final pool verification boundary.
+                FinalVerificationBoundary::AfterLayoutVerification => {
+                    buffered.get() && pending_position.is_none()
+                }
+            };
+            if inject {
+                let before = fs::metadata(&pooled).unwrap();
+                fs::write(&pooled, vec![43; layer.size as usize]).unwrap();
+                let after = fs::metadata(&pooled).unwrap();
+                assert_eq!(
+                    (before.dev(), before.ino(), before.len()),
+                    (after.dev(), after.ino(), after.len()),
+                );
+                mutated.set(true);
+            }
+        }
+        false
+    });
+    assert!(
+        mutated.get(),
+        "injection not reached: {boundary:?}, reused={reused}"
+    );
+    let destination = root.join("entries").join(key(2));
+    let validation = result.as_ref().ok().map(|path| {
+        image::load_layout(path, None, limits(), || false)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    });
+    assert!(
+        result.is_err(),
+        "accepted corrupt publication: {boundary:?}, reused={reused}, committed={}, validation={validation:?}",
+        destination.exists()
+    );
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("SHA-256"), "{error}");
+    assert!(!destination.exists());
+    assert_eq!(fs::read(&pooled).unwrap(), vec![43; 4096]);
+    assert_eq!(
+        fs::read(layer_path(&source, &layer)).unwrap(),
+        vec![42; 4096]
+    );
+}
+
+#[test]
+fn final_pool_verification_rejects_new_blob_corrupted_before_buffer_hash() {
+    corrupt_at_final_verification_boundary(false, FinalVerificationBoundary::BeforeBufferHash);
+}
+
+#[test]
+fn final_pool_verification_rejects_reused_blob_corrupted_before_buffer_hash() {
+    corrupt_at_final_verification_boundary(true, FinalVerificationBoundary::BeforeBufferHash);
+}
+
+#[test]
+fn final_pool_verification_rejects_new_blob_corrupted_after_layout_verification() {
+    corrupt_at_final_verification_boundary(
+        false,
+        FinalVerificationBoundary::AfterLayoutVerification,
+    );
+}
+
+#[test]
+fn final_pool_verification_rejects_reused_blob_corrupted_after_layout_verification() {
+    corrupt_at_final_verification_boundary(
+        true,
+        FinalVerificationBoundary::AfterLayoutVerification,
+    );
+}
+
 #[test]
 fn replacement_corruption_is_isolated_but_even_valid_detached_blobs_are_rejected() {
     let t = tempfile::tempdir().unwrap();

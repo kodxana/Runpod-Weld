@@ -244,7 +244,6 @@ impl<'a> ManagedCache<'a> {
             receipt_metadata_limit,
             instructions,
             cancelled,
-            None,
         )?;
         self.audit_links(cancelled)?;
         Ok(Some(path))
@@ -333,7 +332,6 @@ impl<'a> ManagedCache<'a> {
             receipt_metadata_limit,
             targets.len(),
             cancelled,
-            Some(&verified),
         )?;
         sync_dirs(
             &self.root,
@@ -623,10 +621,6 @@ impl<'a> ManagedCache<'a> {
         Ok(budget)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "publication evidence is explicit and never stored on the cache"
-    )]
     fn verify_entry(
         &self,
         path: &Path,
@@ -635,7 +629,6 @@ impl<'a> ManagedCache<'a> {
         receipt_metadata_limit: u64,
         instructions: usize,
         cancelled: &impl Fn() -> bool,
-        verified: Option<&BTreeMap<String, VerifiedBlob>>,
     ) -> Result<(image::ImageMetadata, Vec<Vec<Vec<u8>>>)> {
         check(cancelled)?;
         let directory = private_dir(path)?;
@@ -679,13 +672,8 @@ impl<'a> ManagedCache<'a> {
         for (descriptor, cap) in descriptors(&metadata, limits) {
             let digest = descriptor.digest.parse::<crate::oci::Sha256Digest>()?;
             names.insert(digest.encoded().to_owned());
-            let pooled = match verified {
-                Some(blobs) => blobs
-                    .get(&descriptor.digest)
-                    .ok_or("cache publication has no verified blob")?
-                    .open(&pool, descriptor, cap, cancelled)?,
-                None => pool.open_verified(descriptor, cap, cancelled)?,
-            };
+            // Linking evidence must not replace this final content check.
+            let pooled = pool.open_verified(descriptor, cap, cancelled)?;
             let local = fs::symlink_metadata(path.join("blobs/sha256").join(digest.encoded()))?;
             if identity(&pooled.metadata()?) != identity(&local) {
                 return Err("cache blob is not the owned pool inode".into());
@@ -716,7 +704,6 @@ impl<'a> ManagedCache<'a> {
             receipt_metadata_limit,
             instructions,
             cancelled,
-            None,
         )?;
         self.audit_links(cancelled)?;
         self.sync_objects()?;
@@ -1658,7 +1645,7 @@ mod tests {
                 result.unwrap();
                 observations.push((reads, bytes));
             }
-            let expected = 2 * copies as u64 + 1;
+            let expected = 3 * copies as u64 + 1;
             eprintln!("payload copies={copies}: new/reused {observations:?}");
             assert_eq!(
                 observations,
