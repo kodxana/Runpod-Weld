@@ -286,6 +286,15 @@ impl BlobStore {
     ) -> Result<File, Error> {
         let (digest, size) = descriptor.expected(max_size)?;
         check_cancel(&cancelled)?;
+        let mut file = self.open_file(&digest)?;
+        verify_stream(&mut file, None, &digest, size, &cancelled)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
+    // Structural opening only. Cache publication may use this for a verified
+    // ingest stream or an inode already verified within its publication lock.
+    fn open_file(&self, digest: &Sha256Digest) -> Result<File, Error> {
         check_directories(&self.directory)?;
         let path = self.directory.join(digest.encoded());
         let metadata = fs::symlink_metadata(&path)?;
@@ -299,12 +308,10 @@ impl BlobStore {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        let mut file = options.open(&path)?;
+        let file = options.open(&path)?;
         if !file.metadata()?.is_file() {
             return Err(Error::UnsafePath(path));
         }
-        verify_stream(&mut file, None, &digest, size, &cancelled)?;
-        file.seek(SeekFrom::Start(0))?;
         Ok(file)
     }
 
@@ -410,7 +417,48 @@ fn verify_stream<R: Read>(
     if format!("{:x}", hash.finalize()) != digest.encoded() {
         return Err(Error::DigestMismatch);
     }
+    #[cfg(all(test, target_os = "linux"))]
+    hash_reads::record(digest, observed);
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod hash_reads {
+    use super::Sha256Digest;
+    use std::cell::RefCell;
+
+    // Enabled only around one synchronous test operation, isolated from other tests.
+    std::thread_local! {
+        static OBSERVATION: RefCell<Option<(String, u64, u64)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(digest: &Sha256Digest, bytes: u64) {
+        OBSERVATION.with_borrow_mut(|slot| {
+            if let Some((wanted, reads, total)) = slot
+                && wanted == digest.as_str()
+            {
+                *reads += 1;
+                *total += bytes;
+            }
+        });
+    }
+
+    pub(super) fn observe<T>(digest: &str, operation: impl FnOnce() -> T) -> (T, u64, u64) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                OBSERVATION.with_borrow_mut(|slot| *slot = None);
+            }
+        }
+        OBSERVATION.with_borrow_mut(|slot| {
+            assert!(slot.is_none(), "nested hash-read observation");
+            *slot = Some((digest.into(), 0, 0));
+        });
+        let _reset = Reset;
+        let result = operation();
+        let (_, reads, bytes) = OBSERVATION.with_borrow_mut(|slot| slot.take().unwrap());
+        (result, reads, bytes)
+    }
 }
 fn is_link(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]

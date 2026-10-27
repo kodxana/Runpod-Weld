@@ -489,6 +489,94 @@ fn in_place_corruption_poisoning_is_detected_and_never_repaired() {
 }
 
 #[test]
+fn same_size_corruption_is_reverified_between_publications_and_lookups() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let entry = publish(&cache, &source, 1);
+    let pooled = layer_path(&entry, &layer);
+    fs::write(&pooled, vec![43; layer.size as usize]).unwrap();
+    assert!(cache.lookup(&key(1), limits(), 1024, 1, &|| false).is_err());
+    for n in [1, 2] {
+        let error = cache
+            .publish(&source, &key(n), limits(), &[vec![]], 1024, &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("SHA-256"), "{error}");
+    }
+    assert_eq!(fs::read(pooled).unwrap(), vec![43; 4096]);
+    assert!(!t.path().join("cache-v2/entries").join(key(2)).exists());
+}
+
+#[test]
+fn corrupt_source_is_not_masked_by_an_owned_object_or_existing_winner() {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let winner = publish(&cache, &source, 1);
+    fs::write(layer_path(&source, &layer), vec![43; layer.size as usize]).unwrap();
+    for n in [1, 2] {
+        let error = cache
+            .publish(&source, &key(n), limits(), &[vec![]], 1024, &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("SHA-256"), "{error}");
+    }
+    assert!(lookup(&cache, 1));
+    assert_eq!(
+        fs::read(layer_path(&winner, &layer)).unwrap(),
+        vec![42; 4096]
+    );
+}
+
+#[test]
+fn ingest_and_final_layout_validation_still_detect_mid_publication_corruption() {
+    for corrupt_source in [true, false] {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        let layer = fixture(&source, 1);
+        let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+        let mutated = Cell::new(false);
+        let root = t.path().join("cache-v2");
+        let error = cache
+            .publish(&source, &key(1), limits(), &[], 0, &|| {
+                if !mutated.get() {
+                    let ready = if corrupt_source {
+                        fs::read_dir(root.join("objects")).unwrap().any(|entry| {
+                            entry
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".ingest-")
+                        })
+                    } else {
+                        fs::read_dir(root.join("entries"))
+                            .unwrap()
+                            .any(|entry| layer_path(&entry.unwrap().path(), &layer).exists())
+                    };
+                    if ready {
+                        let path = if corrupt_source {
+                            layer_path(&source, &layer)
+                        } else {
+                            layer_path(&root.join("content"), &layer)
+                        };
+                        fs::write(path, vec![43; layer.size as usize]).unwrap();
+                        mutated.set(true);
+                    }
+                }
+                false
+            })
+            .unwrap_err();
+        assert!(mutated.get(), "corruption injection was not reached");
+        assert!(error.to_string().contains("SHA-256"), "{error}");
+        assert!(!root.join("entries").join(key(1)).exists());
+    }
+}
+
+#[test]
 fn replacement_corruption_is_isolated_but_even_valid_detached_blobs_are_rejected() {
     let t = tempfile::tempdir().unwrap();
     let source = t.path().join("source");
