@@ -820,11 +820,12 @@ pub(super) fn inherit(
     base: &Baseline,
     store: &BlobStore,
     delta: &Descriptor,
+    diff_id: &crate::oci::Sha256Digest,
     output: &mut Value,
     remaining: &mut u64,
     c: &impl Fn() -> bool,
 ) -> Result<Vec<Descriptor>, Error> {
-    inherit_with_sharing(base, store, delta, output, remaining, false, c)
+    inherit_with_sharing(base, store, delta, diff_id, output, remaining, false, c)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -832,6 +833,7 @@ pub(super) fn inherit_with_sharing(
     base: &Baseline,
     store: &BlobStore,
     delta: &Descriptor,
+    diff_id: &crate::oci::Sha256Digest,
     output: &mut Value,
     remaining: &mut u64,
     share_owned: bool,
@@ -873,7 +875,7 @@ pub(super) fn inherit_with_sharing(
         .iter()
         .map(|id| Value::String(id.as_str().to_owned()))
         .collect();
-    ids.push(Value::String(delta.digest.clone()));
+    ids.push(Value::String(diff_id.as_str().to_owned()));
     output["rootfs"] = json!({"type":"layers", "diff_ids":ids});
     if let Some(history) = &state.history {
         json_bytes(history, remaining)?;
@@ -1611,6 +1613,7 @@ mod tests {
                 &baseline,
                 &store,
                 descriptor,
+                &descriptor.digest.parse().unwrap(),
                 &mut config,
                 &mut remaining,
                 &|| {

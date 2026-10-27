@@ -5,7 +5,9 @@ mod export_compression;
 
 use export_compression::{Compression, EncodedLayer, LayerWriter, Limits, payload_peak};
 use flate2::read::GzDecoder;
-use rpweld::{image, layer, rootfs};
+use rpweld::layer;
+#[cfg(target_os = "linux")]
+use rpweld::{image, rootfs};
 use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},

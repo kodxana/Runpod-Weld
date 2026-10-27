@@ -1,10 +1,17 @@
 # Bounded new-layer gzip export
 
-This isolated implementation adds `src/export_compression.rs`. It does not register
-the module or change production exports, build options, CLI flags, defaults, or
-cache identity. The parent integration owns those changes. Existing public export
-functions must retain their behavior. Gzip is an explicit opt-in pending the parent
-review, compatibility gates, and actual Pod measurements.
+Builds accept `--compression uncompressed|gzip`. Uncompressed is the default;
+layered export remains the default layout mode. Gzip encodes only newly generated
+layers with level one. Inherited descriptors, media types, bytes, extensions,
+annotations and diffIDs remain unchanged. The library exposes
+`rpweld::export::Compression` through `BuildOptions.compression`; existing
+standalone `export_layout` and `export_delta_layout` APIs still write raw tar.
+Both stage and instruction cache identities include compression. Builder identity
+also changes with the executable, covering encoder/backend changes.
+
+Gzip is opt-in: the local random-data benchmark below found roughly 6.8x slower
+encoding. Smaller blobs are not a build-speed guarantee; no Pod performance claim
+or registry compatibility result is made here.
 
 ## Integration contract
 
@@ -25,17 +32,19 @@ let (_, encoded) = tar.into_inner()?.finish()?;
 // encoded.uncompressed_bytes: includes tar headers, padding, and end markers
 ```
 
-The parent registers the internal module, substitutes the writer only for NEW
-tar/delta bytes, and passes `encoded.diff_id` into config rootfs history and next
-checkpoint/baseline state. Original base descriptor objects, extensions,
+The exporter substitutes the writer only for new tar/delta bytes and passes
+`encoded.diff_id` into config rootfs history and next checkpoint/baseline state. Original base descriptor objects, extensions,
 annotations, media types, and blob bytes bypass this helper. Public destination
 blobs still need independent inodes; no hardlink to a mutable work/base store.
 
-Use the stored limit for `publish_export` and `layer::verify.max_blob_bytes`; use
-the raw limit for `layer::verify.max_uncompressed_bytes`. Pass the separate
-`encoded.diff_id` to verification, not the stored descriptor digest. Gzip header
-budget is 10 bytes. The parent publishes the index last and discards its private
-spool/output on failure. The helper has no filesystem paths or publication API.
+The build engine uses `image::Limits.max_layer_bytes` for the stored ceiling and
+`export::Limits.max_layer_bytes` for the independent raw ceiling. The stored limit
+applies to `publish_export` and `layer::verify.max_blob_bytes`; the raw limit applies
+to `layer::verify.max_uncompressed_bytes`. Verification uses `encoded.diff_id`,
+separate from the stored descriptor digest. Generated gzip headers use a ten-byte
+budget. The exporter publishes the index last and drops its owned pending spool on
+failure. Partial owned output directories can remain for diagnosis. The helper has
+no filesystem paths or publication API.
 
 Gzip uses pinned flate2 1.1.10 / miniz_oxide 0.9.1, level 1, mtime 0, OS 255, no
 filename, comment, or extra fields. The exact header is
@@ -156,18 +165,56 @@ generation and all iterations; RSS is an observation, not an enforced limit.
 
 ## Verification boundary
 
-The isolated test harness compiles the actual internal source by path without
-changing `lib.rs`. Tests cover independent raw/stored bounds and exact thresholds,
+The original isolated test harness still compiles the helper source by path. Tests cover independent raw/stored bounds and exact thresholds,
 checked overflow before writes, deterministic headers and repeated/chunked bytes,
 partial and interrupted writes, sticky I/O errors, cancellation through footer and
 finish, discarded private spools with no blob/index publication, compressed digest
 and raw diff ID, corruption/CRC/truncation/suffix rejection, and actual exporter tar
 replay with hardlinks, symlinks, permissions, ownership, timestamps, and xattrs.
 
-Parent integration still needs its actual CLI/config/cache/checkpoint end-to-end
-tests and preservation checks for inherited descriptor extension objects. This
-isolated helper never accepts those objects. The parent also owns final Pod and
-registry compatibility/performance gates and any eventual default decision.
+Production regression coverage includes CLI defaults and both spellings, independent
+raw/stored caps through the gzip footer, cancellation with no index publication,
+stored digests versus diffIDs, both export modes, cache hits and cross-mode misses,
+opaque inherited gzip descriptors and bytes, public inode isolation, cold/warm
+checkpoint metadata, measured export space and post-export pre-spool admission.
+The original source-path helper harness remains in place.
+
+The engine retains raw-size measurements for one build only, keyed by stored digest,
+media type, stored size and diffID. Export returns these measurements with its
+manifest; successful imported/cache verification adds its measured size too. Every
+later verification (including `verify_fresh_checkpoint`, flattened restore and
+cross-stage replay) admits the known raw spool before writing it. All hashes,
+parsers and replay budgets are still verified. No unsigned persistent size hint is
+trusted. Initially unknown gzip expansion retains streaming limits and cooperative
+reserve checks; observations neither reserve disk nor impose quotas.
+
+`tests/fixtures/layered-export/gzip_acceptance.py` is an opt-in local Alpine runtime
+fixture. It exercises RUN, whiteouts and replacements, hardlinks, symlinks,
+ownership, permissions, xattrs/capabilities, configuration, no-cache stage handoff,
+and export/reimport in both modes and both encodings. Its independent Python/GNU
+tar oracle compares the complete replayed filesystem, including atime and mtime;
+explicit root timestamps are also checked. Run with a fresh native evidence path:
+
+```sh
+python3 tests/fixtures/layered-export/gzip_acceptance.py \
+  --binary /path/to/rpweld --layout /path/to/offline-alpine \
+  --evidence /var/tmp/new-gzip-evidence
+```
+
+Integration validation (2026-10-27, WSL Ubuntu root, Rust 1.90.0): the full
+`cargo test --offline` suite passed (592 tests, 51 ignored; subprocess self-runs
+excluded). The subsequently added parser test and expanded gzip checkpoint-sharing
+case also passed, as did all 11 source-path helper tests. `cargo fmt --check`,
+`cargo clippy --offline --all-targets --all-features -- -D warnings`,
+`cargo doc --offline --no-deps`, and the same strict Clippy check targeting
+`x86_64-pc-windows-gnu` passed. The local Alpine fixture at
+`/var/tmp/weld-build-cli.Njymxj/base` passed all six runtime/reimport cases, with
+logs and results under `/var/tmp/weld-gzip-runtime-38d9-v1`. The full replay comparison
+passed without timestamp exclusions, including the explicit root timestamps.
+No Pod, registry, push or release checks were performed for this integration.
+
+The following validation counts describe the original isolated helper, before
+production integration:
 
 Completed on the stated WSL toolchain: `cargo fmt --check`,
 `cargo clippy --offline --all-targets --all-features -- -D warnings`,

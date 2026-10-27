@@ -9,6 +9,30 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[test]
+fn compression_cli_contract() {
+    let help = Command::new(env!("CARGO_BIN_EXE_rpweld"))
+        .args(["build", "--help"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--compression"));
+    for args in [
+        vec!["--compression", "zip"],
+        vec!["--compression=gzip", "--compression=uncompressed"],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_rpweld"))
+            .arg("build")
+            .args(args)
+            .args(["-f", "does-not-exist", "."])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(error.contains("compression"), "{error}");
+        assert!(!error.contains("unknown build option"), "{error}");
+    }
+}
+
+#[test]
 fn export_mode_rejects_unknown_values_before_opening_sources() {
     let help = Command::new(env!("CARGO_BIN_EXE_rpweld"))
         .args(["build", "--help"])

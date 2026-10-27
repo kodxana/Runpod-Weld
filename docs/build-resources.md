@@ -25,3 +25,19 @@ rejected if the stable post-RUN inventory exceeds it. Temporary copy-out retains
 the old cache until atomic replacement, so old and new payloads coexist; measured
 admission charges the full new allocation. This remains a resource policy, not a
 hard disk quota. Details are in [RUN mounts](run-mounts.md).
+
+For opt-in gzip export, the measured tar estimate is passed through the encoder's
+checked stored-size bound. Layered payload admission is
+`stored + max(raw, inherited copies)`, plus directory/JSON/inode allowances: the raw
+verification spool is released before inherited blob copies start. Flattened export
+admits the stored estimate alone at export time. Private checkpoint hardlinks do not
+reserve another inherited payload; public outputs always copy into independent inodes.
+The raw exporter ceiling and stored image ceiling remain independent.
+
+Raw sizes learned during encoding or successful verification stay in a process-local
+map bound to the stored digest, media type, stored size and diffID for the current
+build. Later checkpoint verification, flattened restore and cross-stage replay admit
+that known raw spool before creating it, even for gzip. The already-written stored
+blob is reflected in current free space, so that later check adds only the raw spool.
+Unknown imported/cached gzip continues using streaming limits and cooperative reserve
+checks. No persistent unsigned raw-size hint is trusted, and reserves are unchanged.

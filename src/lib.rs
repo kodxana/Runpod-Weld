@@ -16,6 +16,8 @@ pub mod dockerfile;
 mod dockerignore;
 pub mod executor;
 pub mod export;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod export_compression;
 pub mod image;
 pub mod layer;
 mod lease_guard;

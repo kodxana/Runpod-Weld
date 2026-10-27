@@ -38,7 +38,7 @@ Usage:
     --output NEWDIR --work-dir NEWDIR [--build-arg KEY=VALUE] [--host-dns] [--verbose]
     [--secret id=ID,src=FILE] [--cache-mount-dir DIR]
     [--progress auto|plain|quiet] [--target STAGE] [--no-cache] [--pull] [--platform linux/amd64]
-    [--export-mode layered|flattened]
+    [--export-mode layered|flattened] [--compression uncompressed|gzip]
     [--max-rootfs-bytes N] [--max-layer-bytes N] [--metadata-budget N] [--max-entries N]
     [--run-timeout-seconds N] CONTEXT
 
@@ -46,6 +46,7 @@ Experimental build: Linux amd64, multi-stage, registry/local OCI bases or scratc
 Default Dockerfile: CONTEXT/Dockerfile. Verified cached bases are reused offline.
 Layered export is the default: preserve base layers and append a cumulative delta per stage.
 --export-mode flattened writes one full-filesystem layer instead.
+Compression defaults to uncompressed; gzip encodes only new layers at level 1.
 --pull refreshes base tags using verified TLS; digest references remain reusable.
 Failed refreshes fail the build and preserve the previous base cache.
 Managed builds create private state under RPWELD_HOME (default ~/.local/share/rpweld).
@@ -342,6 +343,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
     let mut tag_count = 0;
     let mut progress = None;
     let mut export_mode = None;
+    let mut compression = None;
     let mut values = BTreeMap::new();
     let mut bases = BTreeMap::new();
     let mut references = BTreeMap::new();
@@ -384,12 +386,30 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             }
             continue;
         }
-        if !positional && ["-t", "--tag", "--progress", "--export-mode"].contains(&option) {
+        if !positional
+            && [
+                "-t",
+                "--tag",
+                "--progress",
+                "--export-mode",
+                "--compression",
+            ]
+            .contains(&option)
+        {
             let value = inline
                 .or_else(|| iter.next().map(String::as_str))
                 .filter(|v| !v.is_empty() && !v.starts_with('-') && !v.contains('\0'))
                 .ok_or_else(|| format!("missing value for {option}"))?;
-            if option == "--export-mode" {
+            if option == "--compression" {
+                if compression.is_some() {
+                    return Err("duplicate --compression".into());
+                }
+                compression = Some(match value {
+                    "uncompressed" => rpweld::export::Compression::Uncompressed,
+                    "gzip" => rpweld::export::Compression::Gzip,
+                    _ => return Err("--compression requires uncompressed or gzip".into()),
+                });
+            } else if option == "--export-mode" {
                 if export_mode.is_some() {
                     return Err("duplicate --export-mode".into());
                 }
@@ -594,6 +614,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             verbose,
             progress: progress.unwrap_or(true),
             export_mode: export_mode.unwrap_or_default(),
+            compression: compression.unwrap_or_default(),
             target: values.get("--target").map(|s| s.to_string()),
             cache: None,
             managed_cache: None,
@@ -1540,6 +1561,50 @@ mod tests {
         .chain(extra.iter().copied())
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    fn compression_defaults_to_raw_and_accepts_both_spellings() {
+        use rpweld::export::Compression;
+        assert_eq!(
+            parse_build_args(&build_args(&[]))
+                .unwrap()
+                .options
+                .compression,
+            Compression::Uncompressed
+        );
+        for (value, expected) in [
+            ("uncompressed", Compression::Uncompressed),
+            ("gzip", Compression::Gzip),
+        ] {
+            assert_eq!(
+                parse_build_args(&build_args(&["--compression", value]))
+                    .unwrap()
+                    .options
+                    .compression,
+                expected
+            );
+            assert_eq!(
+                parse_build_args(&build_args(&[&format!("--compression={value}")]))
+                    .unwrap()
+                    .options
+                    .compression,
+                expected
+            );
+        }
+        for flags in [
+            vec!["--compression"],
+            vec!["--compression="],
+            vec!["--compression=zstd"],
+            vec!["--compression=gzip", "--compression=uncompressed"],
+        ] {
+            assert!(
+                parse_build_args(&build_args(&flags))
+                    .err()
+                    .unwrap()
+                    .contains("compression")
+            );
+        }
     }
 
     #[test]

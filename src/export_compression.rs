@@ -17,9 +17,11 @@ const CHUNK: usize = 64 * 1024;
 
 /// Gzip uses the fixed level-one CPU profile; existing exports remain uncompressed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum Compression {
+pub enum Compression {
+    /// Store the original tar bytes (the default).
     #[default]
     Uncompressed,
+    /// Encode new layers with deterministic gzip level one.
     Gzip,
 }
 

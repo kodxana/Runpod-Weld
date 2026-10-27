@@ -7,19 +7,34 @@
 //! Symlink xattrs, empty xattrs (PAX deletion semantics), special files, external
 //! hardlinks, whiteout names and nested mounts are rejected, never omitted.
 //! Failures leave an explicitly partial destination; no user tree is deleted.
-//! Payload memory is fixed at 64 KiB; metadata is bounded by caller budgets.
+//! Transfers use at most 64 KiB chunks; metadata is bounded by caller budgets.
 //! File reads require ownership or CAP_FOWNER for O_NOATIME. Directory/symlink
 //! reads may update source atimes; the archived timestamps are captured first.
 
+pub use crate::export_compression::Compression;
+use crate::export_compression::EncodedLayer;
 use crate::oci::Descriptor;
 use serde_json::Value;
 use std::{fmt, io, path::Path};
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct Encoding {
+    pub compression: Compression,
+    pub max_blob_bytes: u64,
+}
+
+pub(crate) struct Exported {
+    pub manifest: Descriptor,
+    pub layer: EncodedLayer,
+}
 
 /// Required resource budgets. Layer bytes include tar headers/padding. Metadata
 /// counts path/link bytes, PAX records, headers and serialized OCI JSON in total.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// Also caps total unique regular-file bytes hashed per inventory in layered
+    /// Uncompressed new tar bytes, including headers and padding. Also caps
+    /// total unique regular-file bytes hashed per inventory in layered
     /// mode. Base blobs use the image limits supplied to Baseline::capture.
     pub max_layer_bytes: u64,
     /// Logical filesystem entries, including the root directory; not tar headers.
@@ -268,12 +283,17 @@ pub(crate) fn export_delta_layout_created(
             destination,
             config,
             limits,
+            Encoding {
+                compression: Compression::Uncompressed,
+                max_blob_bytes: limits.max_layer_bytes,
+            },
             &cancelled,
             created,
             Some(baseline),
             None,
             linux::SourceState::Observed,
         )
+        .map(|result| result.manifest)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -363,6 +383,10 @@ mod tests {
             &config(),
             Some(&baseline),
             LIMITS,
+            Encoding {
+                compression: Compression::Uncompressed,
+                max_blob_bytes: LIMITS.max_layer_bytes,
+            },
             None,
             Some((&mut receipt, LIMITS.max_metadata_bytes)),
             || false,
@@ -415,6 +439,10 @@ mod tests {
             &config(),
             Some(&baseline),
             LIMITS,
+            Encoding {
+                compression: Compression::Uncompressed,
+                max_blob_bytes: LIMITS.max_layer_bytes,
+            },
             None,
             Some((&mut receipt, 1)),
             || false,
@@ -427,77 +455,192 @@ mod tests {
     }
 
     #[test]
-    fn measured_resource_exports_preserve_flattened_and_layered_results() {
+    fn gzip_exports_enforce_independent_caps_and_publish_only_complete_streams() {
+        use sha2::{Digest, Sha256};
         for layered in [false, true] {
             let f = Fixture::new();
             let baseline = layered.then(|| Baseline::scratch(&f.root, LIMITS, || false).unwrap());
-            fs::write(f.root.join("data"), vec![42; 65537]).unwrap();
-            fs::hard_link(f.root.join("data"), f.root.join("alias")).unwrap();
-            let paths = crate::build_resources::Paths {
-                work: f.root.clone(),
-                output: f.dest.clone(),
-                store: f.temp.path().to_owned(),
+            fs::write(f.root.join("data"), vec![42; 1 << 20]).unwrap();
+            let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+            for path in [&f.root, &f.root.join("data")] {
+                fs::File::open(path)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_accessed(stamp + std::time::Duration::from_secs(1))
+                            .set_modified(stamp),
+                    )
+                    .unwrap();
+            }
+            let run = |name: &str, raw, stored, cancelled: &dyn Fn() -> bool| {
+                export_created_with_resources(
+                    &f.root,
+                    &f.temp.path().join(name),
+                    &config(),
+                    baseline.as_ref(),
+                    Limits {
+                        max_layer_bytes: raw,
+                        ..LIMITS
+                    },
+                    Encoding {
+                        compression: Compression::Gzip,
+                        max_blob_bytes: stored,
+                    },
+                    None,
+                    None,
+                    cancelled,
+                    || Ok(()),
+                )
             };
-            let snapshot = crate::build_resources::Snapshot::observe(&paths).unwrap();
-            let policy = crate::build_resources::Policy::resolve(
-                paths,
-                &snapshot,
-                crate::build_resources::Overrides::default(),
-                1,
-                0,
+            let first = run("first", LIMITS.max_layer_bytes, 16384, &|| false).unwrap();
+            let encoded = &first.layer;
+            assert!(encoded.uncompressed_bytes > 1 << 20);
+            assert!(encoded.descriptor.size < 16384);
+            assert_eq!(
+                encoded.descriptor.media_type,
+                "application/vnd.oci.image.layer.v1.tar+gzip"
+            );
+            let bytes = fs::read(
+                f.temp
+                    .path()
+                    .join("first/blobs")
+                    .join(encoded.descriptor.digest.replace(':', "/")),
             )
             .unwrap();
-            export_created_with_resources(
-                &f.root,
-                &f.dest,
-                &config(),
-                baseline.as_ref(),
-                LIMITS,
-                Some(&policy),
-                None,
-                || false,
-                || Ok(()),
+            assert_eq!(&bytes[..10], &[31, 139, 8, 0, 0, 0, 0, 0, 4, 255]);
+            assert_eq!(
+                encoded.descriptor.digest,
+                format!("sha256:{:x}", Sha256::digest(&bytes))
+            );
+            let mut raw = Vec::new();
+            flate2::read::GzDecoder::new(bytes.as_slice())
+                .read_to_end(&mut raw)
+                .unwrap();
+            assert_eq!(raw.len() as u64, encoded.uncompressed_bytes);
+            assert_eq!(
+                encoded.diff_id.as_str(),
+                format!("sha256:{:x}", Sha256::digest(&raw))
+            );
+            assert_ne!(encoded.diff_id.as_str(), encoded.descriptor.digest);
+            let exact = run(
+                "exact",
+                encoded.uncompressed_bytes,
+                encoded.descriptor.size as u64,
+                &|| false,
             )
             .unwrap();
-            let metadata = f.load();
-            let spool = f.temp.path().join("verify");
-            fs::create_dir(&spool).unwrap();
-            let store = BlobStore::open(&f.dest).unwrap();
-            let verified = layer::verify(
-                &store,
-                &metadata.layers[0],
-                &metadata.diff_ids[0],
-                &spool,
-                layer::Limits {
-                    max_blob_bytes: 1 << 20,
-                    max_uncompressed_bytes: 1 << 20,
-                    max_entries: 100,
-                    max_metadata_bytes: 1 << 20,
-                    max_gzip_header_bytes: 65536,
-                },
-                || false,
-            )
-            .unwrap();
-            assert_eq!(
-                verified
-                    .entries()
-                    .iter()
-                    .filter(|e| e.kind == layer::EntryKind::File)
-                    .count(),
-                1
+            assert_eq!(exact.layer.descriptor, encoded.descriptor);
+            for (name, raw_limit, stored_limit) in [
+                ("raw-small", encoded.uncompressed_bytes - 1, 16384),
+                (
+                    "footer-small",
+                    encoded.uncompressed_bytes,
+                    encoded.descriptor.size as u64 - 1,
+                ),
+            ] {
+                assert!(run(name, raw_limit, stored_limit, &|| false).is_err());
+                let dest = f.temp.path().join(name);
+                assert!(!dest.join("index.json").exists());
+                assert_eq!(fs::read_dir(dest.join("blobs/sha256")).unwrap().count(), 0);
+            }
+            let cancelled_after_write = std::cell::Cell::new(false);
+            assert!(
+                run("cancelled", LIMITS.max_layer_bytes, 16384, &|| {
+                    let pending = f.temp.path().join("cancelled/blobs/sha256");
+                    let allocated = fs::read_dir(pending).ok().is_some_and(|entries| {
+                        entries
+                            .filter_map(Result::ok)
+                            .any(|e| e.metadata().is_ok_and(|m| m.len() > 0))
+                    });
+                    cancelled_after_write.set(cancelled_after_write.get() || allocated);
+                    allocated
+                })
+                .is_err()
             );
-            assert_eq!(
-                verified
-                    .entries()
-                    .iter()
-                    .filter(|e| e.kind == layer::EntryKind::Hardlink)
-                    .count(),
-                1
-            );
-            assert_eq!(
-                verified.entries().iter().map(|e| e.size).sum::<u64>(),
-                65537
-            );
+            assert!(cancelled_after_write.get());
+            assert!(!f.temp.path().join("cancelled/index.json").exists());
+        }
+    }
+
+    #[test]
+    fn measured_resource_exports_preserve_flattened_and_layered_results() {
+        for compression in [Compression::Uncompressed, Compression::Gzip] {
+            for layered in [false, true] {
+                let f = Fixture::new();
+                let baseline =
+                    layered.then(|| Baseline::scratch(&f.root, LIMITS, || false).unwrap());
+                fs::write(f.root.join("data"), vec![42; 65537]).unwrap();
+                fs::hard_link(f.root.join("data"), f.root.join("alias")).unwrap();
+                let paths = crate::build_resources::Paths {
+                    work: f.root.clone(),
+                    output: f.dest.clone(),
+                    store: f.temp.path().to_owned(),
+                };
+                let snapshot = crate::build_resources::Snapshot::observe(&paths).unwrap();
+                let policy = crate::build_resources::Policy::resolve(
+                    paths,
+                    &snapshot,
+                    crate::build_resources::Overrides::default(),
+                    1,
+                    0,
+                )
+                .unwrap();
+                export_created_with_resources(
+                    &f.root,
+                    &f.dest,
+                    &config(),
+                    baseline.as_ref(),
+                    LIMITS,
+                    Encoding {
+                        compression,
+                        max_blob_bytes: LIMITS.max_layer_bytes,
+                    },
+                    Some(&policy),
+                    None,
+                    || false,
+                    || Ok(()),
+                )
+                .unwrap();
+                let metadata = f.load();
+                let spool = f.temp.path().join("verify");
+                fs::create_dir(&spool).unwrap();
+                let store = BlobStore::open(&f.dest).unwrap();
+                let verified = layer::verify(
+                    &store,
+                    &metadata.layers[0],
+                    &metadata.diff_ids[0],
+                    &spool,
+                    layer::Limits {
+                        max_blob_bytes: 1 << 20,
+                        max_uncompressed_bytes: 1 << 20,
+                        max_entries: 100,
+                        max_metadata_bytes: 1 << 20,
+                        max_gzip_header_bytes: 65536,
+                    },
+                    || false,
+                )
+                .unwrap();
+                assert_eq!(
+                    verified
+                        .entries()
+                        .iter()
+                        .filter(|e| e.kind == layer::EntryKind::File)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    verified
+                        .entries()
+                        .iter()
+                        .filter(|e| e.kind == layer::EntryKind::Hardlink)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    verified.entries().iter().map(|e| e.size).sum::<u64>(),
+                    65537
+                );
+            }
         }
     }
 
@@ -983,7 +1126,7 @@ impl From<serde_json::Error> for Error {
 /// atomically; cancellation after that publication cannot revoke success.
 /// Cancellation is cooperative between entries and 64 KiB writes, not an I/O
 /// timeout. Temporary tar storage is inside destination and removed on return;
-/// peak disk use includes both the spool and verified blob (roughly 2x layer).
+/// the stored spool becomes the verified blob without another payload copy.
 pub fn export_layout(
     root: &Path,
     destination: &Path,
@@ -1009,12 +1152,17 @@ pub(crate) fn export_layout_created(
             destination,
             config,
             limits,
+            Encoding {
+                compression: Compression::Uncompressed,
+                max_blob_bytes: limits.max_layer_bytes,
+            },
             &cancelled,
             created,
             None,
             None,
             linux::SourceState::Observed,
         )
+        .map(|result| result.manifest)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1031,11 +1179,12 @@ pub(crate) fn export_created_with_resources(
     config: &Value,
     baseline: Option<&Baseline>,
     limits: Limits,
+    encoding: Encoding,
     resources: Option<&crate::build_resources::Policy>,
     receipt: Option<(&mut Option<crate::rootfs::ReplayReceipt>, u64)>,
     cancelled: impl Fn() -> bool,
     created: impl FnOnce() -> io::Result<()>,
-) -> Result<Descriptor, Error> {
+) -> Result<Exported, Error> {
     #[cfg(target_os = "linux")]
     {
         linux::export(
@@ -1043,6 +1192,7 @@ pub(crate) fn export_created_with_resources(
             destination,
             config,
             limits,
+            encoding,
             &cancelled,
             created,
             baseline,
@@ -1058,6 +1208,7 @@ pub(crate) fn export_created_with_resources(
             config,
             baseline,
             limits,
+            encoding,
             resources,
             receipt,
             cancelled,
@@ -1076,9 +1227,10 @@ pub(crate) fn export_checkpoint(
     config: &Value,
     baseline: &Baseline,
     limits: Limits,
+    encoding: Encoding,
     resources: Option<&crate::build_resources::Policy>,
     cancelled: impl Fn() -> bool,
-) -> Result<(Descriptor, Baseline), Error> {
+) -> Result<(Exported, Baseline), Error> {
     #[cfg(target_os = "linux")]
     {
         let mut next = None;
@@ -1087,6 +1239,7 @@ pub(crate) fn export_checkpoint(
             destination,
             config,
             limits,
+            encoding,
             &cancelled,
             || Ok(()),
             Some(baseline),
@@ -1106,6 +1259,7 @@ pub(crate) fn export_checkpoint(
             config,
             baseline,
             limits,
+            encoding,
             resources,
             cancelled,
         );
@@ -1119,7 +1273,10 @@ mod linux {
         include!("export_delta.rs");
     }
     use super::*;
-    use crate::oci::BlobStore;
+    use crate::{
+        export_compression::{LayerWriter, Limits as EncodingLimits, payload_peak},
+        oci::BlobStore,
+    };
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::{
@@ -1133,8 +1290,9 @@ mod linux {
         },
         path::{Component, PathBuf},
     };
-    const LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
     const CONFIG: &str = "application/vnd.oci.image.config.v1+json";
+    #[cfg(test)]
+    const LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
     const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
     const INDEX: &str = "application/vnd.oci.image.index.v1+json";
     fn check(c: &impl Fn() -> bool) -> Result<(), Error> {
@@ -1317,26 +1475,27 @@ mod linux {
             Ok(())
         }
     }
-    fn layered_payload_peak(delta: u64, base: u64) -> Result<u64, Error> {
-        // The verifier's spool is dropped before inherit() copies base blobs.
-        delta
-            .checked_add(delta.max(base))
-            .ok_or(Error::Limit("export space estimate"))
-    }
-
     #[cfg(test)]
     #[test]
     fn layered_admission_counts_only_coexisting_payloads() {
         let mib = 1024 * 1024;
         // The verification spool is gone before inherited base blobs are copied.
         // At 400 MiB free, a 120 MiB peak keeps the 256 MiB reserve intact.
-        assert_eq!(layered_payload_peak(60 * mib, 60 * mib).unwrap(), 120 * mib);
         assert_eq!(
-            layered_payload_peak(60 * mib, 100 * mib).unwrap(),
+            payload_peak(60 * mib, 60 * mib, 60 * mib).unwrap(),
+            120 * mib
+        );
+        assert_eq!(
+            payload_peak(60 * mib, 60 * mib, 100 * mib).unwrap(),
             160 * mib
         );
-        assert_eq!(layered_payload_peak(60 * mib, 0).unwrap(), 120 * mib);
-        assert!(layered_payload_peak(u64::MAX, 1).is_err());
+        assert_eq!(payload_peak(60 * mib, 60 * mib, 0).unwrap(), 120 * mib);
+        assert!(payload_peak(u64::MAX, 1, 0).is_err());
+        assert_eq!(
+            payload_peak(5 * mib, 60 * mib, 100 * mib).unwrap(),
+            105 * mib
+        );
+        assert_eq!(payload_peak(5 * mib, 60 * mib, 0).unwrap(), 65 * mib);
     }
 
     #[cfg(test)]
@@ -1446,13 +1605,6 @@ mod linux {
         Ok(result)
     }
 
-    struct Sink<'a, C> {
-        file: &'a mut File,
-        hash: Sha256,
-        size: u64,
-        max: u64,
-        cancelled: &'a C,
-    }
     struct Payload<'a, C> {
         file: &'a mut File,
         remaining: u64,
@@ -1478,26 +1630,8 @@ mod linux {
             Ok(n)
         }
     }
-    impl<C: Fn() -> bool> Write for Sink<'_, C> {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if (self.cancelled)() {
-                return Err(io::Error::other(Error::Cancelled));
-            }
-            let n = bytes.len().min(64 * 1024);
-            if n as u64 > self.max.saturating_sub(self.size) {
-                return Err(io::Error::other(Error::Limit("layer bytes")));
-            }
-            self.file.write_all(&bytes[..n])?;
-            self.hash.update(&bytes[..n]);
-            self.size += n as u64;
-            Ok(n)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            self.file.flush()
-        }
-    }
     struct Walk<'a, C: Fn() -> bool> {
-        tar: tar::Builder<Sink<'a, C>>,
+        tar: tar::Builder<LayerWriter<'a, &'a mut File, C>>,
         remaining: u64,
         entries: usize,
         max_entries: usize,
@@ -1710,12 +1844,13 @@ mod linux {
         dest: &Path,
         config: &Value,
         limits: Limits,
+        encoding: Encoding,
         c: &impl Fn() -> bool,
         created: impl FnOnce() -> std::io::Result<()>,
         baseline: Option<&Baseline>,
         resources: Option<&crate::build_resources::Policy>,
         source_state: SourceState<'_>,
-    ) -> Result<Descriptor, Error> {
+    ) -> Result<Exported, Error> {
         check(c)?;
         // Our writer emits at most PAX + GNU long path + GNU long link + entry
         // for each logical record. Untrusted base replay gets no multiplier.
@@ -1811,7 +1946,7 @@ mod linux {
                     )?;
                 }
             }
-            let mut bytes = estimate.bytes;
+            let mut bytes = encoding.compression.max_encoded_size(estimate.bytes)?;
             let mut inodes = 8u64;
             if let Some(base) = baseline {
                 // Account for the larger of verification and base-copy phases.
@@ -1833,7 +1968,7 @@ mod linux {
                         inodes += 1;
                     }
                 }
-                bytes = layered_payload_peak(bytes, base_bytes)?;
+                bytes = payload_peak(bytes, estimate.bytes, base_bytes)?;
             }
             bytes = bytes
                 .checked_add(65536)
@@ -1846,14 +1981,16 @@ mod linux {
         created()?;
         let store = BlobStore::open(dest)?;
         let mut spool = store.pending_export()?;
-        let layer = {
-            let sink = Sink {
-                file: spool.as_file_mut(),
-                hash: Sha256::new(),
-                size: 0,
-                max: limits.max_layer_bytes.min(i64::MAX as u64),
-                cancelled: c,
-            };
+        let encoded = {
+            let sink = LayerWriter::new(
+                spool.as_file_mut(),
+                encoding.compression,
+                EncodingLimits {
+                    max_uncompressed_bytes: limits.max_layer_bytes,
+                    max_blob_bytes: encoding.max_blob_bytes,
+                },
+                c,
+            );
             let mut walk = Walk {
                 tar: tar::Builder::new(sink),
                 remaining,
@@ -1897,23 +2034,22 @@ mod linux {
                 return Err(Error::Invalid("hardlinks outside source tree"));
             }
             remaining = walk.remaining;
-            let sink = walk.tar.into_inner()?;
-            descriptor(LAYER, sink.size, sink.hash)?
+            walk.tar.into_inner()?.finish()?.1
         };
-        store.publish_export(spool, &layer, limits.max_layer_bytes, c)?;
+        let layer = &encoded.descriptor;
+        store.publish_export(spool, layer, encoding.max_blob_bytes, c)?;
         if baseline.is_some() {
-            let diff_id = layer.digest.parse().map_err(Error::Blob)?;
             crate::layer::verify(
                 &store,
-                &layer,
-                &diff_id,
+                layer,
+                &encoded.diff_id,
                 dest,
                 crate::layer::Limits {
-                    max_blob_bytes: limits.max_layer_bytes,
+                    max_blob_bytes: encoding.max_blob_bytes,
                     max_uncompressed_bytes: limits.max_layer_bytes,
                     max_entries: physical_limit.unwrap(),
                     max_metadata_bytes: limits.max_metadata_bytes,
-                    max_gzip_header_bytes: 0,
+                    max_gzip_header_bytes: 10,
                 },
                 c,
             )
@@ -1924,19 +2060,28 @@ mod linux {
                 delta::inherit_with_sharing(
                     base,
                     &store,
-                    &layer,
+                    layer,
+                    &encoded.diff_id,
                     &mut output,
                     &mut remaining,
                     true,
                     c,
                 )?
             } else {
-                delta::inherit(base, &store, &layer, &mut output, &mut remaining, c)?
+                delta::inherit(
+                    base,
+                    &store,
+                    layer,
+                    &encoded.diff_id,
+                    &mut output,
+                    &mut remaining,
+                    c,
+                )?
             }
         } else {
-            output["rootfs"] = json!({"type":"layers", "diff_ids":[layer.digest]});
+            output["rootfs"] = json!({"type":"layers", "diff_ids":[encoded.diff_id.as_str()]});
             output["history"] = json!([{"created_by":"Weld flattened rootfs export", "comment":"Full filesystem snapshot; original layer history replaced."}]);
-            vec![layer]
+            vec![layer.clone()]
         };
         if let (SourceState::Archived(_) | SourceState::Checkpoint(_), Some(plan)) =
             (&source_state, &plan)
@@ -1966,6 +2111,23 @@ mod linux {
         } else {
             None
         };
+        let next_baseline = if matches!(source_state, SourceState::Checkpoint(_)) {
+            Some(delta::checkpoint_baseline(
+                dest,
+                layers,
+                &output,
+                plan.ok_or(Error::Invalid("checkpoint requires layered inventory"))?
+                    .inventory,
+                baseline
+                    .ok_or(Error::Invalid("checkpoint baseline missing"))?
+                    .state
+                    .blob_limit
+                    .max(encoding.max_blob_bytes),
+                &mut remaining,
+            )?)
+        } else {
+            None
+        };
         check(c)?;
         OpenOptions::new()
             .write(true)
@@ -1981,23 +2143,12 @@ mod linux {
             .map_err(|e| Error::Io(e.error))?;
         match source_state {
             SourceState::Archived(Some((slot, _))) => *slot = receipt,
-            SourceState::Checkpoint(slot) => {
-                *slot = Some(delta::checkpoint_baseline(
-                    dest,
-                    layers,
-                    &output,
-                    plan.ok_or(Error::Invalid("checkpoint requires layered inventory"))?
-                        .inventory,
-                    baseline
-                        .ok_or(Error::Invalid("checkpoint baseline missing"))?
-                        .state
-                        .blob_limit
-                        .max(limits.max_layer_bytes),
-                    &mut remaining,
-                )?);
-            }
+            SourceState::Checkpoint(slot) => *slot = next_baseline,
             _ => (),
         }
-        Ok(manifest)
+        Ok(Exported {
+            manifest,
+            layer: encoded,
+        })
     }
 }

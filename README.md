@@ -410,6 +410,13 @@ dependency layers when application inputs change. Builds without instruction
 caching retain one cumulative delta per stage. An inherited stage preserves its parent's complete
 layer chain. Deletions, replacements, hardlinks and preserved metadata participate
 in the delta; runtime configuration still comes from the evaluated Dockerfile.
+New layers are uncompressed by default. `--compression gzip` opts into deterministic
+gzip level one for either export mode; base layers are never recompressed. Use
+`--compression uncompressed` to select raw output explicitly. Compression participates
+in stage and instruction cache identity. Smaller blobs do not guarantee faster builds:
+local incompressible input took roughly 6.8x longer to encode. See the
+[compression contract and local evidence](docs/export-compression.md).
+
 Use `--export-mode flattened` to write one full-filesystem layer. Layered output
 uses instruction checkpoints for RUN, COPY and WORKDIR (and FROM when inherited WORKDIR creates directories); metadata-only suffixes
 can append a root-only delta. This is not an exact Docker history/layer-count contract.

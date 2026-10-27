@@ -60,73 +60,80 @@ fn cached_parent_receipt_exhaustion_falls_back_to_verified_replay() {
 #[test]
 fn layered_instruction_checkpoints_reuse_prefix_and_apply_only_the_next_delta() {
     use std::os::unix::fs::MetadataExt;
-    let t = tempfile::tempdir().unwrap();
-    let mut o = options(t.path());
-    o.export_mode = build::ExportMode::Layered;
-    write(&o.context.join("dependency"), &"x".repeat(1024 * 1024));
-    write(&o.context.join("app"), "version-one");
-    let source = "FROM scratch\nCOPY dependency /dependency\nCOPY app /app\n";
-    build::build(source, &o, never_cancel).unwrap();
-    let cold = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
-    assert_eq!(
-        cold.layers.len(),
-        2,
-        "two filesystem instruction deltas; FROM reuses the verified base"
-    );
-    let last = cold.layers.last().unwrap();
-    assert!(
-        last.size < 16384,
-        "app delta must not repeat the dependency: {}",
-        last.size
-    );
-    let archive =
-        fs::File::open(o.output.join("blobs").join(last.digest.replace(':', "/"))).unwrap();
-    let paths: Vec<_> = tar::Archive::new(archive)
-        .entries()
-        .unwrap()
-        .map(|entry| entry.unwrap().path().unwrap().into_owned())
-        .collect();
-    assert_eq!(paths, vec![PathBuf::from("."), PathBuf::from("app")]);
-    let dependency_blob = PathBuf::from("blobs").join(cold.layers[0].digest.replace(':', "/"));
-    let first = o.work.join("checkpoint-image-2").join(&dependency_blob);
-    let second = o.work.join("checkpoint-image-3").join(&dependency_blob);
-    assert_eq!(
-        fs::metadata(&first).unwrap().ino(),
-        fs::metadata(&second).unwrap().ino(),
-        "immutable private checkpoints must share unchanged blob storage"
-    );
-    assert_ne!(
-        fs::metadata(&second).unwrap().ino(),
-        fs::metadata(o.output.join(&dependency_blob)).unwrap().ino(),
-        "mutable public output must have an independent inode"
-    );
-    write(&o.context.join("app"), "version-two");
-    next(&mut o, t.path(), "edit");
-    build::build(source, &o, never_cancel).unwrap();
-    let edited = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
-    assert_eq!(
-        &cold.layers[..1],
-        &edited.layers[..1],
-        "unchanged instruction layers stay byte-identical"
-    );
-    assert_eq!(fs::read(o.work.join("rootfs/app")).unwrap(), b"version-two");
-    assert_eq!(
-        fs::metadata(o.work.join("rootfs/dependency"))
+    for compression in [export::Compression::Uncompressed, export::Compression::Gzip] {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        o.export_mode = build::ExportMode::Layered;
+        o.compression = compression;
+        write(&o.context.join("dependency"), &"x".repeat(1024 * 1024));
+        write(&o.context.join("app"), "version-one");
+        let source = "FROM scratch\nCOPY dependency /dependency\nCOPY app /app\n";
+        build::build(source, &o, never_cancel).unwrap();
+        let cold = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+        assert_eq!(
+            cold.layers.len(),
+            2,
+            "two filesystem instruction deltas; FROM reuses the verified base"
+        );
+        let last = cold.layers.last().unwrap();
+        assert!(
+            last.size < 16384,
+            "app delta must not repeat the dependency: {}",
+            last.size
+        );
+        let archive =
+            fs::File::open(o.output.join("blobs").join(last.digest.replace(':', "/"))).unwrap();
+        let archive: Box<dyn std::io::Read> = match compression {
+            export::Compression::Uncompressed => Box::new(archive),
+            export::Compression::Gzip => Box::new(flate2::read::GzDecoder::new(archive)),
+        };
+        let paths: Vec<_> = tar::Archive::new(archive)
+            .entries()
             .unwrap()
-            .len(),
-        1024 * 1024
-    );
-    assert!(
-        !o.work.join("rootfs-before-2").exists(),
-        "prefix hits must not retain a replaced full root"
-    );
-    next(&mut o, t.path(), "warm");
-    build::build(source, &o, never_cancel).unwrap();
-    let warm = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
-    assert_eq!(
-        edited.selected, warm.selected,
-        "whole-stage hits preserve exact output"
-    );
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert_eq!(paths, vec![PathBuf::from("."), PathBuf::from("app")]);
+        let dependency_blob = PathBuf::from("blobs").join(cold.layers[0].digest.replace(':', "/"));
+        let first = o.work.join("checkpoint-image-2").join(&dependency_blob);
+        let second = o.work.join("checkpoint-image-3").join(&dependency_blob);
+        assert_eq!(
+            fs::metadata(&first).unwrap().ino(),
+            fs::metadata(&second).unwrap().ino(),
+            "immutable private checkpoints must share unchanged blob storage"
+        );
+        assert_ne!(
+            fs::metadata(&second).unwrap().ino(),
+            fs::metadata(o.output.join(&dependency_blob)).unwrap().ino(),
+            "mutable public output must have an independent inode"
+        );
+        write(&o.context.join("app"), "version-two");
+        next(&mut o, t.path(), "edit");
+        build::build(source, &o, never_cancel).unwrap();
+        let edited = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+        assert_eq!(
+            &cold.layers[..1],
+            &edited.layers[..1],
+            "unchanged instruction layers stay byte-identical"
+        );
+        assert_eq!(fs::read(o.work.join("rootfs/app")).unwrap(), b"version-two");
+        assert_eq!(
+            fs::metadata(o.work.join("rootfs/dependency"))
+                .unwrap()
+                .len(),
+            1024 * 1024
+        );
+        assert!(
+            !o.work.join("rootfs-before-2").exists(),
+            "prefix hits must not retain a replaced full root"
+        );
+        next(&mut o, t.path(), "warm");
+        build::build(source, &o, never_cancel).unwrap();
+        let warm = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+        assert_eq!(
+            edited.selected, warm.selected,
+            "whole-stage hits preserve exact output"
+        );
+    }
 }
 
 #[test]
@@ -542,6 +549,7 @@ fn options(root: &Path) -> BuildOptions {
         progress: true,
         managed_cache: None,
         export_mode: rpweld::build::ExportMode::Flattened,
+        compression: rpweld::export::Compression::Uncompressed,
         target: None,
         no_cache: false,
         run_mounts: Default::default(),
@@ -595,91 +603,94 @@ fn layered_cold_checkpoints_keep_root_and_exact_archived_metadata() {
         cell::Cell,
         os::unix::fs::{MetadataExt, symlink},
     };
-    let t = tempfile::tempdir().unwrap();
-    let mut o = options(t.path());
-    o.export_mode = build::ExportMode::Layered;
-    local_base(&mut o, t.path(), |root| {
-        fs::write(root.join("payload"), vec![7; 1 << 20]).unwrap();
-        symlink("/payload", root.join("link")).unwrap();
-        fs::hard_link(root.join("link"), root.join("link-alias")).unwrap();
-    });
-    write(&o.context.join("one"), "one");
-    write(&o.context.join("two"), "two");
-    let source =
-        "FROM local\nWORKDIR /app\nCOPY one /app/one\nCOPY two /app/two\nLABEL suffix=yes\n";
-    let original_inode = Cell::new(None);
-    build::build(source, &o, || {
-        if let Ok(m) = fs::symlink_metadata(o.work.join("rootfs/payload")) {
-            if let Some(original) = original_inode.get() {
-                assert_eq!(
-                    m.ino(),
-                    original,
-                    "cold checkpoint replaced the working inode"
-                );
-            } else {
-                original_inode.set(Some(m.ino()));
+    for compression in [export::Compression::Uncompressed, export::Compression::Gzip] {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        o.export_mode = build::ExportMode::Layered;
+        o.compression = compression;
+        local_base(&mut o, t.path(), |root| {
+            fs::write(root.join("payload"), vec![7; 1 << 20]).unwrap();
+            symlink("/payload", root.join("link")).unwrap();
+            fs::hard_link(root.join("link"), root.join("link-alias")).unwrap();
+        });
+        write(&o.context.join("one"), "one");
+        write(&o.context.join("two"), "two");
+        let source =
+            "FROM local\nWORKDIR /app\nCOPY one /app/one\nCOPY two /app/two\nLABEL suffix=yes\n";
+        let original_inode = Cell::new(None);
+        build::build(source, &o, || {
+            if let Ok(m) = fs::symlink_metadata(o.work.join("rootfs/payload")) {
+                if let Some(original) = original_inode.get() {
+                    assert_eq!(
+                        m.ino(),
+                        original,
+                        "cold checkpoint replaced the working inode"
+                    );
+                } else {
+                    original_inode.set(Some(m.ino()));
+                }
             }
-        }
-        false
-    })
-    .unwrap();
-    assert!(original_inode.get().is_some());
-    assert!(
-        !fs::read_dir(&o.work).unwrap().any(|e| e
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("rootfs-")),
-        "cold layered build retained reconstructed roots"
-    );
-    for mode in ["cold", "hit", "no-cache"] {
-        if mode != "cold" {
-            next(&mut o, t.path(), mode);
-            o.no_cache = mode == "no-cache";
-            build::build(source, &o, never_cancel).unwrap();
-        }
-        let image = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
-        let root = t.path().join(format!("replayed-{mode}"));
-        fs::create_dir(&root).unwrap();
-        let store = rpweld::oci::BlobStore::open(&o.output).unwrap();
-        for (d, id) in image.layers.iter().zip(&image.diff_ids) {
-            let mut layer =
-                layer::verify(&store, d, id, t.path(), o.limits.layer, never_cancel).unwrap();
-            rpweld::rootfs::apply_layer(&root, &mut layer, never_cancel).unwrap();
-        }
-        for name in [
-            "",
-            "app",
-            "app/one",
-            "app/two",
-            "payload",
-            "link",
-            "link-alias",
-        ] {
-            let live = fs::symlink_metadata(o.work.join("rootfs").join(name)).unwrap();
-            let archived = fs::symlink_metadata(root.join(name)).unwrap();
-            let attributes = |m: &fs::Metadata| {
-                (
-                    m.mode(),
-                    m.uid(),
-                    m.gid(),
-                    m.atime(),
-                    m.atime_nsec(),
-                    m.mtime(),
-                    m.mtime_nsec(),
-                )
-            };
-            assert_eq!(attributes(&live), attributes(&archived), "{mode}: {name}");
-        }
-        assert_eq!(fs::read(root.join("app/two")).unwrap(), b"two");
-        assert_eq!(
-            fs::read_link(root.join("link")).unwrap(),
-            Path::new("/payload")
+            false
+        })
+        .unwrap();
+        assert!(original_inode.get().is_some());
+        assert!(
+            !fs::read_dir(&o.work).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("rootfs-")),
+            "cold layered build retained reconstructed roots"
         );
-        assert_eq!(
-            fs::symlink_metadata(root.join("link")).unwrap().ino(),
-            fs::symlink_metadata(root.join("link-alias")).unwrap().ino()
-        );
+        for mode in ["cold", "hit", "no-cache"] {
+            if mode != "cold" {
+                next(&mut o, t.path(), mode);
+                o.no_cache = mode == "no-cache";
+                build::build(source, &o, never_cancel).unwrap();
+            }
+            let image = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+            let root = t.path().join(format!("replayed-{mode}"));
+            fs::create_dir(&root).unwrap();
+            let store = rpweld::oci::BlobStore::open(&o.output).unwrap();
+            for (d, id) in image.layers.iter().zip(&image.diff_ids) {
+                let mut layer =
+                    layer::verify(&store, d, id, t.path(), o.limits.layer, never_cancel).unwrap();
+                rpweld::rootfs::apply_layer(&root, &mut layer, never_cancel).unwrap();
+            }
+            for name in [
+                "",
+                "app",
+                "app/one",
+                "app/two",
+                "payload",
+                "link",
+                "link-alias",
+            ] {
+                let live = fs::symlink_metadata(o.work.join("rootfs").join(name)).unwrap();
+                let archived = fs::symlink_metadata(root.join(name)).unwrap();
+                let attributes = |m: &fs::Metadata| {
+                    (
+                        m.mode(),
+                        m.uid(),
+                        m.gid(),
+                        m.atime(),
+                        m.atime_nsec(),
+                        m.mtime(),
+                        m.mtime_nsec(),
+                    )
+                };
+                assert_eq!(attributes(&live), attributes(&archived), "{mode}: {name}");
+            }
+            assert_eq!(fs::read(root.join("app/two")).unwrap(), b"two");
+            assert_eq!(
+                fs::read_link(root.join("link")).unwrap(),
+                Path::new("/payload")
+            );
+            assert_eq!(
+                fs::symlink_metadata(root.join("link")).unwrap().ino(),
+                fs::symlink_metadata(root.join("link-alias")).unwrap().ino()
+            );
+        }
     }
 }
 

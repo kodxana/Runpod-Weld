@@ -36,6 +36,7 @@ fn options(root: &Path) -> BuildOptions {
         progress: true,
         managed_cache: None,
         export_mode: rpweld::build::ExportMode::Flattened,
+        compression: rpweld::export::Compression::Uncompressed,
         target: None,
         no_cache: false,
         run_mounts: Default::default(),

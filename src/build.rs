@@ -104,6 +104,8 @@ pub struct BuildOptions {
     /// Append-only engine progress; RUN streams and diagnostics remain visible when false.
     pub progress: bool,
     pub export_mode: ExportMode,
+    /// Encoding for newly generated layers; inherited layers retain their bytes.
+    pub compression: export::Compression,
     pub target: Option<String>,
     pub cache: Option<PathBuf>,
     /// Explicit managed store for shared checkpoint blobs; mutually exclusive with cache.
@@ -1282,20 +1284,65 @@ fn replay_allocation(_: &Path, _: &[layer::Entry], _: &impl Fn() -> bool) -> Res
     Err("layer replay requires Linux".into())
 }
 
+// Measurements never come from unsigned layout metadata. Keep them for this entire
+// build, including copied checkpoints and stage bases; verification still runs.
+#[derive(Default)]
+struct LayerMeasurements {
+    raw_sizes: BTreeMap<(String, String, i64, String), u64>,
+}
+impl LayerMeasurements {
+    fn key(
+        descriptor: &Descriptor,
+        diff: &crate::oci::Sha256Digest,
+    ) -> (String, String, i64, String) {
+        (
+            descriptor.digest.clone(),
+            descriptor.media_type.clone(),
+            descriptor.size,
+            diff.as_str().to_owned(),
+        )
+    }
+    fn record(&mut self, descriptor: &Descriptor, diff: &crate::oci::Sha256Digest, bytes: u64) {
+        self.raw_sizes.insert(Self::key(descriptor, diff), bytes);
+    }
+    fn exported(&mut self, exported: export::Exported) -> Descriptor {
+        self.record(
+            &exported.layer.descriptor,
+            &exported.layer.diff_id,
+            exported.layer.uncompressed_bytes,
+        );
+        exported.manifest
+    }
+    fn spool_bytes(
+        &self,
+        descriptor: &Descriptor,
+        diff: &crate::oci::Sha256Digest,
+    ) -> Result<Option<u64>> {
+        if descriptor.media_type.ends_with(".tar") {
+            return Ok(Some(
+                u64::try_from(descriptor.size).map_err(|_| "negative layer size")?,
+            ));
+        }
+        Ok(self.raw_sizes.get(&Self::key(descriptor, diff)).copied())
+    }
+}
+
 fn check_spool_space(
     resources: Option<&crate::build_resources::Policy>,
     spool: &Path,
     descriptor: &Descriptor,
+    diff: &crate::oci::Sha256Digest,
+    measurements: &LayerMeasurements,
 ) -> Result<()> {
-    // Plain tar size is known before spooling. Compressed expansion is unknown;
-    // its streaming cancellation callback still rechecks current disk reserves.
-    if descriptor.media_type.ends_with(".tar") {
+    // Unknown compressed expansion retains cooperative reserve checks. Known
+    // raw sizes must be admitted before any spool bytes are allocated.
+    if let Some(bytes) = measurements.spool_bytes(descriptor, diff)? {
         resource_check(
             resources,
-            "verifying uncompressed layer spool",
+            "verifying measured layer spool",
             &[crate::build_resources::Requirement {
                 path: spool.to_owned(),
-                bytes: u64::try_from(descriptor.size).map_err(|_| "negative layer size")?,
+                bytes,
                 inodes: 1,
             }],
         )?;
@@ -1419,6 +1466,7 @@ fn copy_input(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_checkpoint(
     layout: &Path,
     config: &Value,
@@ -1426,6 +1474,7 @@ fn verify_checkpoint(
     spool: &Path,
     limits: Limits,
     resources: Option<&crate::build_resources::Policy>,
+    measurements: &mut LayerMeasurements,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Descriptor> {
     for suffix in ["", "blobs", "blobs/sha256"] {
@@ -1450,8 +1499,9 @@ fn verify_checkpoint(
         budget.max_entries = budget
             .max_entries
             .min(limits.max_replay_entries.saturating_sub(entries));
-        check_spool_space(resources, spool, descriptor)?;
+        check_spool_space(resources, spool, descriptor, diff, measurements)?;
         let mut verified = layer::verify(&store, descriptor, diff, spool, budget, cancelled)?;
+        measurements.record(descriptor, diff, verified.size());
         bytes += verified.size();
         entries += verified.physical_header_count();
         if let Some(root) = root {
@@ -1475,6 +1525,7 @@ fn verify_fresh_checkpoint(
     spool: &Path,
     limits: Limits,
     resources: Option<&crate::build_resources::Policy>,
+    measurements: &mut LayerMeasurements,
     apply_to: Option<&Path>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<(image::ImageMetadata, (u64, usize))> {
@@ -1502,18 +1553,20 @@ fn verify_fresh_checkpoint(
             .ok_or("replay entry budget exceeded")?,
     );
     let descriptor = metadata.layers.last().ok_or("checkpoint layer missing")?;
-    check_spool_space(resources, spool, descriptor)?;
+    let diff = metadata
+        .diff_ids
+        .last()
+        .ok_or("checkpoint diff ID missing")?;
+    check_spool_space(resources, spool, descriptor, diff, measurements)?;
     let mut verified = layer::verify(
         &BlobStore::open(layout)?,
         descriptor,
-        metadata
-            .diff_ids
-            .last()
-            .ok_or("checkpoint diff ID missing")?,
+        diff,
         spool,
         budget,
         cancelled,
     )?;
+    measurements.record(descriptor, diff, verified.size());
     if let Some(root) = apply_to {
         check_replay_space(resources, root, &verified, cancelled)?;
         rootfs::apply_layer(root, &mut verified, cancelled)?;
@@ -1631,22 +1684,26 @@ fn export_stage(
     config: &Value,
     baseline: Option<&export::Baseline>,
     limits: export::Limits,
+    encoding: export::Encoding,
     resources: Option<&crate::build_resources::Policy>,
+    measurements: &mut LayerMeasurements,
     receipt: Option<(&mut Option<rootfs::ReplayReceipt>, u64)>,
     cancelled: &impl Fn() -> bool,
     created: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<Descriptor> {
-    Ok(export::export_created_with_resources(
+    let exported = export::export_created_with_resources(
         root,
         destination,
         config,
         baseline,
         limits,
+        encoding,
         resources,
         receipt,
         cancelled,
         created,
-    )?)
+    )?;
+    Ok(measurements.exported(exported))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1658,6 +1715,7 @@ fn restore_checkpoint(
     spool: &Path,
     limits: Limits,
     resources: Option<&crate::build_resources::Policy>,
+    measurements: &mut LayerMeasurements,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Descriptor> {
     let replacement = work.join(format!("checkpoint-{retained}"));
@@ -1669,6 +1727,7 @@ fn restore_checkpoint(
         spool,
         limits,
         resources,
+        measurements,
         cancelled,
     )?;
     check(cancelled)?;
@@ -1905,6 +1964,7 @@ fn build_inner_checked(
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err("build requires Linux amd64".into());
     }
+    let mut measurements = LayerMeasurements::default();
     check(&cancelled)?;
     if options.cache.is_some() && options.managed_cache.is_some() {
         return Err("choose either an external cache or a managed cache store".into());
@@ -2090,8 +2150,9 @@ fn build_inner_checked(
             budget.max_entries = budget
                 .max_entries
                 .min(options.limits.max_replay_entries.saturating_sub(entries));
-            check_spool_space(resources, &spool, descriptor)?;
+            check_spool_space(resources, &spool, descriptor, diff, &measurements)?;
             let mut verified = layer::verify(&store, descriptor, diff, &spool, budget, cancelled)?;
+            measurements.record(descriptor, diff, verified.size());
             bytes += verified.size();
             entries += verified.physical_header_count();
             check_replay_space(resources, &root, &verified, &cancelled)?;
@@ -2158,6 +2219,7 @@ fn build_inner_checked(
                 .then_some(receipts_remaining),
             lease,
             resources,
+            &mut measurements,
             || {
                 phase.tick();
                 cancelled()
@@ -2196,6 +2258,7 @@ fn build_stage(
     prepare_handoff: Option<u64>,
     lease: Option<&crate::store_lease::StoreLease>,
     resources: Option<&crate::build_resources::Policy>,
+    measurements: &mut LayerMeasurements,
     cancelled: impl Fn() -> bool,
 ) -> Result<StageResult> {
     check(&cancelled)?;
@@ -2347,7 +2410,7 @@ fn build_stage(
             metadata.as_ref().map(|m| &m.selected.digest),
             options.host_dns,
             dependencies,
-            options.export_mode
+            (options.export_mode, options.compression)
         );
         let uses_context = steps.iter().any(|s| {
             matches!(
@@ -2574,13 +2637,14 @@ fn build_stage(
                 crate::progress::count_bar(layer_index, m.layers.len()),
                 layer_index + 1
             ));
-            check_spool_space(resources, &spool, descriptor)?;
+            check_spool_space(resources, &spool, descriptor, diff, measurements)?;
             let mut verified = layer::verify(&store, descriptor, diff, &spool, limits, || {
                 preparation.tick();
                 phase.tick();
                 cancelled()
             })?;
             phase.finish();
+            measurements.record(descriptor, diff, verified.size());
             bytes += verified.size();
             entries += verified.physical_header_count();
             check_replay_space(resources, &root, &verified, &cancelled)?;
@@ -2791,7 +2855,7 @@ fn build_stage(
                 options.host_dns,
                 boundary.config,
                 boundary.args,
-                options.export_mode
+                (options.export_mode, options.compression)
             );
             let inputs = serde_json::to_vec(&(inputs, selected))?;
             available.then(|| {
@@ -2839,6 +2903,7 @@ fn build_stage(
                     &spool,
                     options.limits,
                     resources,
+                    measurements,
                     Some(&root),
                     &cancelled,
                 )?;
@@ -2868,6 +2933,7 @@ fn build_stage(
                     &spool,
                     options.limits,
                     resources,
+                    measurements,
                     &cancelled,
                 )?
             };
@@ -3016,6 +3082,10 @@ fn build_stage(
                     &checkpoint_config,
                     base,
                     options.limits.export,
+                    export::Encoding {
+                        compression: options.compression,
+                        max_blob_bytes: options.limits.image.max_layer_bytes,
+                    },
                     resources,
                     || {
                         phase.tick();
@@ -3023,7 +3093,7 @@ fn build_stage(
                     },
                 )?;
                 next_baseline = Some(next);
-                manifest
+                measurements.exported(manifest)
             } else {
                 export_stage(
                     &root,
@@ -3031,7 +3101,12 @@ fn build_stage(
                     &checkpoint_config,
                     baseline.as_ref(),
                     options.limits.export,
+                    export::Encoding {
+                        compression: options.compression,
+                        max_blob_bytes: options.limits.image.max_layer_bytes,
+                    },
                     resources,
+                    measurements,
                     None,
                     &|| {
                         phase.tick();
@@ -3064,6 +3139,7 @@ fn build_stage(
                     &spool,
                     options.limits,
                     resources,
+                    measurements,
                     None,
                     &verifying,
                 )?;
@@ -3090,6 +3166,7 @@ fn build_stage(
                     &spool,
                     options.limits,
                     resources,
+                    measurements,
                     &verifying,
                 )?
             };
@@ -3223,7 +3300,12 @@ fn build_stage(
             &config,
             baseline.as_ref(),
             options.limits.export,
+            export::Encoding {
+                compression: options.compression,
+                max_blob_bytes: options.limits.image.max_layer_bytes,
+            },
             resources,
+            measurements,
             prepare_handoff.map(|limit| (&mut exported_receipt, limit)),
             &output_cancelled,
             || {
@@ -3280,6 +3362,7 @@ fn build_stage(
                 &spool,
                 options.limits,
                 resources,
+                measurements,
                 None,
                 &verification_cancelled,
             )?;
@@ -3296,6 +3379,7 @@ fn build_stage(
                 &spool,
                 options.limits,
                 resources,
+                measurements,
                 &verification_cancelled,
             )?
         } else {
@@ -3307,6 +3391,7 @@ fn build_stage(
                 &spool,
                 options.limits,
                 resources,
+                measurements,
                 &verification_cancelled,
             )?
         };
@@ -4005,6 +4090,7 @@ mod tests {
             verbose: false,
             progress: true,
             export_mode: ExportMode::Flattened,
+            compression: export::Compression::Uncompressed,
             managed_cache: None,
             target: None,
             cache: None,
@@ -4039,6 +4125,135 @@ mod tests {
             },
         }
     }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn generated_gzip_measurement_is_bound_and_admitted_before_checkpoint_respool() {
+        let t = tempfile::tempdir().unwrap();
+        let o = options(t.path());
+        let root = t.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let baseline = export::Baseline::scratch(&root, o.limits.export, || false).unwrap();
+        fs::write(root.join("data"), vec![7; 1 << 20]).unwrap();
+        let config = json!({"os":"linux","architecture":"amd64","config":{}});
+        let mut measurements = LayerMeasurements::default();
+        export_stage(
+            &root,
+            &o.output,
+            &config,
+            Some(&baseline),
+            o.limits.export,
+            export::Encoding {
+                compression: export::Compression::Gzip,
+                max_blob_bytes: o.limits.image.max_layer_bytes,
+            },
+            None,
+            &mut measurements,
+            None,
+            &|| false,
+            || Ok(()),
+        )
+        .unwrap();
+        let metadata = image::load_layout(&o.output, None, o.limits.image, || false).unwrap();
+        let descriptor = &metadata.layers[0];
+        let diff = &metadata.diff_ids[0];
+        let raw = measurements.spool_bytes(descriptor, diff).unwrap().unwrap();
+        assert!(raw > 1 << 20);
+        assert!(descriptor.size < 16384);
+        assert_eq!(
+            LayerMeasurements::default()
+                .spool_bytes(descriptor, diff)
+                .unwrap(),
+            None
+        );
+        for field in ["digest", "media", "size", "diff"] {
+            let mut changed = descriptor.clone();
+            let mut id = diff.clone();
+            match field {
+                "digest" => changed.digest = format!("sha256:{}", "0".repeat(64)),
+                "media" => {
+                    changed.media_type = "application/vnd.docker.image.rootfs.diff.tar.gzip".into()
+                }
+                "size" => changed.size += 1,
+                "diff" => id = format!("sha256:{}", "0".repeat(64)).parse().unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                measurements.spool_bytes(&changed, &id).unwrap(),
+                None,
+                "{field}"
+            );
+        }
+        let paths = crate::build_resources::Paths {
+            work: root,
+            output: o.output.clone(),
+            store: t.path().to_owned(),
+        };
+        let mut snapshot = crate::build_resources::Snapshot::observe(&paths).unwrap();
+        let policy =
+            crate::build_resources::Policy::resolve(paths, &snapshot, Default::default(), 1, 0)
+                .unwrap();
+        for fs in &mut snapshot.filesystems {
+            fs.total_bytes = 1 << 30;
+            fs.available_bytes = (256 << 20) + 65536 + raw / 2;
+        }
+        let mut required = crate::build_resources::Requirement {
+            path: o.output.clone(),
+            bytes: descriptor.size as u64,
+            inodes: 1,
+        };
+        assert!(
+            policy
+                .check_snapshot(&snapshot, "stored alone", &[required.clone()])
+                .is_ok()
+        );
+        required.bytes = raw;
+        assert!(
+            policy
+                .check_snapshot(&snapshot, "known raw spool", &[required])
+                .is_err()
+        );
+        let spool = t.path().join("blocked-spool");
+        fs::write(&spool, b"sentinel").unwrap();
+        let error = verify_fresh_checkpoint(
+            &o.output,
+            &config["config"],
+            None,
+            (0, 0),
+            &spool,
+            o.limits,
+            Some(&policy),
+            &mut measurements,
+            None,
+            &|| false,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("resource observation") && error.contains("must be a directory"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&spool).unwrap(), b"sentinel");
+        let (_, usage) = verify_fresh_checkpoint(
+            &o.output,
+            &config["config"],
+            None,
+            (0, 0),
+            t.path(),
+            o.limits,
+            Some(&policy),
+            &mut measurements,
+            None,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(usage.0, raw);
+        assert_eq!(
+            measurements.spool_bytes(descriptor, diff).unwrap(),
+            Some(raw)
+        );
+    }
+
     #[test]
     fn heredoc_run_keeps_shell_user_environment_and_body() {
         let t = tempfile::tempdir().unwrap();
