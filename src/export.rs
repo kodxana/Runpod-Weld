@@ -1316,6 +1316,8 @@ pub(crate) fn export_checkpoint(
 ) -> Result<(Exported, Baseline), Error> {
     #[cfg(target_os = "linux")]
     {
+        // Share the large exporter across engine and test callback types.
+        let stop: &dyn Fn() -> bool = &cancelled;
         let mut next = None;
         let manifest = linux::export(
             root,
@@ -1323,7 +1325,7 @@ pub(crate) fn export_checkpoint(
             config,
             limits,
             encoding,
-            &cancelled,
+            &stop,
             || Ok(()),
             Some(baseline),
             resources,
