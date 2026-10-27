@@ -27,6 +27,7 @@ pub(crate) struct Encoding {
 pub(crate) struct Exported {
     pub manifest: Descriptor,
     pub layer: EncodedLayer,
+    #[cfg(target_os = "linux")]
     pub owned_checkpoint: Option<OwnedCheckpoint>,
 }
 
@@ -35,8 +36,6 @@ pub(crate) struct Exported {
 mod owned;
 #[cfg(target_os = "linux")]
 pub(crate) use owned::OwnedCheckpoint;
-#[cfg(not(target_os = "linux"))]
-pub(crate) struct OwnedCheckpoint;
 
 /// Required resource budgets. Layer bytes include tar headers/padding. Metadata
 /// counts path/link bytes, PAX records, headers and serialized OCI JSON in total.
