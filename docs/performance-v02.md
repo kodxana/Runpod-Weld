@@ -129,6 +129,12 @@ complete mutation journal, so it does not authorize skipping inventories.
 Follow-ups must preserve verification, inode ownership, corruption detection,
 metadata and cancellation behavior.
 
+The [component diagnostic](verification-cost-v02.md) separates that verified-read
+cost: its accepted cold case spent 40.01 seconds in SHA updates, 7.20 seconds
+reading, and 0.28 seconds in cancellation callbacks. SHA-NI was already selected.
+Those instrumented results identify repeated checkpoint hashing as the target;
+they are not an additional release speedup.
+
 One allocation-only follow-up borrows anchor paths and symlink targets in the
 temporary inventory grouping map instead of cloning them. The owned inventory,
 logical budget charges, filesystem reads, hashes and cancellation checks remain

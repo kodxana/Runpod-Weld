@@ -76,9 +76,10 @@ immutability, and public/cache inode isolation. Deliberate public-output mutatio
 also passed. The diagnostic's local differential tests covered 252 combinations
 of reads, callbacks, errors and output, preserving original operation order.
 
-The next architectural investigation is whether checkpoint storage can validate
-shared payloads at an explicit bounded transaction boundary instead of repeatedly
-processing whole inherited chains. Existing arbitrary-callback APIs, corruption
+The [managed publication-session proposal](checkpoint-verification-design.md)
+investigates reusing evidence for continuously owned payloads while still
+durably committing each completed instruction. Its complete write boundary
+remains an unresolved prerequisite. Existing arbitrary-callback APIs, corruption
 and healthy-retry tests, ownership checks, durability and public inode isolation
 remain requirements. A publication-wide inode/size memo is not an integrity
 proof; the earlier failed hash-skipping implementation remains rolled back.
