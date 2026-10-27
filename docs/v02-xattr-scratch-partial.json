@@ -1,0 +1,365 @@
+{
+  "schema": 1,
+  "status": "INCOMPLETE_CONTROLLER_FAILURE",
+  "speedup_established": false,
+  "failure_cause": "Parent did not renew the 90-second supervision lease; watchdog interrupted second-pair acceptance. Not a builder failure.",
+  "freeze": {
+    "baseline_provenance_sha256": "dd083d180e17c1699992368835925406ef342f1f8e88d2e3ad47af18d9277c73",
+    "baseline_revision": "d6fe610d4f38522ca0192fd39b3f531650c4ecbe",
+    "baseline_sha256": "67f5d1232ffa650e45aca8af25aefc8e7bc628e907b5da36eeb3f5c6e9bfa1cf",
+    "baseline_tree": "c9040f3ac8efd7465d3e12001a383c21524c76b0",
+    "candidate_provenance_sha256": "f315254ad40f20069bebb8840b5487b724aa626454e7cabec290165b3892ebc8",
+    "candidate_revision": "e41a8ea0df588fc3f2d58ccdf1e5c5509d943516",
+    "candidate_sha256": "8ec37fb9b072529c99f05ab0a8096c8b98193d86227d0d36f11187831abd176f",
+    "candidate_tree": "ca89c5350e093643c5b83c94bf6a4ac912e071a7",
+    "changed_paths": [
+      "src/context.rs"
+    ],
+    "parent_of_candidate": "d6fe610d4f38522ca0192fd39b3f531650c4ecbe",
+    "prep_manifest_sha256": "3b9fbf673119efe469d0cb2e3cadcc9729cf82071b7ecf94be3e1b455584f3c0"
+  },
+  "method": {
+    "planned_order": [
+      "baseline",
+      "candidate",
+      "candidate",
+      "baseline"
+    ],
+    "planned_builds": 4,
+    "attempted_builds": 3,
+    "accepted_builds": 2,
+    "complete_pairs": 1,
+    "completed_balanced_comparisons": 0,
+    "small_files": 100000,
+    "small_file_bytes": 1024,
+    "payload_bytes": 1048576,
+    "cold_means": "empty managed store; no OS page-cache flush",
+    "allocation_tree_sampler": "disabled during builds",
+    "proc_interval_seconds": 0.5,
+    "build_limit_seconds": 300,
+    "supervisor_limit_seconds": 2100,
+    "retries": 0,
+    "timing_excludes": "independent replay and pair acceptance"
+  },
+  "environment": {
+    "cpu_model": "AMD EPYC 9B45 128-Core Processor",
+    "cpu_affinity": [
+      15,
+      58,
+      114,
+      120,
+      143,
+      186,
+      242,
+      248
+    ],
+    "kernel": "Linux 5094d554cc55 6.8.0-147-generic #147-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 24 11:33:16 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux",
+    "cgroup": {
+      "memory.max": "32000000000\n",
+      "memory.current": "178229248\n",
+      "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "cpu.max": "max 100000\n",
+      "io.stat": "259:6 rbytes=0 wbytes=13094912 rios=0 wios=105 dbytes=0 dios=0\n259:4 rbytes=69632 wbytes=13094912 rios=2 wios=105 dbytes=0 dios=0\n259:8 rbytes=0 wbytes=13144064 rios=0 wios=109 dbytes=0 dios=0\n259:9 rbytes=0 wbytes=13144064 rios=0 wios=109 dbytes=0 dios=0\n259:5 rbytes=0 wbytes=13131776 rios=0 wios=106 dbytes=0 dios=0\n259:7 rbytes=4096 wbytes=13131776 rios=1 wios=106 dbytes=0 dios=0\n9:0 rbytes=73728 wbytes=72400896 rios=3 wios=320 dbytes=0 dios=0\n"
+    },
+    "disk_observation": "Filesystem     Type      1B-blocks      Used   Available Use% Mounted on\noverlay        overlay 85899345920 166608896 85732737024   1% /\n",
+    "build_filesystem": "overlay",
+    "host_bind_filesystem": "xfs",
+    "local_backing_io_probe": "PASS"
+  },
+  "accepted_results": [
+    {
+      "variant": "baseline",
+      "repetition": 0,
+      "position": 0,
+      "case": "cold",
+      "wall_seconds": 39.88553480897099,
+      "cpu_user_seconds": 15.471169,
+      "cpu_system_seconds": 24.226796,
+      "returncode": 0,
+      "timed_out": false,
+      "acceptance_seconds": 141.6007327150437,
+      "proc_io": {
+        "cancelled_write_bytes": 516362240,
+        "cpu_ticks_including_waited_children": 3968,
+        "rchar": 19108957935,
+        "read_bytes": 0,
+        "syscr": 2481733,
+        "syscw": 616650,
+        "wchar": 1399690294,
+        "write_bytes": 1707352064
+      },
+      "layer_bytes": 259244544,
+      "new_layer_bytes": 259244544,
+      "allocated_before": {
+        "allocated_bytes": 414334976,
+        "logical_bytes": 105891164,
+        "unique_inodes": 100012
+      },
+      "allocated_retained": {
+        "allocated_bytes": 1609039872,
+        "logical_bytes": 4361700185,
+        "unique_inodes": 200276
+      },
+      "allocation_scopes": {
+        "all_retained": {
+          "allocated_bytes": 1609039872,
+          "logical_bytes": 4361700185,
+          "unique_inodes": 200276
+        },
+        "context": {
+          "allocated_bytes": 414334976,
+          "logical_bytes": 105891084,
+          "unique_inodes": 100009
+        },
+        "output": {
+          "allocated_bytes": 259276800,
+          "logical_bytes": 259251767,
+          "unique_inodes": 15
+        },
+        "store": {
+          "allocated_bytes": 259575808,
+          "logical_bytes": 2333167189,
+          "unique_inodes": 173
+        },
+        "work": {
+          "allocated_bytes": 675852288,
+          "logical_bytes": 1663389947,
+          "unique_inodes": 100074
+        }
+      },
+      "output_blob_hashes": {
+        "35cf2970b19b62abea73cb4ab58e7e63b8a5de0ea546ad35c0767187d5bd8df5": "35cf2970b19b62abea73cb4ab58e7e63b8a5de0ea546ad35c0767187d5bd8df5",
+        "5382dd5d40910d3e704884e01d9d44a56a855e111993ee3e773245ff1fa8311a": "5382dd5d40910d3e704884e01d9d44a56a855e111993ee3e773245ff1fa8311a",
+        "595e3e49f3ca9ad32e8907a304619b868c549a4541f0dd8a1eaa9c518b4c7ce2": "595e3e49f3ca9ad32e8907a304619b868c549a4541f0dd8a1eaa9c518b4c7ce2",
+        "74856cf38c8876c7c015628efdb591d89174e98af3690a4b57eb614a70281354": "74856cf38c8876c7c015628efdb591d89174e98af3690a4b57eb614a70281354",
+        "85b07d264c9d6a81649ac295eb5dd264623df2a4dd95124e632e4839ded6c78c": "85b07d264c9d6a81649ac295eb5dd264623df2a4dd95124e632e4839ded6c78c",
+        "a60ebcbe57847c2ae5b3d2ff56d18d8943927d1c06c1d46fae868aac92ac26b3": "a60ebcbe57847c2ae5b3d2ff56d18d8943927d1c06c1d46fae868aac92ac26b3",
+        "c5181f20541d6e154075b9ccd130074888485f807f595996b6375dbc2deb98be": "c5181f20541d6e154075b9ccd130074888485f807f595996b6375dbc2deb98be",
+        "e41cc09ce334a941ecc8a613ab221248cefc083650a74066daafcda327cb4bee": "e41cc09ce334a941ecc8a613ab221248cefc083650a74066daafcda327cb4bee",
+        "eaf56210e37bb40df9d7d147c57576cb25835184b75ab4495e14c04089e5fe02": "eaf56210e37bb40df9d7d147c57576cb25835184b75ab4495e14c04089e5fe02",
+        "f79cb74fcd260f2acd5b5be8ccaff0f4f3f312bbd3cbf525e06e970f0ce0e3dc": "f79cb74fcd260f2acd5b5be8ccaff0f4f3f312bbd3cbf525e06e970f0ce0e3dc"
+      },
+      "cache_log": {
+        "executed": [
+          "V02_EXEC_application",
+          "V02_EXEC_config",
+          "V02_EXEC_dependencies"
+        ],
+        "hits": []
+      },
+      "command": [
+        "/var/tmp/weld-xattr-DVCl2mXw/payload/baseline/bin/rpweld",
+        "build",
+        "--no-host-dns",
+        "--base",
+        "fixture=/var/tmp/weld-xattr-DVCl2mXw/scratch/base",
+        "-t",
+        "v02-performance:fixture",
+        "--work-dir",
+        "/var/tmp/weld-xattr-DVCl2mXw/scratch/pair-00/baseline/cold-work",
+        "--output",
+        "/var/tmp/weld-xattr-DVCl2mXw/scratch/pair-00/baseline/cold-output",
+        "/var/tmp/weld-xattr-DVCl2mXw/scratch/pair-00/baseline/context"
+      ],
+      "independent_acceptance": "PASS"
+    },
+    {
+      "variant": "candidate",
+      "repetition": 0,
+      "position": 1,
+      "case": "cold",
+      "wall_seconds": 40.2187663600198,
+      "cpu_user_seconds": 15.133665,
+      "cpu_system_seconds": 24.881004,
+      "returncode": 0,
+      "timed_out": false,
+      "acceptance_seconds": 152.68773878499633,
+      "proc_io": {
+        "cancelled_write_bytes": 516362240,
+        "cpu_ticks_including_waited_children": 4000,
+        "rchar": 19108970438,
+        "read_bytes": 0,
+        "syscr": 2481851,
+        "syscw": 616650,
+        "wchar": 1399690331,
+        "write_bytes": 1707360256
+      },
+      "layer_bytes": 259244544,
+      "new_layer_bytes": 259244544,
+      "allocated_before": {
+        "allocated_bytes": 414334976,
+        "logical_bytes": 105891144,
+        "unique_inodes": 100012
+      },
+      "allocated_retained": {
+        "allocated_bytes": 1609039872,
+        "logical_bytes": 4361700190,
+        "unique_inodes": 200276
+      },
+      "allocation_scopes": {
+        "all_retained": {
+          "allocated_bytes": 1609039872,
+          "logical_bytes": 4361700190,
+          "unique_inodes": 200276
+        },
+        "context": {
+          "allocated_bytes": 414334976,
+          "logical_bytes": 105891072,
+          "unique_inodes": 100009
+        },
+        "output": {
+          "allocated_bytes": 259276800,
+          "logical_bytes": 259251767,
+          "unique_inodes": 15
+        },
+        "store": {
+          "allocated_bytes": 259575808,
+          "logical_bytes": 2333167210,
+          "unique_inodes": 173
+        },
+        "work": {
+          "allocated_bytes": 675852288,
+          "logical_bytes": 1663389947,
+          "unique_inodes": 100074
+        }
+      },
+      "output_blob_hashes": {
+        "35cf2970b19b62abea73cb4ab58e7e63b8a5de0ea546ad35c0767187d5bd8df5": "35cf2970b19b62abea73cb4ab58e7e63b8a5de0ea546ad35c0767187d5bd8df5",
+        "5382dd5d40910d3e704884e01d9d44a56a855e111993ee3e773245ff1fa8311a": "5382dd5d40910d3e704884e01d9d44a56a855e111993ee3e773245ff1fa8311a",
+        "595e3e49f3ca9ad32e8907a304619b868c549a4541f0dd8a1eaa9c518b4c7ce2": "595e3e49f3ca9ad32e8907a304619b868c549a4541f0dd8a1eaa9c518b4c7ce2",
+        "74856cf38c8876c7c015628efdb591d89174e98af3690a4b57eb614a70281354": "74856cf38c8876c7c015628efdb591d89174e98af3690a4b57eb614a70281354",
+        "85b07d264c9d6a81649ac295eb5dd264623df2a4dd95124e632e4839ded6c78c": "85b07d264c9d6a81649ac295eb5dd264623df2a4dd95124e632e4839ded6c78c",
+        "a60ebcbe57847c2ae5b3d2ff56d18d8943927d1c06c1d46fae868aac92ac26b3": "a60ebcbe57847c2ae5b3d2ff56d18d8943927d1c06c1d46fae868aac92ac26b3",
+        "c5181f20541d6e154075b9ccd130074888485f807f595996b6375dbc2deb98be": "c5181f20541d6e154075b9ccd130074888485f807f595996b6375dbc2deb98be",
+        "e41cc09ce334a941ecc8a613ab221248cefc083650a74066daafcda327cb4bee": "e41cc09ce334a941ecc8a613ab221248cefc083650a74066daafcda327cb4bee",
+        "eaf56210e37bb40df9d7d147c57576cb25835184b75ab4495e14c04089e5fe02": "eaf56210e37bb40df9d7d147c57576cb25835184b75ab4495e14c04089e5fe02",
+        "f79cb74fcd260f2acd5b5be8ccaff0f4f3f312bbd3cbf525e06e970f0ce0e3dc": "f79cb74fcd260f2acd5b5be8ccaff0f4f3f312bbd3cbf525e06e970f0ce0e3dc"
+      },
+      "cache_log": {
+        "executed": [
+          "V02_EXEC_application",
+          "V02_EXEC_config",
+          "V02_EXEC_dependencies"
+        ],
+        "hits": []
+      },
+      "command": [
+        "/var/tmp/weld-xattr-DVCl2mXw/payload/candidate/bin/rpweld",
+        "build",
+        "--no-host-dns",
+        "--base",
+        "fixture=/var/tmp/weld-xattr-DVCl2mXw/scratch/base",
+        "-t",
+        "v02-performance:fixture",
+        "--work-dir",
+        "/var/tmp/weld-xattr-DVCl2mXw/scratch/pair-00/candidate/cold-work",
+        "--output",
+        "/var/tmp/weld-xattr-DVCl2mXw/scratch/pair-00/candidate/cold-output",
+        "/var/tmp/weld-xattr-DVCl2mXw/scratch/pair-00/candidate/context"
+      ],
+      "independent_acceptance": "PASS"
+    }
+  ],
+  "complete_pair_checks": {
+    "cross_arm_output_mutation_and_cache_isolation": "PASS",
+    "exact_all_OCI_bytes": "PASS",
+    "seconds_outside_build": 58.08484117599437,
+    "source_immutability": "PASS"
+  },
+  "third_build_unaccepted": {
+    "wall_seconds": 40.84747034299653,
+    "cpu_user_seconds": 15.13806,
+    "cpu_system_seconds": 25.484361,
+    "returncode": 0,
+    "timed_out": false,
+    "proc_io": {
+      "cancelled_write_bytes": 516362240,
+      "cpu_ticks_including_waited_children": 4060,
+      "rchar": 19108970033,
+      "read_bytes": 0,
+      "syscr": 2481851,
+      "syscw": 616650,
+      "wchar": 1399690336,
+      "write_bytes": 1707360256
+    },
+    "variant": "candidate",
+    "repetition": 1,
+    "independent_acceptance": "INTERRUPTED; not accepted"
+  },
+  "fourth_build": "NOT_ATTEMPTED",
+  "first_pair_elapsed_difference_percent": 0.8354696825423114,
+  "supervisor_status_verbatim": {
+    "accepted_builds": 0,
+    "benchmark_deadline_utc": "2026-10-27T17:40:29.365599+00:00",
+    "error": "expired/invalid liveness lease",
+    "finished_at": "2026-10-27T17:18:09.891154+00:00",
+    "manifest_sha256": "706a065c2d3c6114d03be36889c3d0f1493e9c461d5c0e1bfabbd571ac2a0722",
+    "partial_logs_preserved": true,
+    "pod_delete_deadline_utc": "2026-10-27T18:02:59.148000+00:00",
+    "pod_id": "uam6ufwm0rxakt",
+    "speed_claim": false,
+    "status": "FAIL"
+  },
+  "supervisor_count_caveat": "accepted_builds in supervisor-status is set to four only on whole-run success; use individual accepted results for the partial count of two.",
+  "collection": {
+    "verification": "PASS",
+    "files": 67,
+    "sha256": "1f94992f91666e7d0b99ec8c3ca03358046ee390ea1252362d08e61ee169030f",
+    "bytes": 14333878
+  },
+  "teardown": {
+    "pod_id": "uam6ufwm0rxakt",
+    "created_at": "2026-10-27T17:02:59.148Z",
+    "absence_verified_at": "2026-10-27T17:22:43Z",
+    "delete": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\n  \"status\": 204\n}"
+        }
+      ],
+      "isError": false
+    },
+    "read_back": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\n  \"detail\": \"pod not found\",\n  \"status\": 404,\n  \"title\": \"Not Found\",\n  \"hint\": \"No such resource on this account: verify the id with the matching list- tool before retrying.\"\n}"
+        }
+      ],
+      "isError": true
+    },
+    "complete_inventory": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\n  \"pagination\": {\n    \"hasNextPage\": false,\n    \"nextCursor\": null\n  },\n  \"pods\": []\n}"
+        }
+      ],
+      "isError": false
+    },
+    "cleanup_reminder_removal": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"scheduledTaskId\":\"scheduled-task:command:mcp:b1246078-adba-470d-8a7b-cccf8bc120e8:schedule-task:weld-xattr-e41a8ea-cleanup-20261027\",\"deleted\":true}"
+        }
+      ],
+      "structuredContent": {
+        "scheduledTaskId": "scheduled-task:command:mcp:b1246078-adba-470d-8a7b-cccf8bc120e8:schedule-task:weld-xattr-e41a8ea-cleanup-20261027",
+        "deleted": true
+      },
+      "isError": false
+    },
+    "estimated_hourly_compute_and_disk_usd": 0.33095890410958906,
+    "estimated_lifecycle_seconds": 1183.852,
+    "cost_is_estimate_not_billing": true,
+    "estimated_cost_usd": 0.10883510015220701
+  },
+  "limits": [
+    "One accepted pair cannot establish speedup or regression.",
+    "Do not compare absolute times with the previous profile: host CPU and observation settings changed.",
+    "No allocator-total measurement was collected in this release-only comparison.",
+    "No full Nemotron build, Docker timing comparison, GPU or registry workload."
+  ]
+}

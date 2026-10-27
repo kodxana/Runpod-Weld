@@ -122,11 +122,12 @@ unique layer and six for a reused layer during publication. Those are baseline
 counts, not a retained reduction or a new Pod timing result. Post-ownership
 corruption can still poison retries under the existing stable-store contract.
 
-The next investigation is reducing repeated full-tree inventories where COPY
-provides an exact changed-path set. Any change must preserve verification on
-consumption, inode ownership, cache corruption detection, metadata and
-cancellation behavior. The benchmark does not authorize bypassing those checks
-or assuming arbitrary RUN commands have known writes.
+The [subsequent Pod profile](checkpoint-profile-v02.md) attributes large-file
+cost mainly to repeated verified reads and identifies repeated xattr-buffer
+allocation during many-file COPY preparation. COPY's target list is not a
+complete mutation journal, so it does not authorize skipping inventories.
+Follow-ups must preserve verification, inode ownership, corruption detection,
+metadata and cancellation behavior.
 
 One allocation-only follow-up borrows anchor paths and symlink targets in the
 temporary inventory grouping map instead of cloning them. The owned inventory,
