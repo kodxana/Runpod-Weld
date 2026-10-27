@@ -37,8 +37,8 @@ instructions. `quiet` hides these engine lines only and preserves raw RUN
 stdout/stderr. Otherwise RUN output is prefixed with stage, instruction and stream
 identifiers; CR progress records become lines and long records are split into
 bounded chunks. Engine phase messages carry `[weld]`. Diagnostics, registry
-transfer output and final results remain visible. These modes do not change cache identity. RUN can itself print secrets;
-progress does not echo Dockerfile arguments or environment values.
+transfer output and final results remain visible. These modes do not change cache identity. Supplied-secret RUN stdout/stderr is suppressed in every progress mode;
+other RUNs can print sensitive data. Progress does not echo Dockerfile arguments or environment values.
 
 Base-cache lock waits, image verification, blob storage, base-layer preparation,
 checkpoint export/restoration and stage publication report their phase and elapsed
@@ -134,25 +134,39 @@ subset. Weld never downloads or executes a Dockerfile frontend. Other versions,
 custom frontends, repeated/misplaced declarations and other parser directives
 remain rejected by the builder.
 
-`RUN --mount=type=secret,id=HF_TOKEN,required=false command` has a deliberately
-limited **optional absent-secret** profile. No secret is supplied or mounted;
-there is no `--secret` injection or ARG/environment fallback. IDs accept only
-ASCII letters, digits, `_` and `-`. All three options must occur exactly once
-(order is immaterial); other options, required secrets, multiple mounts and
-malformed flags are rejected. The command retains ordinary shell/JSON/heredoc,
-SHELL and USER semantics. Weld reports the absence explicitly and includes the
-profile and ID in cache identity.
+Weld supports bounded file secrets and persisted package caches in RUN without
+`CAP_SYS_ADMIN`, native mounts or namespaces:
 
-Before the RUN and before its instruction-cache lookup, Weld requires
-`/run/secrets/<id>` to be absent in the current image rootfs. Confined Linux
-traversal rejects existing paths, any symlink (including dangling links), mount
-crossings and unresolved errors. It never reads secret contents, removes
-inherited paths or follows a host escape. Whole-stage cache shortcuts are bypassed
-for these stages so the checks run at the correct intermediate filesystem state;
-instruction caches and their cumulative budgets still apply. This is not general
-BuildKit secret-mount emulation: images with inherited secret paths deliberately
-fail, regardless of how Docker handles an omitted optional mount. See the
-[pinned Dockerfile regression and profile tests](tests/fixtures/optional-secret/README.md).
+```sh
+rpweld build -t my-app --secret id=HF_TOKEN,src=/private/hf-token .
+```
+
+```dockerfile
+RUN --mount=type=secret,id=HF_TOKEN,required=true command-reading-the-file
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.npm npm ci
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get update && apt-get install -y git
+```
+
+Secrets default to `/run/secrets/<id>` with mode `0400`, UID/GID 0 and
+`required=false`; `target`, `mode`, `uid`, and `gid` are supported. Sources must
+be private, owned regular files outside all build inputs and cache areas.
+Supplied-secret RUN output is suppressed, including quiet mode. Missing optional
+secrets still require an absent target; inherited secret paths are never consumed.
+
+Package caches default to the private managed `run-cache-v1` namespace. Explicit
+unmanaged builds require `--cache-mount-dir DIR`. Omitted, `shared`, and `locked`
+sharing all use exclusive cooperative serialization; `private` is unsupported.
+`--no-cache` still reuses package caches. Cache contents and secret inputs are
+excluded from instruction fingerprints, and all temporary targets are removed or
+restored before any image checkpoint. Secret and cache mounts cannot share a RUN.
+
+These are temporary ordinary files/directories, **not tmpfs or kernel mounts**.
+Handled errors and cancellation restore the image after descendants stop.
+SIGKILL, OOM termination or power loss can leave secret files in private failed
+work; do not reuse it, and clean it only after confirming descendants have stopped.
+Trusted RUN commands can deliberately copy or disclose secrets. See the
+[complete supported profile, resource limits and cleanup contract](docs/run-mounts.md).
 
 The automatic global args `BUILDPLATFORM`/`TARGETPLATFORM` default to `linux/amd64`,
 `BUILDOS`/`TARGETOS` to `linux`, `BUILDARCH`/`TARGETARCH` to `amd64`, and
@@ -462,7 +476,7 @@ storage. Keep build contexts and source images stable throughout a build.
 
 `--platform linux/amd64` is accepted and validated. Other architectures and
 multi-platform lists are rejected. This is not a BuildKit backend; remote
-BuildKit caches, secret/SSH mounts and unchanged `docker buildx` commands are
+General BuildKit mounts, SSH forwarding and unchanged `docker buildx` commands are
 not supported.
 
 ### Inspect local storage

@@ -143,7 +143,7 @@ pub fn scan(source: &str) -> Report {
         let mut end_line = line;
         if arguments.contains("<<") {
             let result = (if name == "RUN" {
-                crate::build_plan::optional_secret(arguments, start).map(|(_, command)| command)
+                crate::build_plan::run_mounts(arguments, start).map(|(_, command)| command)
             } else {
                 Ok(arguments)
             })
@@ -296,10 +296,10 @@ fn split_instruction(text: &str) -> (&str, &str) {
 
 fn inspect(report: &mut Report, line: usize, name: &str, arguments: &str) {
     let arguments = if name == "RUN" && arguments.starts_with("--") {
-        match crate::build_plan::optional_secret(arguments, line) {
-            Ok((Some(id), command)) => {
-                report.diagnostic(line, "review", "optional_absent_secret",
-                    &format!("No secret supplied for {id}; builder requires /run/secrets/{id} absent and rejects symlinks before RUN or cache reuse."), Some(name));
+        match crate::build_plan::run_mounts(arguments, line) {
+            Ok((mounts, command)) if !mounts.is_empty() => {
+                report.diagnostic(line, "review", "run_mounts",
+                    "Bounded file secrets/cache materialization; inherited secret paths and symlink targets are refused. Cache sharing is serialized.", Some(name));
                 command
             }
             _ => arguments,

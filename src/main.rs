@@ -36,6 +36,7 @@ Usage:
 
   rpweld build -f DOCKERFILE [--base NAME=LAYOUT] [--base-ref NAME=REFERENCE]
     --output NEWDIR --work-dir NEWDIR [--build-arg KEY=VALUE] [--host-dns] [--verbose]
+    [--secret id=ID,src=FILE] [--cache-mount-dir DIR]
     [--progress auto|plain|quiet] [--target STAGE] [--no-cache] [--pull] [--platform linux/amd64]
     [--export-mode layered|flattened]
     [--max-rootfs-bytes N] [--max-layer-bytes N] [--metadata-budget N] [--max-entries N]
@@ -345,6 +346,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
     let mut bases = BTreeMap::new();
     let mut references = BTreeMap::new();
     let mut build_args = BTreeMap::new();
+    let mut run_mounts = rpweld::run_mounts::Options::default();
     let mut context = None;
     let mut host_dns = false;
     let mut no_host_dns = false;
@@ -365,6 +367,23 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
         let (option, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+        if !positional && ["--secret", "--cache-mount-dir"].contains(&option) {
+            let value = inline
+                .or_else(|| iter.next().map(String::as_str))
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| format!("missing value for {option}"))?;
+            if option == "--secret" {
+                let (id, source) = rpweld::run_mounts::parse_secret(value)?;
+                if run_mounts.secrets.len() >= rpweld::run_mounts::MAX_MOUNTS
+                    || run_mounts.secrets.insert(id, source).is_some()
+                {
+                    return Err("duplicate secret id or more than 8 sources".into());
+                }
+            } else if run_mounts.cache_dir.replace(value.into()).is_some() {
+                return Err("duplicate --cache-mount-dir".into());
+            }
+            continue;
+        }
         if !positional && ["-t", "--tag", "--progress", "--export-mode"].contains(&option) {
             let value = inline
                 .or_else(|| iter.next().map(String::as_str))
@@ -579,6 +598,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildCli, String> {
             cache: None,
             managed_cache: None,
             no_cache,
+            run_mounts,
             args: build_args,
             bases: bases
                 .into_iter()
@@ -664,8 +684,41 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
     }
     // An explicitly selected Dockerfile can itself be a managed input.
     let early_lease = source_lease(std::path::Path::new(&cli.dockerfile))?;
+    let excluded: Vec<_> = [&cli.options.context, &cli.options.work, &cli.options.output]
+        .into_iter()
+        .map(|p| p.as_path())
+        .chain(std::iter::once(std::path::Path::new(&cli.dockerfile)))
+        .chain(cli.options.bases.values().map(|b| b.layout.as_path()))
+        .collect();
+    // Source locations are validated before the Dockerfile can be read or fingerprinted.
+    // Cache-store lease validation happens after prepare_build selects the store.
+    let mut source_options = cli.options.run_mounts.clone();
+    source_options.cache_dir = None;
+    rpweld::run_mounts::validate_inputs(&source_options, &excluded, early_lease.as_ref())
+        .map_err(|e| e.to_string())?;
     let source = read_build_source(&cli.dockerfile)?;
     let lease = prepare_build(&source, &mut cli, early_lease, out)?;
+    if let Some(cache) = &cli.options.run_mounts.cache_dir {
+        let cache = rpweld::store_access::resolved(cache).map_err(|e| e.to_string())?;
+        let auth = rpweld::registry::auth_path(&cli.registry)?;
+        let cert = cli
+            .registry
+            .cert_dir
+            .as_deref()
+            .map(rpweld::store_access::resolved)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if auth.starts_with(&cache)
+            || cert
+                .as_ref()
+                .is_some_and(|p| p.starts_with(&cache) || cache.starts_with(p))
+        {
+            return Err(
+                "registry credentials and certificates must be disjoint from RUN cache directories"
+                    .into(),
+            );
+        }
+    }
     let result = match lease.as_ref() {
         Some(lease) => {
             #[cfg(target_os = "linux")]
@@ -894,6 +947,9 @@ fn prepare_build(
     }
     if !cli.options.no_cache {
         cli.options.managed_cache = Some(store.clone());
+    }
+    if cli.options.run_mounts.cache_dir.is_none() {
+        cli.options.run_mounts.cache_dir = Some(store.join("run-cache-v1"));
     }
     let auth = registry::auth_path(&cli.registry)?;
     registry::check_cache_secret_paths(&cli.registry, &store)?;

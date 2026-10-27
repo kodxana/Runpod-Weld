@@ -937,6 +937,7 @@ mod linux {
             store.join("cache-v1"),
             store.join("cache-v2"),
             store.join("base-cache-v1"),
+            store.join("run-cache-v1"),
         ] {
             if auth.starts_with(&area) || cert.as_ref().is_some_and(|p| p.starts_with(&area)) {
                 return Err(

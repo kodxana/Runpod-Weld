@@ -829,6 +829,7 @@ mod linux {
                             if path.starts_with("cache-v1")
                                 || path.starts_with("cache-v2")
                                 || path.starts_with("base-cache-v1")
+                                || path.starts_with("run-cache-v1")
                             {
                                 count(&mut self.out.cache_usage, &mut self.cache_seen, &m);
                             } else {
@@ -1274,6 +1275,17 @@ mod linux {
                 scan.tag(&root, p);
             } else if ["base-cache-v1", "cache-v1"].contains(&s) {
                 scan.area(&root, p);
+            } else if s == "run-cache-v1" {
+                // Package caches have their own lock/provenance and no retirement protocol.
+                // Protect the complete namespace, including interrupted staging entries.
+                scan.out.protected_entries.push(entry(
+                    p.into(),
+                    Status::Protected,
+                    Ownership::Unknown,
+                ));
+                if let Some(d) = scan.dir(&root, p, p) {
+                    scan.usage(&d, p, 1);
+                }
             } else if s == "cache-v2" {
                 if !cache_validated_separately {
                     scan.shared_cache(&root);

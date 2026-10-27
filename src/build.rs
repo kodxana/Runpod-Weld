@@ -109,6 +109,8 @@ pub struct BuildOptions {
     /// Explicit managed store for shared checkpoint blobs; mutually exclusive with cache.
     pub managed_cache: Option<PathBuf>,
     pub no_cache: bool,
+    /// File secret inputs and persisted package cache; never fingerprinted.
+    pub run_mounts: crate::run_mounts::Options,
 }
 
 /// Successful OCI publication and retained engine work directory.
@@ -139,7 +141,7 @@ enum Step {
         workdir: String,
         env: Vec<String>,
         user: String,
-        absent_secret: Option<String>,
+        mounts: Vec<crate::run_mounts::Mount>,
     },
 }
 
@@ -149,60 +151,6 @@ struct Checkpoint {
     operation: &'static str,
     config: Value,
     args: BTreeMap<String, String>,
-}
-
-/// Verify absence without reading data, following links, or modifying the image.
-/// Like the rest of the builder this requires an exclusively owned, stable tree.
-#[cfg(target_os = "linux")]
-fn validate_absent_secret(root: &Path, id: &str) -> Result<()> {
-    use std::os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::fs::OpenOptionsExt,
-    };
-    #[repr(C)]
-    struct How {
-        flags: u64,
-        mode: u64,
-        resolve: u64,
-    }
-    let root = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(root)?;
-    let path = std::ffi::CString::new(format!("run/secrets/{id}"))?;
-    let how = How {
-        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
-        mode: 0,
-        // NO_XDEV | NO_MAGICLINKS | NO_SYMLINKS | BENEATH. Even dangling
-        // symlinks reject; only ENOENT proves this profile's absence.
-        resolve: 1 | 2 | 4 | 8,
-    };
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root.as_raw_fd(),
-            path.as_ptr(),
-            &how,
-            std::mem::size_of::<How>(),
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(());
-        }
-        return Err(format!(
-            "optional absent secret {id}: cannot prove /run/secrets/{id} absent: {error}"
-        )
-        .into());
-    }
-    drop(unsafe { OwnedFd::from_raw_fd(fd as i32) });
-    Err(format!("optional absent secret {id}: /run/secrets/{id} exists; refusing inherited secret path (no secret supplied)").into())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn validate_absent_secret(_root: &Path, _id: &str) -> Result<()> {
-    Err("optional absent secret validation requires Linux".into())
 }
 
 // The stage directory is newly created and leased before this function. Source
@@ -936,7 +884,7 @@ fn preflight_checkpoints(
                 charge = charge
                     .checked_add(
                         command.len()
-                            + i.absent_secret.as_ref().map_or(0, String::len)
+                            + format!("{:?}", i.mounts).len()
                             + wd.len()
                             + user.len()
                             + entries.iter().map(String::len).sum::<usize>(),
@@ -947,7 +895,7 @@ fn preflight_checkpoints(
                     workdir: wd.clone(),
                     env: entries,
                     user: user.clone(),
-                    absent_secret: i.absent_secret.clone(),
+                    mounts: i.mounts.clone(),
                 });
             }
         }
@@ -1970,6 +1918,19 @@ fn build_inner_checked(
     {
         crate::store_access::validate_path(path, lease)?;
     }
+    crate::run_mounts::validate_inputs(
+        &options.run_mounts,
+        &[
+            options.context.as_path(),
+            options.work.as_path(),
+            options.output.as_path(),
+        ]
+        .into_iter()
+        .chain(options.bases.values().map(|b| b.layout.as_path()))
+        .chain(options.dockerfile.iter().map(|p| p.as_path()))
+        .collect::<Vec<_>>(),
+        lease,
+    )?;
     let plan = resolve_plan(source, &options.args, options.limits.max_plan_bytes)?;
     let policy = context::load_policy(&options.context, options.dockerfile.as_deref(), &cancelled)?;
     let selected = selected_stages(&plan, options.target.as_deref())?;
@@ -2433,7 +2394,7 @@ fn build_stage(
     if let Some(entry) = &cache_entry
         // Whole-stage replay cannot validate an intermediate RUN's input tree.
         // Keep instruction caching, whose guard runs against each input rootfs.
-        && !steps.iter().any(|s| matches!(s, Step::Run { absent_secret: Some(_), .. }))
+        && !steps.iter().any(|s| matches!(s, Step::Run { mounts, .. } if !mounts.is_empty()))
         && stage_cache.as_ref().unwrap().lookup(
             entry,
             options.limits,
@@ -2753,15 +2714,18 @@ fn build_stage(
             continue;
         }
         for step in instruction_steps {
-            if let Step::Run {
-                absent_secret: Some(id),
-                ..
-            } = step
-            {
-                validate_absent_secret(&root, id)?;
-                eprintln!(
-                    "Note: optional secret {id}: no secret supplied; /run/secrets/{id} verified absent."
-                );
+            if let Step::Run { mounts, .. } = step {
+                #[cfg(target_os = "linux")]
+                crate::run_mounts::validate_targets(&root, mounts, &options.run_mounts)?;
+                for mount in mounts {
+                    if let crate::run_mounts::Mount::Secret { id, .. } = mount
+                        && !options.run_mounts.secrets.contains_key(id)
+                    {
+                        eprintln!(
+                            "Note: optional secret {id}: no secret supplied; target verified absent."
+                        );
+                    }
+                }
             }
         }
         let mut fingerprint_summary: Option<context::Summary> = None;
@@ -3011,11 +2975,8 @@ fn build_stage(
                     workdir,
                     env,
                     user,
-                    absent_secret,
+                    mounts,
                 } => {
-                    if let Some(id) = absent_secret {
-                        validate_absent_secret(&root, id)?;
-                    }
                     let run_state = state.join(index.to_string());
                     fs::create_dir(&run_state)?;
                     let dns = if options.host_dns {
@@ -3025,7 +2986,7 @@ fn build_stage(
                     };
                     let result = worker(
                         &root, &run_state, command, workdir, env, user, options, lease, &run_label,
-                        &cancelled,
+                        mounts, resources, &cancelled,
                     );
                     // Restore even on failed/cancelled RUN; restoration errors are fatal.
                     if let Some(dns) = dns {
@@ -3473,6 +3434,123 @@ fn worker(
     options: &BuildOptions,
     lease: Option<&crate::store_lease::StoreLease>,
     log_label: &str,
+    mounts: &[crate::run_mounts::Mount],
+    resources: Option<&crate::build_resources::Policy>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if mounts.iter().any(|m| m.is_secret()) {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            // This work directory was created exclusively by this build. Keep
+            // materialized files private even when legacy output parents are public.
+            let work = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(root.parent().ok_or("missing work directory")?)?;
+            work.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+        let admission = |path: &Path, bytes, inodes| {
+            resource_check(
+                resources,
+                "RUN mount materialization",
+                &[crate::build_resources::Requirement {
+                    path: path.to_owned(),
+                    bytes,
+                    inodes,
+                }],
+            )
+            .map_err(|e| io::Error::other(e.to_string()))
+        };
+        let mut mount_options = options.run_mounts.clone();
+        mount_options.limits = crate::run_mounts::Limits {
+            max_bytes: options.limits.max_rootfs_bytes,
+            max_entries: options.limits.max_rootfs_entries,
+            max_metadata_bytes: options.limits.layer.max_metadata_bytes,
+        };
+        let mounts_guard = crate::run_mounts::MountGuard::prepare(
+            root,
+            state,
+            mounts,
+            &mount_options,
+            Some(&admission),
+            cancelled,
+        )?;
+        let hide_output = mounts.iter().any(|m| match m {
+            crate::run_mounts::Mount::Secret { id, .. } => {
+                options.run_mounts.secrets.contains_key(id)
+            }
+            _ => false,
+        });
+        if hide_output {
+            eprintln!("[weld] Secret RUN: stdout/stderr suppressed to protect secret data.");
+        }
+        let failure = std::cell::RefCell::new(None);
+        let last = std::cell::Cell::new(std::time::Instant::now());
+        let monitor = || {
+            if cancelled() {
+                return true;
+            }
+            if last.get().elapsed() >= Duration::from_secs(1) {
+                last.set(std::time::Instant::now());
+                if let Err(error) = mounts_guard.check_limits() {
+                    *failure.borrow_mut() = Some(error);
+                }
+            }
+            failure.borrow().is_some()
+        };
+        let result = worker_command(
+            root,
+            state,
+            command,
+            wd,
+            env,
+            user,
+            options,
+            lease,
+            log_label,
+            hide_output,
+            &monitor,
+        );
+        // worker_command returns only after the lease guard has reaped descendants.
+        let restored = mounts_guard.finish(result.is_ok(), Some(&admission), cancelled);
+        if let Some(error) = failure.into_inner() {
+            return Err(error.into());
+        }
+        match (result, restored) {
+            (Err(error), Err(cleanup)) => {
+                Err(format!("{error}; RUN mount cleanup also failed: {cleanup}").into())
+            }
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            root, state, command, wd, env, user, options, lease, log_label, mounts, resources,
+            cancelled,
+        );
+        Err("RUN mounts require Linux".into())
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Retains captured RUN state alongside the existing process and lease parameters"
+)]
+fn worker_command(
+    root: &Path,
+    state: &Path,
+    command: &str,
+    wd: &str,
+    env: &[String],
+    user: &str,
+    options: &BuildOptions,
+    lease: Option<&crate::store_lease::StoreLease>,
+    log_label: &str,
+    hide_output: bool,
     c: &impl Fn() -> bool,
 ) -> Result<()> {
     let timeout = options.limits.run_timeout_seconds;
@@ -3507,7 +3585,7 @@ fn worker(
     #[cfg(target_os = "linux")]
     let stop_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(target_os = "linux")]
-    let sinks = if options.progress {
+    let sinks = if options.progress && !hide_output {
         use std::os::fd::AsFd;
         Some((
             crate::progress::RunOutput::new(io::stdout().as_fd(), stop_output.clone())?,
@@ -3516,7 +3594,9 @@ fn worker(
     } else {
         None
     };
-    if options.progress {
+    if hide_output {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    } else if options.progress {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
     #[cfg(target_os = "linux")]
@@ -3771,28 +3851,38 @@ mod tests {
     #[test]
     fn absent_secret_guard_never_reads_deletes_or_follows_inherited_paths() {
         use std::{fs, os::unix::fs::symlink};
+        let mounts = crate::run_mounts::parse("--mount=type=secret,id=HF_TOKEN true")
+            .unwrap()
+            .0;
+        let validate = |root: &Path| {
+            crate::run_mounts::validate_targets(
+                root,
+                &mounts,
+                &crate::run_mounts::Options::default(),
+            )
+        };
         let t = tempfile::tempdir().unwrap();
         let root = t.path().join("root");
         fs::create_dir(&root).unwrap();
-        super::validate_absent_secret(&root, "HF_TOKEN").unwrap();
+        validate(&root).unwrap();
         fs::create_dir_all(root.join("run/secrets")).unwrap();
-        super::validate_absent_secret(&root, "HF_TOKEN").unwrap();
+        validate(&root).unwrap();
         let target = root.join("run/secrets/HF_TOKEN");
         fs::write(&target, b"inherited-canary").unwrap();
-        assert!(super::validate_absent_secret(&root, "HF_TOKEN").is_err());
+        assert!(validate(&root).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"inherited-canary");
         fs::remove_file(&target).unwrap();
         let outside = t.path().join("outside-canary");
         fs::write(&outside, b"outside-canary").unwrap();
         for link in [&outside, &t.path().join("missing-canary")] {
             symlink(link, &target).unwrap();
-            assert!(super::validate_absent_secret(&root, "HF_TOKEN").is_err());
+            assert!(validate(&root).is_err());
             assert_eq!(fs::read_link(&target).unwrap(), *link);
             fs::remove_file(&target).unwrap();
         }
         fs::remove_dir(root.join("run/secrets")).unwrap();
         symlink(t.path(), root.join("run/secrets")).unwrap();
-        assert!(super::validate_absent_secret(&root, "HF_TOKEN").is_err());
+        assert!(validate(&root).is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"outside-canary");
     }
     use super::*;
@@ -3919,6 +4009,7 @@ mod tests {
             target: None,
             cache: None,
             no_cache: false,
+            run_mounts: Default::default(),
             limits: Limits {
                 image: image::Limits {
                     max_metadata_bytes: 1024 * 1024,

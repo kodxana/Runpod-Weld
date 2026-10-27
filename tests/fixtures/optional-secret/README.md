@@ -1,4 +1,4 @@
-# Optional absent-secret profile
+# Optional-secret absence regression
 
 `Dockerfile.nemotron` is unchanged from
 https://github.com/kodxana/nemotron-bolt-runpod/blob/91ee1316e21f624082c90cc07fcbbec1d9499550/Dockerfile
@@ -22,6 +22,10 @@ RPWELD_TEST_LAYOUT=/path/to/local/alpine-oci cargo test --test instruction_cache
 They cover cold/no-cache execution, guarded instruction hits, ID invalidation,
 and rejection of inherited files, dangling symlinks and non-directory parents
 with cold and cached predecessor stages. No network or actual token is used.
-The profile intentionally rejects inherited paths; it does not claim equivalence
+The absent-source case still intentionally rejects inherited paths; it does not claim equivalence
 to Docker's behavior when an optional secret was not provided. No Docker oracle
 or GPU build is required for these limited-profile tests.
+
+Real injection and bounded package cache lifecycle are covered by `tests/run_mounts.rs`
+and the ignored offline BusyBox/chroot tests in `tests/run_mounts_cli.rs`. See
+[RUN mount profile](../../../docs/run-mounts.md).

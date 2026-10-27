@@ -18,7 +18,7 @@ fn scanner_understands_only_validated_backward_stages() {
     }
     let pinned = dockerfile::scan(include_str!("fixtures/optional-secret/Dockerfile.nemotron"));
     assert_eq!(pinned.diagnostics.len(), 1, "{:?}", pinned.diagnostics);
-    assert_eq!(pinned.diagnostics[0].code, "optional_absent_secret");
+    assert_eq!(pinned.diagnostics[0].code, "run_mounts");
 }
 
 #[test]
@@ -33,7 +33,9 @@ fn pinned_nemotron_dockerfile_parses_before_target_selection() {
     assert_eq!(plan.stages.len(), 3);
     assert_eq!(plan.stages[0].name.as_deref(), Some("runtime-base"));
     let run = &plan.stages[1].instructions[2];
-    assert_eq!(run.absent_secret.as_deref(), Some("HF_TOKEN"));
+    assert!(
+        matches!(&run.mounts[0], rpweld::run_mounts::Mount::Secret { id, .. } if id == "HF_TOKEN")
+    );
     assert!(
         matches!(&run.kind, build_plan::InstructionKind::Run(build_plan::Run::Shell(command)) if command.starts_with("python3 scripts/bake_models.py"))
     );
@@ -54,9 +56,8 @@ fn secret_exec_and_heredoc_preserve_payloads() {
             "FROM scratch\nRUN --mount=required=false,id=other-token,type=secret {command}\n"
         );
         let plan = build_plan::parse(&source).unwrap();
-        assert_eq!(
-            plan.stages[0].instructions[1].absent_secret.as_deref(),
-            Some("other-token")
+        assert!(
+            matches!(&plan.stages[0].instructions[1].mounts[0], rpweld::run_mounts::Mount::Secret { id, .. } if id == "other-token")
         );
         assert!(dockerfile::scan(&source).scan_complete);
     }
@@ -83,18 +84,13 @@ fn empty_cmd_is_valid_in_scanner() {
 fn invalid_secret_profiles_rejected() {
     for flag in [
         "--mount=type=cache,id=HF_TOKEN,required=false",
-        "--mount=type=secret,id=HF_TOKEN,required=true",
-        "--mount=type=secret,id=HF_TOKEN",
         "--mount=type=secret,id=../HF_TOKEN,required=false",
         "--mount=type=secret,id=/HF_TOKEN,required=false",
-        "--mount=type=secret,id=HF.TOKEN,required=false",
         "--mount=type=secret,id=,required=false",
-        "--mount=type=secret,id=HF_TOKEN,required=false,target=/tmp/token",
         "--mount=type=secret,id=HF_TOKEN,required=false,env=HF_TOKEN",
         "--mount=type=secret,id=HF_TOKEN,required=false,from=base",
         "--mount=type=secret,id=HF_TOKEN,required=false,",
         "--mount=type=secret,id=HF_TOKEN,id=OTHER,required=false",
-        "--mount=type=secret,id=HF_TOKEN,required=false --mount=type=secret,id=X,required=false",
         "--mount type=secret,id=HF_TOKEN,required=false",
     ] {
         assert!(

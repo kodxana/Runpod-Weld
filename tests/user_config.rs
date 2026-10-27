@@ -38,6 +38,7 @@ fn options(root: &Path) -> BuildOptions {
         export_mode: rpweld::build::ExportMode::Flattened,
         target: None,
         no_cache: false,
+        run_mounts: Default::default(),
         limits: Limits {
             image: image::Limits {
                 max_metadata_bytes: 1 << 20,

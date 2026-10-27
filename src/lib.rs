@@ -26,6 +26,7 @@ pub mod progress;
 pub mod registry;
 pub mod resources;
 pub mod rootfs;
+pub mod run_mounts;
 pub mod store_access;
 pub mod store_inventory;
 pub mod store_lease;

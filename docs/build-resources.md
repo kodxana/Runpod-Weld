@@ -13,3 +13,15 @@ Large workload metadata never enlarges untrusted image JSON bounds (16 MiB/docum
 Managed engine operations recheck disk/inode reserves through the existing cancellation path at most once per second when polled. Crossing a reserve stops a RUN and its traced descendants, records failure, and reports the capacity reason. This is cooperative monitoring, not a disk quota: a fast allocation can fill a filesystem between polls. Cgroup memory pressure remains advisory and does not trigger this cancellation.
 
 Before replay, layout copying, checkpoint publication and export, the engine checks the additional allocation estimated from verified entries or the existing export inventory. Export estimates count regular hardlink payloads once, include tar records and padding, and account for independent base-blob copies in layered output. Compressed expansion that is not yet known relies on the configured decompression limit and periodic reserve checks. Estimates and current-space checks do not reserve storage; retained partial work remains available for diagnosis and normal explicit cleanup after a failure.
+
+
+RUN package caches use the same rootfs byte/entry ceilings and layer metadata
+ceiling, both for the complete persisted package namespace and each RUN's
+materialized cache data. Measured copy-in/out admission includes payload bytes,
+per-entry filesystem allocation allowance and inode counts, and uses the actual
+write destination. Mount growth is checked cooperatively once per second while
+RUN executes; fast writers can exceed a ceiling between polls. Publication is
+rejected if the stable post-RUN inventory exceeds it. Temporary copy-out retains
+the old cache until atomic replacement, so old and new payloads coexist; measured
+admission charges the full new allocation. This remains a resource policy, not a
+hard disk quota. Details are in [RUN mounts](run-mounts.md).
