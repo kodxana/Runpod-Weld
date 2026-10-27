@@ -44,6 +44,7 @@ fn raw_pty() -> (std::fs::File, std::fs::File) {
 fn blocked_run_stdout_is_cancelled_and_reaped_without_closing_the_consumer() {
     use std::{
         fs,
+        io::Read,
         os::fd::{AsRawFd, OwnedFd},
         process::Stdio,
         time::{Duration, Instant},
@@ -59,12 +60,17 @@ fn blocked_run_stdout_is_cancelled_and_reaped_without_closing_the_consumer() {
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+static void output_gate(int argc, char **argv) {
+    if (argc > 2 && strstr(argv[2], "managed") != NULL)
+        while (access("/output-ready", F_OK) != 0) usleep(1000);
+}
 int main(int argc, char **argv) {
     int fd = open("/pids", O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0 || dprintf(fd, "%d\n", getpid()) < 0) return 2;
     char block[8192]; memset(block, 'x', sizeof block);
     if (argc > 2 && strstr(argv[2], "complete") != NULL) {
         close(fd);
+        output_gate(argc, argv);
         return write(1, block, sizeof block) == sizeof block ? 0 : 3;
     }
     pid_t child = fork();
@@ -73,6 +79,7 @@ int main(int argc, char **argv) {
         if (setsid() < 0 || dprintf(fd, "%d\n", getpid()) < 0) return 5;
     }
     close(fd);
+    output_gate(argc, argv);
     for (;;) if (write(1, block, sizeof block) < 0) return 6;
 }
 "#,
@@ -101,7 +108,10 @@ int main(int argc, char **argv) {
     {
         fs::write(
             context.join("Dockerfile"),
-            format!("FROM scratch\nCOPY probe /bin/sh\nRUN {command}\n"),
+            format!(
+                "FROM scratch\nCOPY probe /bin/sh\nRUN {command}{}\n",
+                if managed { " managed" } else { "" }
+            ),
         )
         .unwrap();
         let run = tempfile::tempdir_in(tmp.path()).unwrap();
@@ -162,18 +172,29 @@ int main(int argc, char **argv) {
         let mut signalled = false;
         let mut saw_full_pipe = false;
         let mut saw_exited_command = false;
+        let mut output_released = !managed;
         let status = loop {
             let mut available = 0;
             assert_eq!(
                 unsafe { libc::ioctl(consumer.as_raw_fd(), libc::FIONREAD, &mut available) },
                 0
             );
-            saw_full_pipe |= available >= if pty { 4095 } else { 4096 };
+            saw_full_pipe |= output_released && available >= if pty { 4095 } else { 4096 };
             let pids: Vec<i32> = fs::read_to_string(work.join("rootfs/pids"))
                 .unwrap_or_default()
                 .lines()
                 .filter_map(|s| s.parse().ok())
                 .collect();
+            if !output_released && pids.len() == if command == "complete" { 1 } else { 2 } {
+                // Drain only the managed CLI preamble before the probe may write.
+                // Partial records can block a pipe with less than PIPE_BUF free;
+                // after this gate the consumer stays open and entirely undrained.
+                (&consumer)
+                    .read_exact(&mut vec![0; available as usize])
+                    .unwrap();
+                fs::write(work.join("rootfs/output-ready"), b"").unwrap();
+                output_released = true;
+            }
             if command == "complete" && saw_full_pipe && pids.len() == 1 {
                 saw_exited_command |= unsafe { libc::kill(pids[0], 0) } == -1
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
@@ -197,7 +218,8 @@ int main(int argc, char **argv) {
         };
         assert!(
             saw_full_pipe && !status.success(),
-            "{mode} pty={pty} {command}: {status}"
+            "{mode} managed={managed} pty={pty} {command}: {status}; {}",
+            fs::read_to_string(&error).unwrap()
         );
         assert_eq!(
             writer

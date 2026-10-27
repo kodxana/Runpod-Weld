@@ -1921,6 +1921,9 @@ pub(crate) fn build_managed_inner(
 ) -> Result<BuildResult> {
     control.check_output()?;
     record.update(lease, |r| r.phase = crate::build_record::Phase::Building)?;
+    // Share the existing engine instantiation; provenance remains the explicit
+    // control, never the erased cooperative-poll callback.
+    let stop: &dyn Fn() -> bool = &|| control.poll();
     let result = build_inner_checked(
         source,
         options,
@@ -1928,7 +1931,7 @@ pub(crate) fn build_managed_inner(
         Some(record),
         Some(resources),
         Some(control),
-        || control.poll(),
+        stop,
     )
     .map_err(|original| match control.check() {
         Err(error) => format!("{error}; stopped operation: {original}").into(),
