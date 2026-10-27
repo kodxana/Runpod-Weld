@@ -58,11 +58,23 @@ fn optional_secret_absence_runs_offline_and_reuses_guarded_checkpoints() {
 #[test]
 #[ignore = "requires Linux root and RPWELD_TEST_LAYOUT (local Alpine OCI)"]
 fn optional_secret_rejects_inherited_files_and_symlinks_after_cached_prefix() {
-    for setup in [
-        "mkdir -p /run/secrets; printf canary > /run/secrets/HF_TOKEN",
-        "mkdir -p /run/secrets; ln -s /outside-canary /run/secrets/HF_TOKEN",
-        "mkdir -p /run; ln -s /missing /run/secrets",
-        "mkdir -p /run; printf canary > /run/secrets",
+    for (setup, rejection) in [
+        (
+            "mkdir -p /run/secrets; printf canary > /run/secrets/HF_TOKEN",
+            "secret target exists; refusing inherited path",
+        ),
+        (
+            "mkdir -p /run/secrets; ln -s /outside-canary /run/secrets/HF_TOKEN",
+            "secret target exists; refusing inherited path",
+        ),
+        (
+            "mkdir -p /run; ln -s /missing /run/secrets",
+            "(os error 40)",
+        ),
+        (
+            "mkdir -p /run; printf canary > /run/secrets",
+            "(os error 20)",
+        ),
     ] {
         let mut p = Project::new("python");
         // Populate a reusable stage with the inherited path. The protected stage
@@ -75,7 +87,12 @@ fn optional_secret_rejects_inherited_files_and_symlinks_after_cached_prefix() {
             let result = p.build(&args);
             assert!(!result.success, "{}", result.log);
             assert!(
-                result.log.contains("optional absent secret HF_TOKEN"),
+                result.log.contains("[stage 2 instruction 2] RUN START"),
+                "protected instruction was not reached: {}",
+                result.log
+            );
+            assert!(
+                result.log.contains(rejection),
                 "setup={setup}; args={args:?}\n{}",
                 result.log
             );
@@ -824,7 +841,9 @@ fn killed_builder_preserves_completed_instruction_and_previous_tag() {
     p.build(&[]).ok();
     let tag = p.tag();
     let prefix = "FROM alpine\nCOPY requirements.txt /requirements\nRUN printf 'IC_EXEC_%s\\n' durable; cp /requirements /installed\n";
-    p.write("Dockerfile", &format!("{prefix}RUN printf 'IC_EXEC_%s\\n' interrupted; printf '%s' \"$$\" > /interrupted-pid; touch /cancel-ready; sleep 30\n"));
+    // The detached guard intentionally retains the lease and reaps after RUN
+    // finishes when the builder itself is killed. It does not use PDEATHSIG.
+    p.write("Dockerfile", &format!("{prefix}RUN printf 'IC_EXEC_%s\\n' interrupted; printf '%s' \"$$\" > /interrupted-pid; touch /cancel-ready; sleep 2\n"));
     p.serial += 1;
     let killed = p.build_at_signal(p.serial, &[], Some(libc::SIGKILL), "instruction-cache:test");
     assert!(!killed.success, "{}", killed.log);
