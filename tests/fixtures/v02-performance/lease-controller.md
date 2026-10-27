@@ -45,6 +45,10 @@ or combine its samples with the new four-build comparison.
    variables. OpenSSH reads the named key normally; this unattended path needs a
    usable noninteractive key. Agent authentication and SSH configuration files
    are disabled. `--host` is DNS/IPv4 without `root@`; the SSH user is `root`.
+   The public OS-path allowlist includes `PROGRAMDATA`: Windows OpenSSH 9.5
+   exits 255 with empty stderr before connecting without it, even for `ssh -V`.
+   The local tests exercise that real OpenSSH initialization without a key or
+   network connection; the remaining subprocess tests use fake SSH children.
 
    Foreground invocation (the process must remain alive while the parent works):
 

@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -325,6 +326,13 @@ class RemoteTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt' and shutil.which('ssh'), 'Windows OpenSSH regression')
+    def test_real_windows_openssh_initializes_with_public_environment(self):
+        # -V needs no key/network and writes to stderr. Empty stdout is parsed
+        # only after exit zero; missing PROGRAMDATA instead raises SSH 255.
+        with self.assertRaises(json.JSONDecodeError):
+            controller.run_ssh([shutil.which('ssh'), '-V'], 5)
+
     def test_fake_ssh_success_failure_timeout_and_reaping(self):
         self.assertEqual(controller.run_ssh([sys.executable, '-c', 'print("{\\"ok\\":true}")'], 3), {'ok': True})
         with self.assertRaisesRegex(RuntimeError, 'sentinel failure'):

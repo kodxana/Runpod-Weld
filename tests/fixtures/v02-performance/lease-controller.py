@@ -232,8 +232,9 @@ class WindowsJob:
 def run_ssh(command, timeout):
     job, process = WindowsJob(), None
     try:
-        # These OS paths are the only inherited values; no auth environment is read.
-        env = {k: os.environ[k] for k in ('PATH', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP') if k in os.environ}
+        # Windows OpenSSH exits 255 before logging without PROGRAMDATA, even for -V.
+        # Only public OS paths are inherited; no auth environment is read.
+        env = {k: os.environ[k] for k in ('PATH', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'PROGRAMDATA') if k in os.environ}
         with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                                        env=env, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
