@@ -269,8 +269,8 @@ fn inventory(
         c,
     )?;
     // All aliases' metadata is captured before any readlink can touch atime.
-    type LinkGroup = (PathBuf, u64, u64, Option<[u8; 32]>, Option<PathBuf>);
-    let mut groups: HashMap<(u64, u64), LinkGroup> = HashMap::new();
+    type LinkGroup<'a> = (&'a Path, u64, u64, Option<[u8; 32]>, Option<&'a Path>);
+    let mut groups: HashMap<(u64, u64), LinkGroup<'_>> = HashMap::new();
     let mut bytes = 0u64;
     for (path, node) in &mut entries {
         check(c)?;
@@ -288,9 +288,9 @@ fn inventory(
                 anchor.as_os_str().len() as u64
                     + target.as_ref().map_or(0, |p| p.as_os_str().len() as u64),
             )?;
-            node.anchor = anchor.clone();
+            node.anchor = anchor.to_path_buf();
             node.hash = *hash;
-            node.target = target.clone();
+            node.target = target.map(Path::to_path_buf);
             continue;
         }
         let absolute = root.join(path);
@@ -356,7 +356,7 @@ fn inventory(
         )?;
         groups.insert(
             identity(m),
-            (path.clone(), 1, m.nlink(), node.hash, node.target.clone()),
+            (path.as_path(), 1, m.nlink(), node.hash, node.target.as_deref()),
         );
     }
     if groups
@@ -365,6 +365,7 @@ fn inventory(
     {
         return Err(Error::Invalid("hardlinks outside source tree"));
     }
+    drop(groups);
     Ok(Inventory { entries })
 }
 
