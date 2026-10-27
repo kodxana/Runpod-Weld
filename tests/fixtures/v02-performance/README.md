@@ -1,5 +1,9 @@
 # v0.2 Pod performance and acceptance
 
+For the separately sealed `d6fe610` / `e41a8ea` cold-only xattr comparison, use
+the [independent local lease controller](lease-controller.md). Its fresh-session
+handoff replaces manual liveness pulses without changing the sealed payload.
+
 Prepared independently at v0.1.0 commit
 `63b716e1027ceba48bf9c887567419057b1bfd73`. Only these test files are owned by
 this workstream. No candidate execution or Pod creation belongs to preparation.
