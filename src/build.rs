@@ -1516,8 +1516,8 @@ fn verify_checkpoint(
 }
 
 /// Fresh exports copy the already-verified base prefix unchanged. Verify stored
-/// blob hashes again, but decode only the newly generated layer. Cache hits still
-/// use full verification and replay; this evidence never crosses build lifetimes.
+/// blob hashes again, but decode only the next layer above the verified prefix.
+/// Instruction hits may apply that delta; prefix evidence stays within this build.
 #[allow(clippy::too_many_arguments)]
 fn verify_fresh_checkpoint(
     layout: &Path,
@@ -1527,8 +1527,9 @@ fn verify_fresh_checkpoint(
     spool: &Path,
     limits: Limits,
     resources: Option<&crate::build_resources::Policy>,
+    apply_to: Option<&Path>,
     cancelled: &impl Fn() -> bool,
-) -> Result<(Descriptor, (u64, usize))> {
+) -> Result<(image::ImageMetadata, (u64, usize))> {
     let metadata = image::load_layout(layout, None, limits.image, cancelled)?;
     let base_layers = base.map_or(&[][..], |m| m.layers.as_slice());
     let base_ids = base.map_or(&[][..], |m| m.diff_ids.as_slice());
@@ -1552,18 +1553,26 @@ fn verify_fresh_checkpoint(
             .checked_sub(base_usage.1)
             .ok_or("replay entry budget exceeded")?,
     );
-    let descriptor = metadata.layers.last().unwrap();
+    let descriptor = metadata.layers.last().ok_or("checkpoint layer missing")?;
     check_spool_space(resources, spool, descriptor)?;
-    let verified = layer::verify(
+    let mut verified = layer::verify(
         &BlobStore::open(layout)?,
         descriptor,
-        metadata.diff_ids.last().unwrap(),
+        metadata
+            .diff_ids
+            .last()
+            .ok_or("checkpoint diff ID missing")?,
         spool,
         budget,
         cancelled,
     )?;
+    if let Some(root) = apply_to {
+        check_replay_space(resources, root, &verified, cancelled)?;
+        rootfs::apply_layer(root, &mut verified, cancelled)?;
+        root_budget(root, limits, cancelled)?;
+    }
     Ok((
-        metadata.selected,
+        metadata,
         (
             base_usage
                 .0
@@ -2141,7 +2150,7 @@ fn build_inner_checked(
             Base::Image(_) => None,
         })
         .collect();
-    let handoffs = if options.no_cache && options.export_mode == ExportMode::Layered {
+    let handoffs = if options.export_mode == ExportMode::Layered {
         root_handoffs(&plan, &selected)
     } else {
         BTreeMap::new()
@@ -2526,7 +2535,7 @@ fn build_stage(
     let mut base_replay_usage = (0u64, 0usize);
     let mut transferred = false;
     let mut replay_receipt = None;
-    if let Some((source, prepared)) = prepared_base {
+    if let Some((source, prepared)) = prepared_base.filter(|_| !cache_hit) {
         let m = metadata
             .as_ref()
             .ok_or("prepared root base metadata missing")?;
@@ -2568,7 +2577,7 @@ fn build_stage(
     if !transferred
         && export_image
         && options.export_mode == ExportMode::Layered
-        && !cache_hit
+        && (!cache_hit || prepare_handoff.is_some())
         && metadata.is_some()
     {
         replay_receipt = Some(rootfs::ReplayReceipt::new(
@@ -2657,7 +2666,7 @@ fn build_stage(
         preparation.detail(crate::progress::count_bar(m.layers.len(), m.layers.len()));
         preparation.finish();
     }
-    let baseline = if export_image && options.export_mode == ExportMode::Layered && !cache_hit {
+    let mut baseline = if export_image && options.export_mode == ExportMode::Layered && !cache_hit {
         let phase = crate::progress::Phase::start(
             options.progress,
             "  Capturing verified base filesystem (no replay)",
@@ -2666,7 +2675,7 @@ fn build_stage(
             phase.tick();
             cancelled()
         };
-        let baseline = match (&base_path, &metadata, replay_receipt) {
+        let baseline = match (&base_path, &metadata, replay_receipt.take()) {
             (Some(layout), Some(metadata), Some(receipt)) => export::Baseline::capture_replayed(
                 &root,
                 layout,
@@ -2702,6 +2711,9 @@ fn build_stage(
     };
     let mut prior_identity = metadata.as_ref().map(|m| m.selected.digest.to_string());
     let mut last_checkpoint: Option<(PathBuf, Descriptor, Value)> = None;
+    let mut instruction_hits = 0usize;
+    let mut instruction_misses = 0usize;
+    let mut new_layer_bytes = 0u64;
     let mut start = 0usize;
     for boundary in &checkpoints {
         let started = std::time::Instant::now();
@@ -2714,6 +2726,24 @@ fn build_stage(
             );
         }
         let instruction_steps = &steps[start..boundary.end];
+        // The selected base already is a verified checkpoint. An inherited root
+        // WORKDIR is a no-op; do not serialize an empty FROM layer or copy its blobs.
+        if baseline.is_some()
+            && boundary.operation == "FROM"
+            && instruction_steps
+                .iter()
+                .all(|step| matches!(step, Step::Directory { path, .. } if path == "/"))
+        {
+            if options.progress {
+                eprintln!(
+                    "[weld] [stage {} instruction {}] FROM DONE (verified base reused)",
+                    index + 1,
+                    boundary.ordinal
+                );
+            }
+            start = boundary.end;
+            continue;
+        }
         for step in instruction_steps {
             if let Step::Run {
                 absent_secret: Some(id),
@@ -2828,21 +2858,53 @@ fn build_stage(
                 copied.metadata_bytes += summary.metadata_bytes;
                 copy_targets.push(summary.targets);
             }
-            let manifest = restore_checkpoint(
-                entry,
-                &boundary.config,
-                &work,
-                &format!("rootfs-before-{}", boundary.ordinal),
-                &spool,
-                options.limits,
-                resources,
-                &cancelled,
-            )?;
+            let manifest = if baseline.is_some() {
+                let (checkpoint, usage) = verify_fresh_checkpoint(
+                    entry,
+                    &boundary.config,
+                    metadata.as_ref(),
+                    base_replay_usage,
+                    &spool,
+                    options.limits,
+                    resources,
+                    Some(&root),
+                    &cancelled,
+                )?;
+                let manifest = checkpoint.selected.clone();
+                baseline = Some(export::Baseline::capture_checkpoint(
+                    &root,
+                    entry,
+                    &checkpoint,
+                    options.limits.export,
+                    options.limits.image.max_layer_bytes,
+                    &cancelled,
+                )?);
+                metadata = Some(checkpoint);
+                base_replay_usage = usage;
+                if options.progress {
+                    eprintln!(
+                        "[weld]   Applied cached instruction delta; retained verified prefix"
+                    );
+                }
+                manifest
+            } else {
+                restore_checkpoint(
+                    entry,
+                    &boundary.config,
+                    &work,
+                    &format!("rootfs-before-{}", boundary.ordinal),
+                    &spool,
+                    options.limits,
+                    resources,
+                    &cancelled,
+                )?
+            };
             materialized |= instruction_steps
                 .iter()
                 .any(|step| !matches!(step, Step::Directory { path, .. } if path == "/"));
             prior_identity = Some(manifest.digest.to_string());
             last_checkpoint = Some((entry.clone(), manifest, boundary.config.clone()));
+            instruction_hits += 1;
             if options.progress {
                 eprintln!(
                     "  CACHED instruction {} {} [stage {}] {:.3}s",
@@ -2854,6 +2916,19 @@ fn build_stage(
             }
             start = boundary.end;
             continue;
+        }
+        if builder_identity.is_some() {
+            instruction_misses += 1;
+            if options.progress && options.verbose {
+                eprintln!(
+                    "[weld]   Cache miss: {}",
+                    if entry.is_some() {
+                        "no checkpoint for these inputs and predecessor; executing instruction"
+                    } else {
+                        "COPY selection requires execution; downstream identity will be refreshed"
+                    }
+                );
+            }
         }
         let receipt_start = copy_targets.len();
         let run_label = format!("stage {} instruction {} RUN", index + 1, boundary.ordinal);
@@ -2964,20 +3039,38 @@ fn build_stage(
                 options.progress,
                 "  Exporting instruction checkpoint",
             );
-            let exported = export_stage(
-                &root,
-                &snapshot,
-                &checkpoint_config,
-                baseline.as_ref(),
-                options.limits.export,
-                resources,
-                None,
-                &|| {
-                    phase.tick();
-                    cancelled()
-                },
-                || Ok(()),
-            )?;
+            let mut next_baseline = None;
+            let exported = if let Some(base) = &baseline {
+                let (manifest, next) = export::export_checkpoint(
+                    &root,
+                    &snapshot,
+                    &checkpoint_config,
+                    base,
+                    options.limits.export,
+                    resources,
+                    || {
+                        phase.tick();
+                        cancelled()
+                    },
+                )?;
+                next_baseline = Some(next);
+                manifest
+            } else {
+                export_stage(
+                    &root,
+                    &snapshot,
+                    &checkpoint_config,
+                    baseline.as_ref(),
+                    options.limits.export,
+                    resources,
+                    None,
+                    &|| {
+                        phase.tick();
+                        cancelled()
+                    },
+                    || Ok(()),
+                )?
+            };
             phase.finish();
             // Layered engine export repairs only its own readlink observations;
             // the live root already has the archived filesystem state.
@@ -2994,7 +3087,7 @@ fn build_stage(
                 cancelled()
             };
             let manifest = if baseline.is_some() {
-                verify_fresh_checkpoint(
+                let (checkpoint, usage) = verify_fresh_checkpoint(
                     &snapshot,
                     &boundary.config,
                     metadata.as_ref(),
@@ -3002,9 +3095,23 @@ fn build_stage(
                     &spool,
                     options.limits,
                     resources,
+                    None,
                     &verifying,
-                )?
-                .0
+                )?;
+                let manifest = checkpoint.selected.clone();
+                new_layer_bytes = new_layer_bytes
+                    .checked_add(u64::try_from(
+                        checkpoint
+                            .layers
+                            .last()
+                            .ok_or("checkpoint layer missing")?
+                            .size,
+                    )?)
+                    .ok_or("checkpoint byte summary overflow")?;
+                metadata = Some(checkpoint);
+                base_replay_usage = usage;
+                baseline = next_baseline;
+                manifest
             } else {
                 restore_checkpoint(
                     &snapshot,
@@ -3056,6 +3163,15 @@ fn build_stage(
         start = boundary.end;
     }
     check(&cancelled)?;
+    if options.progress && builder_identity.is_some() {
+        eprintln!(
+            "[weld] Stage {} cache: {} instruction hits, {} misses; {} new layer bytes",
+            index + 1,
+            instruction_hits,
+            instruction_misses,
+            new_layer_bytes
+        );
+    }
     if !export_image {
         if options.progress {
             eprintln!("[weld]   Keeping COPY-only stage filesystem; no intermediate image export");
@@ -3151,6 +3267,16 @@ fn build_stage(
         )?
     };
     output_phase.finish();
+    if let Some(limit) = prepare_handoff {
+        if cache_hit {
+            exported_receipt = replay_receipt.filter(|receipt| receipt.metadata_bytes() <= limit);
+            verified_replay_usage = Some(base_replay_usage);
+        } else if output_reuses_checkpoint
+            && let (Some(base), Some(current)) = (&baseline, &metadata)
+        {
+            exported_receipt = base.receipt(&root, &current.config, limit, &cancelled)?;
+        }
+    }
     if !cache_hit && (cache_entry.is_some() || !final_stage) {
         // Export traverses directories: COPY --from must consume the exported
         // metadata even with caching disabled or a metadata-only stage suffix.
@@ -3166,7 +3292,17 @@ fn build_stage(
             phase.tick();
             cancelled()
         };
-        let verified = if baseline.is_some() {
+        let verified = if baseline.is_some() && output_reuses_checkpoint {
+            // This exact checkpoint was already decoded. The output is an independent
+            // copy; verify all stored digests without decompressing the prefix again.
+            let copied =
+                image::load_layout(&output, None, options.limits.image, verification_cancelled)?;
+            if copied.selected != manifest || copied.config["config"] != config["config"] {
+                return Err("copied checkpoint identity/config changed".into());
+            }
+            verified_replay_usage = Some(base_replay_usage);
+            copied.selected
+        } else if baseline.is_some() {
             let (verified, usage) = verify_fresh_checkpoint(
                 &output,
                 &config["config"],
@@ -3175,10 +3311,11 @@ fn build_stage(
                 &spool,
                 options.limits,
                 resources,
+                None,
                 &verification_cancelled,
             )?;
             verified_replay_usage = Some(usage);
-            verified
+            verified.selected
         } else if output_reuses_checkpoint {
             // The last instruction already restored this exact snapshot. Copying
             // its OCI blobs does not touch rootfs; verify the output without

@@ -24,7 +24,7 @@ pub(crate) fn key(
     cancelled: &impl Fn() -> bool,
 ) -> Result<String> {
     let mut hash = Sha256::new();
-    field(&mut hash, b"weld-stage-cache-v6-replayed-checkpoints");
+    field(&mut hash, b"weld-stage-cache-v7-incremental-checkpoints");
     field(&mut hash, inputs);
     // Development builds share a version string: bind cache entries to executable bytes.
     let mut executable = fs::File::open(std::env::current_exe()?)?;
@@ -74,7 +74,10 @@ pub(crate) fn key(
 // manifest and this instruction's evaluated inputs. No later context belongs here.
 pub(crate) fn instruction_key(inputs: &[u8]) -> String {
     let mut hash = Sha256::new();
-    field(&mut hash, b"weld-instruction-cache-v2-replayed-checkpoints");
+    field(
+        &mut hash,
+        b"weld-instruction-cache-v3-incremental-checkpoints",
+    );
     field(&mut hash, inputs);
     format!("{:x}", hash.finalize())
 }

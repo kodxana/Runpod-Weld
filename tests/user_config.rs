@@ -206,7 +206,8 @@ fn private_umask_scratch_initial_checkpoint_and_inherited_roots() {
     o.no_cache = false;
     next(&mut o, t.path(), "cold");
     let out = private_umask_build(&o, &store, source, None);
-    assert_private_root_build(&o, &store, &out, 1);
+    // WORKDIR checkpoint plus metadata suffix; every retained root stays 0755.
+    assert_private_root_build(&o, &store, &out, 2);
     assert!(
         !o.work.join("rootfs-exported-2").exists(),
         "cold layered checkpoints must keep the original working root"
@@ -214,12 +215,15 @@ fn private_umask_scratch_initial_checkpoint_and_inherited_roots() {
     next(&mut o, t.path(), "checkpoint-hit");
     let changed = source.replace("revision=one", "revision=two");
     let out = private_umask_build(&o, &store, &changed, None);
-    assert_private_root_build(&o, &store, &out, 1);
-    assert!(o.work.join("rootfs-before-2").is_dir());
+    assert_private_root_build(&o, &store, &out, 2);
+    assert!(
+        !o.work.join("rootfs-before-2").exists(),
+        "layered checkpoint hits apply only the delta to the existing root"
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("CACHED instruction 2 WORKDIR"));
     next(&mut o, t.path(), "whole-stage-hit");
     let out = private_umask_build(&o, &store, &changed, None);
-    assert_private_root_build(&o, &store, &out, 1);
+    assert_private_root_build(&o, &store, &out, 2);
     assert!(String::from_utf8_lossy(&out.stderr).contains("CACHED (verified local stage)"));
     next(&mut o, t.path(), "inherited");
     let out = private_umask_build(
@@ -278,7 +282,7 @@ fn private_umask_nonroot_run_and_explicit_restricted_root() {
     o.no_cache = false;
     next(&mut o, t.path(), "runtime-cold");
     let out = private_umask_build(&o, &store, source, Some(&base));
-    assert_private_root_build(&o, &store, &out, 2);
+    assert_private_root_build(&o, &store, &out, 3);
     next(&mut o, t.path(), "runtime-checkpoint-hit");
     let out = private_umask_build(
         &o,
@@ -286,7 +290,7 @@ fn private_umask_nonroot_run_and_explicit_restricted_root() {
         &source.replace("revision=one", "revision=two"),
         Some(&base),
     );
-    assert_private_root_build(&o, &store, &out, 2);
+    assert_private_root_build(&o, &store, &out, 3);
     assert!(String::from_utf8_lossy(&out.stderr).contains("CACHED instruction 2 RUN"));
     assert_eq!(
         fs::read(o.work.join("rootfs/tmp/rootmode-marker")).unwrap(),

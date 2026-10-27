@@ -15,6 +15,129 @@ fn never_cancel() -> bool {
     false
 }
 
+#[test]
+fn layered_instruction_checkpoints_reuse_prefix_and_apply_only_the_next_delta() {
+    use std::os::unix::fs::MetadataExt;
+    let t = tempfile::tempdir().unwrap();
+    let mut o = options(t.path());
+    o.export_mode = build::ExportMode::Layered;
+    write(&o.context.join("dependency"), &"x".repeat(1024 * 1024));
+    write(&o.context.join("app"), "version-one");
+    let source = "FROM scratch\nCOPY dependency /dependency\nCOPY app /app\n";
+    build::build(source, &o, never_cancel).unwrap();
+    let cold = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+    assert_eq!(
+        cold.layers.len(),
+        2,
+        "two filesystem instruction deltas; FROM reuses the verified base"
+    );
+    let last = cold.layers.last().unwrap();
+    assert!(
+        last.size < 16384,
+        "app delta must not repeat the dependency: {}",
+        last.size
+    );
+    let archive =
+        fs::File::open(o.output.join("blobs").join(last.digest.replace(':', "/"))).unwrap();
+    let paths: Vec<_> = tar::Archive::new(archive)
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().into_owned())
+        .collect();
+    assert_eq!(paths, vec![PathBuf::from("."), PathBuf::from("app")]);
+    let dependency_blob = PathBuf::from("blobs").join(cold.layers[0].digest.replace(':', "/"));
+    let first = o.work.join("checkpoint-image-2").join(&dependency_blob);
+    let second = o.work.join("checkpoint-image-3").join(&dependency_blob);
+    assert_eq!(
+        fs::metadata(&first).unwrap().ino(),
+        fs::metadata(&second).unwrap().ino(),
+        "immutable private checkpoints must share unchanged blob storage"
+    );
+    assert_ne!(
+        fs::metadata(&second).unwrap().ino(),
+        fs::metadata(o.output.join(&dependency_blob)).unwrap().ino(),
+        "mutable public output must have an independent inode"
+    );
+    write(&o.context.join("app"), "version-two");
+    next(&mut o, t.path(), "edit");
+    build::build(source, &o, never_cancel).unwrap();
+    let edited = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+    assert_eq!(
+        &cold.layers[..1],
+        &edited.layers[..1],
+        "unchanged instruction layers stay byte-identical"
+    );
+    assert_eq!(fs::read(o.work.join("rootfs/app")).unwrap(), b"version-two");
+    assert_eq!(
+        fs::metadata(o.work.join("rootfs/dependency"))
+            .unwrap()
+            .len(),
+        1024 * 1024
+    );
+    assert!(
+        !o.work.join("rootfs-before-2").exists(),
+        "prefix hits must not retain a replaced full root"
+    );
+    next(&mut o, t.path(), "warm");
+    build::build(source, &o, never_cancel).unwrap();
+    let warm = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+    assert_eq!(
+        edited.selected, warm.selected,
+        "whole-stage hits preserve exact output"
+    );
+}
+
+#[test]
+fn cached_parent_root_handoff_preserves_prefix_after_a_child_edit() {
+    let t = tempfile::tempdir().unwrap();
+    let mut o = options(t.path());
+    o.export_mode = build::ExportMode::Layered;
+    write(&o.context.join("dependency"), "parent bytes");
+    write(&o.context.join("app"), "one");
+    let source =
+        "FROM scratch AS parent\nCOPY dependency /dependency\nFROM parent\nCOPY app /app\n";
+    for phase in ["cold", "edit"] {
+        if phase == "edit" {
+            write(&o.context.join("app"), "two");
+            next(&mut o, t.path(), phase);
+        }
+        build::build(source, &o, never_cancel).unwrap();
+        assert_eq!(
+            fs::read(o.work.join("rootfs/dependency")).unwrap(),
+            b"parent bytes"
+        );
+        let intermediates: Vec<_> = fs::read_dir(t.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".weld-stages-")
+            })
+            .collect();
+        for intermediate in intermediates {
+            assert!(
+                !intermediate.join("stage-0-work/rootfs").exists(),
+                "eligible cached parent root must move to its last child"
+            );
+            let parent = image::load_layout(
+                intermediate.join("stage-0-image"),
+                None,
+                o.limits.image,
+                never_cancel,
+            )
+            .unwrap();
+            let child = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+            assert!(
+                child.layers.starts_with(&parent.layers),
+                "parent output remains independently verified"
+            );
+        }
+    }
+    assert_eq!(fs::read(o.work.join("rootfs/app")).unwrap(), b"two");
+}
+
 fn stages(root: &Path) -> PathBuf {
     fs::read_dir(root)
         .unwrap()
@@ -181,11 +304,11 @@ fn root_handoff_preserves_link_topology_metadata_and_empty_children() {
 }
 
 #[test]
-fn copied_parents_and_flattened_or_cached_builds_keep_separate_roots() {
+fn copied_parents_and_flattened_builds_keep_separate_roots() {
     for (mode, no_cache, copy) in [
         (build::ExportMode::Layered, true, true),
         (build::ExportMode::Flattened, true, false),
-        (build::ExportMode::Layered, false, false),
+        (build::ExportMode::Layered, false, true),
     ] {
         let t = tempfile::tempdir().unwrap();
         let mut o = options(t.path());
@@ -568,42 +691,45 @@ fn earlier_arg_and_env_inputs_invalidate_only_their_consumers() {
 
 #[test]
 fn corrupted_checkpoint_is_fatal_and_never_publishes_output() {
-    let t = tempfile::tempdir().unwrap();
-    let mut o = options(t.path());
-    write(&o.context.join("requirements"), "dependency==1");
-    write(&o.context.join("app"), "app one");
-    let source = "FROM scratch\nCOPY requirements /requirements\nCOPY app /app\n";
-    build::build(source, &o, never_cancel).unwrap();
-    let checkpoint = image::load_layout(
-        o.work.join("checkpoint-image-2"),
-        None,
-        o.limits.image,
-        never_cancel,
-    )
-    .unwrap();
-    let entry: PathBuf = fs::read_dir(o.cache.as_ref().unwrap())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|path| {
-            image::load_layout(path, None, o.limits.image, never_cancel)
-                .unwrap()
-                .selected
-                == checkpoint.selected
-        })
+    for mode in [build::ExportMode::Flattened, build::ExportMode::Layered] {
+        let t = tempfile::tempdir().unwrap();
+        let mut o = options(t.path());
+        o.export_mode = mode;
+        write(&o.context.join("requirements"), "dependency==1");
+        write(&o.context.join("app"), "app one");
+        let source = "FROM scratch\nCOPY requirements /requirements\nCOPY app /app\n";
+        build::build(source, &o, never_cancel).unwrap();
+        let checkpoint = image::load_layout(
+            o.work.join("checkpoint-image-2"),
+            None,
+            o.limits.image,
+            never_cancel,
+        )
         .unwrap();
-    let digest = checkpoint.layers[0].digest.to_string();
-    fs::write(
-        entry
-            .join("blobs/sha256")
-            .join(digest.strip_prefix("sha256:").unwrap()),
-        b"corrupted",
-    )
-    .unwrap();
-    write(&o.context.join("app"), "app two");
-    next(&mut o, t.path(), "corrupted");
-    assert!(build::build(source, &o, never_cancel).is_err());
-    assert!(!o.output.exists());
-    assert!(!o.work.join("rootfs-before-2").exists());
+        let entry: PathBuf = fs::read_dir(o.cache.as_ref().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|path| {
+                image::load_layout(path, None, o.limits.image, never_cancel)
+                    .unwrap()
+                    .selected
+                    == checkpoint.selected
+            })
+            .unwrap();
+        let digest = checkpoint.layers[0].digest.to_string();
+        fs::write(
+            entry
+                .join("blobs/sha256")
+                .join(digest.strip_prefix("sha256:").unwrap()),
+            b"corrupted",
+        )
+        .unwrap();
+        write(&o.context.join("app"), "app two");
+        next(&mut o, t.path(), "corrupted");
+        assert!(build::build(source, &o, never_cancel).is_err());
+        assert!(!o.output.exists());
+        assert!(!o.work.join("rootfs-before-2").exists());
+    }
 }
 
 #[test]
@@ -705,7 +831,11 @@ fn final_checkpoint_keeps_verified_root_without_second_replay() {
             );
             assert_eq!(fs::read(o.work.join("rootfs/payload")).unwrap(), b"payload");
             if phase == "instruction-hit" {
-                assert!(o.work.join("rootfs-before-2").exists());
+                assert_eq!(
+                    o.work.join("rootfs-before-2").exists(),
+                    mode == build::ExportMode::Flattened,
+                    "layered hits apply only their delta; flattened hits restore a full checkpoint"
+                );
             }
             let output = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
             let store = rpweld::oci::BlobStore::open(&o.output).unwrap();

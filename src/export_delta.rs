@@ -110,6 +110,22 @@ pub(super) fn exported_receipt(
     Ok(Some(receipt))
 }
 
+pub(crate) fn checkpoint_receipt(
+    base: &Baseline,
+    root: &Path,
+    config: &Value,
+    limit: u64,
+    c: &impl Fn() -> bool,
+) -> Result<Option<crate::rootfs::ReplayReceipt>, Error> {
+    let ids = config["rootfs"]["diff_ids"].as_array().ok_or(Error::Invalid("checkpoint receipt diff IDs missing"))?;
+    if ids.len() != base.state.diff_ids.len() || !ids.iter().zip(&base.state.diff_ids)
+        .all(|(actual, expected)| actual.as_str() == Some(expected.as_str())) {
+        return Err(Error::Invalid("checkpoint receipt diff IDs changed"));
+    }
+    let mut remaining = limit;
+    exported_receipt(root, &base.state.inventory, config, &mut remaining, limit, c)
+}
+
 /// Repair only readlink-induced atime changes at an engine checkpoint.
 /// Checkpoints never promise ctime preservation; standalone capture does.
 pub(super) fn restore_observed_links(root: &Path, inventory: &Inventory, c: &impl Fn() -> bool) -> Result<(), Error> {
@@ -153,7 +169,8 @@ pub(crate) struct State {
     pub(super) layers: Vec<Descriptor>,
     diff_ids: Vec<crate::oci::Sha256Digest>,
     history: Option<Value>,
-    blob_limit: u64,
+    pub(super) blob_limit: u64,
+    pub(super) shareable: bool,
 }
 
 enum Targets<'a> {
@@ -446,6 +463,7 @@ pub(crate) fn capture(
                 diff_ids: metadata.diff_ids,
                 history,
                 blob_limit: image_limits.max_layer_bytes,
+                shareable: false,
             },
         })
     })();
@@ -496,7 +514,29 @@ pub(crate) fn capture_replayed(
         diff_ids: metadata.diff_ids.clone(),
         history,
         blob_limit,
+        shareable: false,
     }})
+}
+
+pub(crate) fn capture_checkpoint(
+    root: &Path,
+    layout: &Path,
+    metadata: &crate::image::ImageMetadata,
+    limits: Limits,
+    blob_limit: u64,
+    c: &impl Fn() -> bool,
+) -> Result<Baseline, Error> {
+    let mut remaining = limits.max_metadata_bytes;
+    json_bytes(&metadata.manifest, &mut remaining)?;
+    json_bytes(&metadata.config, &mut remaining)?;
+    let inventory = inventory(root, limits, &mut remaining, None, c)?;
+    restore_observed_links(root, &inventory, c)?;
+    validate_history(metadata.config.get("history"), metadata.layers.len())?;
+    Ok(Baseline { state: State {
+        inventory, layout: Some(layout.to_owned()), layers: metadata.layers.clone(),
+        diff_ids: metadata.diff_ids.clone(), history: metadata.config.get("history").cloned(),
+        blob_limit, shareable: false,
+    } })
 }
 
 // Only the disposable replay namespace is modified. Pin each directory before
@@ -638,6 +678,7 @@ pub(crate) fn scratch(
             diff_ids: Vec::new(),
             history: None,
             blob_limit: 0,
+            shareable: false,
         },
     })
 }
@@ -783,6 +824,19 @@ pub(super) fn inherit(
     remaining: &mut u64,
     c: &impl Fn() -> bool,
 ) -> Result<Vec<Descriptor>, Error> {
+    inherit_with_sharing(base, store, delta, output, remaining, false, c)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn inherit_with_sharing(
+    base: &Baseline,
+    store: &BlobStore,
+    delta: &Descriptor,
+    output: &mut Value,
+    remaining: &mut u64,
+    share_owned: bool,
+    c: &impl Fn() -> bool,
+) -> Result<Vec<Descriptor>, Error> {
     let state = &base.state;
     // Charge all base descriptor and diff-id copies before allocation.
     for descriptor in &state.layers {
@@ -793,13 +847,19 @@ pub(super) fn inherit(
         let source = BlobStore::open(layout)?;
         for descriptor in &state.layers {
             check(c)?;
-            // Public output is mutable; only ManagedCache may share blob inodes.
+            // Public outputs and cache inputs are never adopted as owned inodes.
             let file = source.open_verified(descriptor, state.blob_limit, c)?;
             // Repeated descriptors retain their order but need only one payload.
             match store.open_verified(descriptor, state.blob_limit, c) {
                 Ok(_) => (),
                 Err(crate::oci::Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                    store.ingest(file, descriptor, state.blob_limit, c)?;
+                    if share_owned && state.shareable {
+                        // Both layouts are immutable siblings in this build's owned work.
+                        // A cross-device error is fatal: admission reserved links, not copies.
+                        source.link_verified(store, descriptor, state.blob_limit, c)?;
+                    } else {
+                        store.ingest(file, descriptor, state.blob_limit, c)?;
+                    }
                 }
                 Err(crate::oci::Error::Cancelled) => {
                     return Err(Error::Blob(crate::oci::Error::Cancelled));
@@ -829,6 +889,25 @@ pub(super) fn inherit(
     let mut layers = state.layers.clone();
     layers.push(delta.clone());
     Ok(layers)
+}
+
+pub(super) fn checkpoint_baseline(
+    layout: &Path,
+    layers: Vec<Descriptor>,
+    config: &Value,
+    inventory: Inventory,
+    blob_limit: u64,
+    remaining: &mut u64,
+) -> Result<Baseline, Error> {
+    let ids = config["rootfs"]["diff_ids"].as_array().ok_or(Error::Invalid("checkpoint diff IDs missing"))?;
+    charge(remaining, ids.len() as u64 * 128)?;
+    let diff_ids = ids.iter().map(|id| id.as_str().ok_or(Error::Invalid("checkpoint diff ID invalid"))?
+        .parse().map_err(Error::Blob)).collect::<Result<Vec<_>, _>>()?;
+    let history = config.get("history");
+    if let Some(history) = history { json_bytes(history, remaining)?; }
+    validate_history(history, layers.len())?;
+    Ok(Baseline { state: State { inventory, layout: Some(layout.to_owned()), layers,
+        diff_ids, history: history.cloned(), blob_limit, shareable: true } })
 }
 
 #[cfg(test)]

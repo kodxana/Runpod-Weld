@@ -64,6 +64,43 @@ pub(crate) enum CaptureAllocation<'a> {
 }
 
 impl Baseline {
+    /// Retain symlink evidence for a private checkpoint whose root was not replayed.
+    pub(crate) fn receipt(
+        &self,
+        root: &Path,
+        config: &Value,
+        limit: u64,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<crate::rootfs::ReplayReceipt>, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::delta::checkpoint_receipt(self, root, config, limit, &cancelled)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root, config, limit, cancelled);
+            Err(Error::Invalid("export requires Linux"))
+        }
+    }
+    /// Inventory an engine-owned root after a verified checkpoint was applied.
+    pub(crate) fn capture_checkpoint(
+        root: &Path,
+        layout: &Path,
+        metadata: &crate::image::ImageMetadata,
+        limits: Limits,
+        blob_limit: u64,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::delta::capture_checkpoint(root, layout, metadata, limits, blob_limit, &cancelled)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root, layout, metadata, limits, blob_limit, cancelled);
+            Err(Error::Invalid("export requires Linux"))
+        }
+    }
     /// Reuse the engine's complete initial replay; never reread live symlink targets.
     /// The engine retains the stable base layout and exclusively owns the root.
     pub(crate) fn capture_replayed(
@@ -1030,6 +1067,52 @@ pub(crate) fn export_created_with_resources(
     }
 }
 
+/// Private, immutable instruction layout plus its already-inventoried baseline.
+/// Only these engine-owned layouts may share inherited blob inodes with each other.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn export_checkpoint(
+    root: &Path,
+    destination: &Path,
+    config: &Value,
+    baseline: &Baseline,
+    limits: Limits,
+    resources: Option<&crate::build_resources::Policy>,
+    cancelled: impl Fn() -> bool,
+) -> Result<(Descriptor, Baseline), Error> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut next = None;
+        let manifest = linux::export(
+            root,
+            destination,
+            config,
+            limits,
+            &cancelled,
+            || Ok(()),
+            Some(baseline),
+            resources,
+            linux::SourceState::Checkpoint(&mut next),
+        )?;
+        Ok((
+            manifest,
+            next.ok_or(Error::Invalid("checkpoint baseline missing"))?,
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            root,
+            destination,
+            config,
+            baseline,
+            limits,
+            resources,
+            cancelled,
+        );
+        Err(Error::Invalid("export requires Linux"))
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     pub(super) mod delta {
@@ -1618,6 +1701,7 @@ mod linux {
     pub(super) enum SourceState<'a> {
         Observed,
         Archived(Option<(&'a mut Option<crate::rootfs::ReplayReceipt>, u64)>),
+        Checkpoint(&'a mut Option<Baseline>),
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1736,12 +1820,16 @@ mod linux {
                 let mut seen = std::collections::BTreeSet::new();
                 for descriptor in &base.state.layers {
                     if seen.insert(&descriptor.digest) {
-                        base_bytes = base_bytes
-                            .checked_add(
-                                u64::try_from(descriptor.size)
-                                    .map_err(|_| Error::Invalid("negative base blob size"))?,
-                            )
-                            .ok_or(Error::Limit("export space estimate"))?;
+                        if !matches!(source_state, SourceState::Checkpoint(_))
+                            || !base.state.shareable
+                        {
+                            base_bytes = base_bytes
+                                .checked_add(
+                                    u64::try_from(descriptor.size)
+                                        .map_err(|_| Error::Invalid("negative base blob size"))?,
+                                )
+                                .ok_or(Error::Limit("export space estimate"))?;
+                        }
                         inodes += 1;
                     }
                 }
@@ -1832,13 +1920,27 @@ mod linux {
             .map_err(Error::Layer)?;
         }
         let layers = if let Some(base) = baseline {
-            delta::inherit(base, &store, &layer, &mut output, &mut remaining, c)?
+            if matches!(source_state, SourceState::Checkpoint(_)) {
+                delta::inherit_with_sharing(
+                    base,
+                    &store,
+                    &layer,
+                    &mut output,
+                    &mut remaining,
+                    true,
+                    c,
+                )?
+            } else {
+                delta::inherit(base, &store, &layer, &mut output, &mut remaining, c)?
+            }
         } else {
             output["rootfs"] = json!({"type":"layers", "diff_ids":[layer.digest]});
             output["history"] = json!([{"created_by":"Weld flattened rootfs export", "comment":"Full filesystem snapshot; original layer history replaced."}]);
             vec![layer]
         };
-        if let (SourceState::Archived(_), Some(plan)) = (&source_state, &plan) {
+        if let (SourceState::Archived(_) | SourceState::Checkpoint(_), Some(plan)) =
+            (&source_state, &plan)
+        {
             delta::restore_observed_links(root, &plan.inventory, c)?;
         }
         let config = blob(&store, CONFIG, &json_bytes(&output, &mut remaining)?, c)?;
@@ -1846,7 +1948,7 @@ mod linux {
             &store,
             MANIFEST,
             &json_bytes(
-                &json!({"schemaVersion":2,"mediaType":MANIFEST,"config":config,"layers":layers}),
+                &json!({"schemaVersion":2,"mediaType":MANIFEST,"config":config,"layers":&layers}),
                 &mut remaining,
             )?,
             c,
@@ -1877,8 +1979,24 @@ mod linux {
         pending
             .persist_noclobber(dest.join("index.json"))
             .map_err(|e| Error::Io(e.error))?;
-        if let SourceState::Archived(Some((slot, _))) = source_state {
-            *slot = receipt;
+        match source_state {
+            SourceState::Archived(Some((slot, _))) => *slot = receipt,
+            SourceState::Checkpoint(slot) => {
+                *slot = Some(delta::checkpoint_baseline(
+                    dest,
+                    layers,
+                    &output,
+                    plan.ok_or(Error::Invalid("checkpoint requires layered inventory"))?
+                        .inventory,
+                    baseline
+                        .ok_or(Error::Invalid("checkpoint baseline missing"))?
+                        .state
+                        .blob_limit
+                        .max(limits.max_layer_bytes),
+                    &mut remaining,
+                )?);
+            }
+            _ => (),
         }
         Ok(manifest)
     }
