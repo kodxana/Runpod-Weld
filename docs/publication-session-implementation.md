@@ -1,9 +1,10 @@
 # Managed publication evidence
 
-This implementation supplies the private publication-session slice of
-[the checkpoint design](checkpoint-verification-design.md). Engine dispatch and
-the complete worker/output boundary are separate prerequisites; this change
-alone does not enable the CLI optimization or establish a runtime speedup.
+The managed Linux CLI uses a per-stage publication session for layered instruction
+checkpoints, implementing [the checkpoint design](checkpoint-verification-design.md)
+with [concrete control and pinned output](managed-control-slice.md). It requires
+no new flag. Flattened, unmanaged and public callback-based builds retain full
+verification. Integrated validation and Pod timing remain pending.
 
 `ManagedCache::publication_session` borrows the store lease through the cache
 and borrows concrete `ManagedControl`. `publish_instruction` accepts only the
@@ -49,9 +50,11 @@ select full verification. They do not themselves fail a cache publication.
 
 Any publication error ends the session and drops evidence. Explicit invalidation
 also ends it; further publications fail. Dropping the stage session releases all
-handles. The engine must invalidate/drop before unknown effects, retries, stage
-end and final-stage publication, then use the existing conservative final
-publication API. No evidence survives a restart. These properties rely on the
+handles. The engine invalidates/drops before public output and final-stage
+publication, then uses the existing conservative final publication API. Missing
+exporter provenance ends reuse for the stage. Unknown write effects must end the
+session; the known COPY, RUN, restoration and export paths preserve its writer
+boundary. No evidence survives a restart. These properties rely on the
 documented cooperative stable-store/trusted-workload contract, not isolation
 against hostile same-user writes, mappings or proc aliases.
 

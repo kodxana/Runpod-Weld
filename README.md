@@ -441,6 +441,14 @@ Checkpoint exports still scan and fingerprint the current tree. Private immutabl
 instruction layouts share already-owned inherited blob inodes; public outputs and
 cache ingestion retain independent copies. Incremental COPY inventories remain future work.
 
+Managed Linux builds retain bounded verification evidence for owned layer payloads
+within a stage. Later instruction publications can reuse it; every new physical
+copy and the final stage publication still receive full content verification.
+Each completed instruction remains durably cached. Low descriptor budgets fall
+back to full verification. This applies to the concrete CLI control path under
+the existing cooperative store/trusted-RUN contract; callback-based library APIs
+remain conservative. See [the publication-session contract](docs/publication-session-implementation.md).
+
 With `--no-cache`, intermediate stages used only by `COPY --from` retain their
 owned filesystem without baseline inventory, image serialization, or checkpoint
 verification. The confined copier reads that filesystem directly under the existing

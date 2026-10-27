@@ -2,8 +2,9 @@
 
 This implements the control/output prerequisite in
 [checkpoint-verification-design.md](checkpoint-verification-design.md). This
-slice does not skip hashes, create a publication session, or change cache formats.
-Exporter capability and session integration are separate work.
+control layer does not skip hashes or change cache formats. The integrated
+[publication session](publication-session-implementation.md) uses its closed
+provenance and checked sinks to authorize bounded per-stage evidence reuse.
 
 ## Closed entry and polling
 
@@ -27,15 +28,15 @@ because of a later resource observation.
 `build_recorded_with_resources`. The private managed entry erases its fixed
 polling closure to the same internal `&dyn Fn()` type used by the compatibility
 resource wrapper, avoiding another large engine instantiation. That erasure does
-not create provenance: only the separately passed control authorizes future
+not create provenance: only the separately passed control authorizes
 session use. Internal resource/progress wrappers do not authorize reuse.
 
-The `StageCache::publish` hook currently checks output status and then performs
-the unchanged conservative publication. Parent integration must select the
-managed exporter explicitly, preserve its owned capability before consuming
-`Exported`, and admit physical payloads through the publication session. It must
-not infer ownership or verified content from policy, a path, or the reporting
-scope.
+`StageCache::publish` retains conservative publication. For layered managed
+instruction checkpoints, the engine explicitly selects the managed exporter,
+preserves its owned capability before consuming `Exported`, and admits physical
+payloads through the publication session. It does not infer ownership or verified
+content from policy, a path, or the reporting scope. Final stage publication
+always uses the conservative path after dropping session evidence.
 
 ## Held output objects
 

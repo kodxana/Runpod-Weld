@@ -1,7 +1,9 @@
-# Proposed managed checkpoint publication session
+# Managed checkpoint publication session
 
-Status: design proposal, not implemented or enabled. The write-boundary proof
-below is a prerequisite, not an established property of the current engine.
+Status: implemented in the managed Linux CLI; integrated validation and Pod
+measurement are pending. See [the implementation](publication-session-implementation.md)
+and [the output boundary](managed-control-slice.md). The rationale and source-audit
+constraints below describe the contract this implementation must preserve.
 
 The [accepted Pod diagnostic](verification-cost-v02.md) identifies repeated
 checkpoint hashing as the large-file bottleneck. Its cold 1 GiB fixture hashes
