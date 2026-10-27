@@ -1,0 +1,14 @@
+{
+  "body": {
+    "name": "rpweld-v02-performance-temporary",
+    "cloud": "SECURE",
+    "cpu": {"id": "cpu3g", "vcpuCount": 8},
+    "dataCenterIds": ["EU-CZ-1"],
+    "image": "runpod/base:1.0.2-ubuntu2404",
+    "disk": 100,
+    "mounts": {},
+    "ports": ["22/tcp"],
+    "startSsh": true,
+    "startJupyter": false
+  }
+}
