@@ -1,6 +1,7 @@
 //! Owned checkpoint layouts. All writers retain a shared store lease and keep
 //! published inodes immutable; maintenance must hold the exclusive store lease.
 //! Unknown/pre-protocol directories are never adopted. No deletion API lives here.
+use super::publication_session::{Boundary, Evidence, Verification};
 use crate::{
     build::Error,
     build_cache::{self, COPY_TARGETS},
@@ -10,6 +11,7 @@ use crate::{
     store_access,
     store_lease::StoreLease,
 };
+use crate::{export::OwnedCheckpoint, managed_control::ManagedControl};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
@@ -90,7 +92,77 @@ pub struct ManagedCache<'a> {
     before_objects_sync: Option<fn(&Path) -> io::Result<()>>,
 }
 
+/// One stage's in-memory evidence. Dropping or invalidating it releases every pin.
+pub(crate) struct PublicationSession<'cache, 'lease, 'control> {
+    cache: &'cache ManagedCache<'lease>,
+    control: &'control ManagedControl<'control>,
+    evidence: Evidence,
+    ended: bool,
+}
+
+impl PublicationSession<'_, '_, '_> {
+    pub(crate) fn invalidate(&mut self) {
+        self.evidence.clear();
+        self.ended = true;
+    }
+
+    pub(crate) fn publish_instruction(
+        &mut self,
+        source: &OwnedCheckpoint,
+        key: &str,
+        limits: image::Limits,
+        targets: &[Vec<Vec<u8>>],
+        receipt_metadata_limit: u64,
+    ) -> Result<PathBuf> {
+        if self.ended {
+            return Err("publication session has ended".into());
+        }
+        self.evidence.begin();
+        let phase = crate::progress::Phase::start(
+            self.control.progress_enabled(),
+            "  Publishing instruction checkpoint",
+        );
+        let result = self.cache.publish_inner(
+            source.path(),
+            key,
+            limits,
+            targets,
+            receipt_metadata_limit,
+            &|| {
+                phase.tick();
+                self.control.poll()
+            },
+            &mut Verification::managed(self.control, source, &mut self.evidence),
+        );
+        match result {
+            Ok(path) => {
+                phase.finish();
+                Ok(path)
+            }
+            Err(error) => {
+                self.invalidate();
+                if let Err(control_error) = self.control.check() {
+                    return Err(format!("{control_error}; stopped operation: {error}").into());
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
 impl<'a> ManagedCache<'a> {
+    pub(crate) fn publication_session<'cache, 'control>(
+        &'cache self,
+        control: &'control ManagedControl<'control>,
+        limits: image::Limits,
+    ) -> PublicationSession<'cache, 'a, 'control> {
+        PublicationSession {
+            cache: self,
+            control,
+            evidence: Evidence::new(limits),
+            ended: false,
+        }
+    }
     /// Create an owned namespace atomically, or validate an already owned one.
     /// A pre-existing unmarked directory is an error, including an empty one.
     pub fn open(
@@ -207,6 +279,31 @@ impl<'a> ManagedCache<'a> {
         receipt_metadata_limit: u64,
         cancelled: &impl Fn() -> bool,
     ) -> Result<PathBuf> {
+        self.publish_inner(
+            source,
+            key,
+            limits,
+            targets,
+            receipt_metadata_limit,
+            cancelled,
+            &mut Verification::conservative(),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared transaction preserves public callback ordering"
+    )]
+    fn publish_inner(
+        &self,
+        source: &Path,
+        key: &str,
+        limits: image::Limits,
+        targets: &[Vec<Vec<u8>>],
+        receipt_metadata_limit: u64,
+        cancelled: &impl Fn() -> bool,
+        verification: &mut Verification<'_, '_>,
+    ) -> Result<PathBuf> {
         check_key(key)?;
         check(cancelled)?;
         self.validate()?;
@@ -214,8 +311,11 @@ impl<'a> ManagedCache<'a> {
         let remaining = self.audit_links(cancelled)?;
         store_access::validate_path(source, Some(self.lease))?;
         let receipt = build_cache::receipt_bytes(targets, receipt_metadata_limit)?;
-        let metadata = image::load_layout(source, None, limits, cancelled)?;
         let destination = self.root.join("entries").join(key);
+        // Winners retain complete source verification even in a live session.
+        // Do not move this extra observation onto the public callback path.
+        verification.winner(&destination)?;
+        let metadata = verification.layout(source, limits, Boundary::Source, cancelled)?;
         if exists(&destination)? {
             self.verify_winner(
                 &destination,
@@ -224,6 +324,7 @@ impl<'a> ManagedCache<'a> {
                 limits,
                 receipt_metadata_limit,
                 cancelled,
+                verification,
             )?;
             return Ok(destination);
         }
@@ -250,8 +351,22 @@ impl<'a> ManagedCache<'a> {
         let target = BlobStore::open(temp.path())?;
         for (descriptor, cap) in descriptors(&metadata, limits) {
             check(cancelled)?;
-            self.ensure_blob(&source_store, &pool, descriptor, cap, cancelled)?;
-            pool.link_verified(&target, descriptor, cap, cancelled)?;
+            self.ensure_blob(
+                &source_store,
+                &pool,
+                descriptor,
+                cap,
+                cancelled,
+                verification,
+            )?;
+            verification.link(
+                &pool,
+                &target,
+                descriptor,
+                cap,
+                Boundary::PoolLink,
+                cancelled,
+            )?;
         }
         // Selected-only layout: never copy unreferenced blobs or unrelated source files.
         write_new(
@@ -265,13 +380,14 @@ impl<'a> ManagedCache<'a> {
             }))?,
         )?;
         write_new(&temp.path().join(COPY_TARGETS), &receipt)?;
-        self.verify_entry(
+        self.verify_entry_inner(
             temp.path(),
             key,
             limits,
             receipt_metadata_limit,
             targets.len(),
             cancelled,
+            verification,
         )?;
         sync_dirs(
             &self.root,
@@ -280,6 +396,7 @@ impl<'a> ManagedCache<'a> {
         sync_dirs(temp.path(), &["blobs/sha256", "blobs", ""])?;
         self.validate()?;
         self.audit_links(cancelled)?;
+        verification.finish()?;
         check(cancelled)?;
         match rename_new(temp.path(), &destination) {
             Ok(()) => {
@@ -295,6 +412,7 @@ impl<'a> ManagedCache<'a> {
                     limits,
                     receipt_metadata_limit,
                     cancelled,
+                    verification,
                 )?;
             }
             Err(e) => return Err(e.into()),
@@ -349,6 +467,7 @@ impl<'a> ManagedCache<'a> {
         descriptor: &Descriptor,
         cap: u64,
         cancelled: &impl Fn() -> bool,
+        verification: &mut Verification<'_, '_>,
     ) -> Result<()> {
         let digest = descriptor.digest.parse::<crate::oci::Sha256Digest>()?;
         let object = self.root.join("objects").join(digest.encoded());
@@ -365,13 +484,10 @@ impl<'a> ManagedCache<'a> {
                 .prefix(".ingest-")
                 .tempdir_in(self.root.join("objects"))?;
             let fresh = BlobStore::open(staging.path())?;
-            fresh.ingest(
-                source.open_verified(descriptor, cap, cancelled)?,
-                descriptor,
-                cap,
-                cancelled,
-            )?;
-            let file = fresh.open_verified(descriptor, cap, cancelled)?;
+            let reader =
+                verification.open(source, descriptor, cap, Boundary::IngestSource, cancelled)?;
+            verification.ingest(&fresh, reader, descriptor, cap, cancelled)?;
+            let file = verification.open(&fresh, descriptor, cap, Boundary::Fresh, cancelled)?;
             let meta = file.metadata()?;
             if meta.nlink() != 1 {
                 return Err("new cache blob has unexpected aliases".into());
@@ -399,7 +515,14 @@ impl<'a> ManagedCache<'a> {
         self.sync_objects()?;
         // The durable anchor is published before any pool/entry alias. A crash
         // before this link leaves a reusable owned object, never an adopted inode.
-        BlobStore::open(&object)?.link_verified(pool, descriptor, cap, cancelled)?;
+        verification.link(
+            &BlobStore::open(&object)?,
+            pool,
+            descriptor,
+            cap,
+            Boundary::Anchor,
+            cancelled,
+        )?;
         Ok(())
     }
 
@@ -558,6 +681,31 @@ impl<'a> ManagedCache<'a> {
         instructions: usize,
         cancelled: &impl Fn() -> bool,
     ) -> Result<(image::ImageMetadata, Vec<Vec<Vec<u8>>>)> {
+        self.verify_entry_inner(
+            path,
+            key,
+            limits,
+            receipt_metadata_limit,
+            instructions,
+            cancelled,
+            &mut Verification::conservative(),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared validation preserves the public verification path"
+    )]
+    fn verify_entry_inner(
+        &self,
+        path: &Path,
+        key: &str,
+        limits: image::Limits,
+        receipt_metadata_limit: u64,
+        instructions: usize,
+        cancelled: &impl Fn() -> bool,
+        verification: &mut Verification<'_, '_>,
+    ) -> Result<(image::ImageMetadata, Vec<Vec<Vec<u8>>>)> {
         check(cancelled)?;
         let directory = private_dir(path)?;
         let entry: Entry = read_record(&path.join(ENTRY))?;
@@ -591,7 +739,7 @@ impl<'a> ManagedCache<'a> {
         {
             return Err("cache receipt identity mismatch".into());
         }
-        let metadata = image::load_layout(path, None, limits, cancelled)?;
+        let metadata = verification.layout(path, limits, Boundary::Pending, cancelled)?;
         if metadata.selected.digest != entry.manifest {
             return Err("cache manifest identity mismatch".into());
         }
@@ -600,7 +748,8 @@ impl<'a> ManagedCache<'a> {
         for (descriptor, cap) in descriptors(&metadata, limits) {
             let digest = descriptor.digest.parse::<crate::oci::Sha256Digest>()?;
             names.insert(digest.encoded().to_owned());
-            let pooled = pool.open_verified(descriptor, cap, cancelled)?;
+            let pooled =
+                verification.open(&pool, descriptor, cap, Boundary::FinalPool, cancelled)?;
             let local = fs::symlink_metadata(path.join("blobs/sha256").join(digest.encoded()))?;
             if identity(&pooled.metadata()?) != identity(&local) {
                 return Err("cache blob is not the owned pool inode".into());
@@ -612,6 +761,10 @@ impl<'a> ManagedCache<'a> {
         Ok((metadata, targets))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "winners share complete entry verification"
+    )]
     fn verify_winner(
         &self,
         path: &Path,
@@ -620,17 +773,20 @@ impl<'a> ManagedCache<'a> {
         limits: image::Limits,
         receipt_metadata_limit: u64,
         cancelled: &impl Fn() -> bool,
+        verification: &mut Verification<'_, '_>,
     ) -> Result<()> {
         // A key identifies inputs, not deterministic output bytes or resolved
         // COPY paths. Keep the winner's manifest and receipt together; publishing
         // a loser must neither replace them nor change that build's own output.
-        self.verify_entry(
+        verification.no_reuse();
+        self.verify_entry_inner(
             path,
             key,
             limits,
             receipt_metadata_limit,
             instructions,
             cancelled,
+            verification,
         )?;
         self.audit_links(cancelled)?;
         self.sync_objects()?;
@@ -1495,6 +1651,7 @@ fn rename_new(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("publication_session_tests.rs");
 
     fn limits() -> image::Limits {
         image::Limits {
@@ -1672,7 +1829,14 @@ mod tests {
         // Inject exactly after the atomic object rename, before parent fsync.
         assert!(
             cache
-                .ensure_blob(&source, &pool, &layer, 4096, &|| false)
+                .ensure_blob(
+                    &source,
+                    &pool,
+                    &layer,
+                    4096,
+                    &|| false,
+                    &mut Verification::conservative()
+                )
                 .is_err()
         );
         let digest = &layer.digest[7..];
@@ -1684,13 +1848,27 @@ mod tests {
         reopened.before_objects_sync = Some(fail_sync);
         assert!(
             reopened
-                .ensure_blob(&source, &pool, &layer, 4096, &|| false)
+                .ensure_blob(
+                    &source,
+                    &pool,
+                    &layer,
+                    4096,
+                    &|| false,
+                    &mut Verification::conservative()
+                )
                 .is_err()
         );
         assert!(!pooled.exists());
         reopened.before_objects_sync = None;
         reopened
-            .ensure_blob(&source, &pool, &layer, 4096, &|| false)
+            .ensure_blob(
+                &source,
+                &pool,
+                &layer,
+                4096,
+                &|| false,
+                &mut Verification::conservative(),
+            )
             .unwrap();
         assert!(pool.open_verified(&layer, 4096, || false).is_ok());
     }

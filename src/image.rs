@@ -122,6 +122,22 @@ pub fn load_layout(
 ) -> Result<ImageMetadata, Error> {
     let root = root.as_ref();
     let store = BlobStore::open(root)?;
+    let metadata = load_layout_metadata(root, &store, reference, limits, &cancelled)?;
+    for layer in &metadata.layers {
+        drop(store.open_verified(layer, limits.max_layer_bytes, &cancelled)?);
+    }
+    Ok(metadata)
+}
+
+// Payload policy stays at the caller; all metadata and descriptor validation is
+// shared with the public loader, including its ordering and multiplicity limits.
+pub(crate) fn load_layout_metadata(
+    root: &Path,
+    store: &BlobStore,
+    reference: Option<&str>,
+    limits: Limits,
+    cancelled: &impl Fn() -> bool,
+) -> Result<ImageMetadata, Error> {
     let mut remaining = limits.max_total_metadata_bytes;
     let layout = read_json(
         open_metadata(&root.join("oci-layout"))?,
@@ -175,7 +191,7 @@ pub fn load_layout(
             "selected descriptor platform is not native linux/amd64",
         ));
     }
-    let manifest = read_blob_json(&store, &selected, limits, &mut remaining, &cancelled)?;
+    let manifest = read_blob_json(store, &selected, limits, &mut remaining, cancelled)?;
     let parsed_manifest: Manifest = serde_json::from_value(manifest.clone())?;
     schema(
         parsed_manifest.schema_version,
@@ -197,11 +213,11 @@ pub fn load_layout(
         return Err(invalid("unsupported image config media type"));
     }
     let config = read_blob_json(
-        &store,
+        store,
         &parsed_manifest.config,
         limits,
         &mut remaining,
-        &cancelled,
+        cancelled,
     )?;
     if !native_platform(&config, true)? {
         return Err(invalid("image config platform is not native linux/amd64"));
@@ -247,9 +263,6 @@ pub fn load_layout(
         if layer.size as u64 > limits.max_layer_bytes {
             return Err(Error::Limit("layer bytes"));
         }
-    }
-    for layer in &parsed_manifest.layers {
-        drop(store.open_verified(layer, limits.max_layer_bytes, &cancelled)?);
     }
     Ok(ImageMetadata {
         index,

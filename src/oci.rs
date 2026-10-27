@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 mod cache_store;
 #[cfg(target_os = "linux")]
 pub use cache_store::ManagedCache;
+#[cfg(target_os = "linux")]
+pub(crate) use cache_store::PublicationSession;
+#[cfg(target_os = "linux")]
+#[path = "publication_session.rs"]
+mod publication_session;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -284,6 +289,18 @@ impl BlobStore {
         max_size: u64,
         cancelled: C,
     ) -> Result<File, Error> {
+        let (digest, size, mut file) = self.open_blob(descriptor, max_size, &cancelled)?;
+        verify_stream(&mut file, None, &digest, size, &cancelled)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
+    fn open_blob(
+        &self,
+        descriptor: &Descriptor,
+        max_size: u64,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(Sha256Digest, u64, File), Error> {
         let (digest, size) = descriptor.expected(max_size)?;
         check_cancel(&cancelled)?;
         check_directories(&self.directory)?;
@@ -299,13 +316,11 @@ impl BlobStore {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        let mut file = options.open(&path)?;
+        let file = options.open(&path)?;
         if !file.metadata()?.is_file() {
             return Err(Error::UnsafePath(path));
         }
-        verify_stream(&mut file, None, &digest, size, &cancelled)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
+        Ok((digest, size, file))
     }
 
     /// Link verified content into another store under the trusted stable-directory model.
@@ -395,6 +410,8 @@ fn verify_stream<R: Read>(
         if count == 0 {
             break;
         }
+        #[cfg(all(test, target_os = "linux"))]
+        publication_session::faults::hit(publication_session::faults::Timing::Buffered)?;
         observed += count as u64;
         if observed > expected {
             return Err(Error::SizeMismatch { expected, observed });
