@@ -873,6 +873,7 @@ mod linux {
             work: crate::dockerignore::WORK,
             visited: 0,
             entries: Vec::new(),
+            xattr_scratch: XattrScratch::default(),
             used: Summary::default(),
             limits: Limits {
                 max_entries: 1_000_000,
@@ -911,6 +912,7 @@ mod linux {
             work: crate::dockerignore::WORK,
             visited: 0,
             entries: Vec::new(),
+            xattr_scratch: XattrScratch::default(),
             used: Summary::default(),
             limits,
         };
@@ -1147,6 +1149,7 @@ mod linux {
             work: crate::dockerignore::WORK,
             visited: 0,
             entries: Vec::new(),
+            xattr_scratch: XattrScratch::default(),
             used: Summary::default(),
             limits,
         };
@@ -1214,11 +1217,17 @@ mod linux {
         attrs: Vec<(CString, Vec<u8>)>,
         explicit: bool,
     }
+    #[derive(Default)]
+    struct XattrScratch {
+        names: Vec<u8>,
+        value: Vec<u8>,
+    }
     struct Plan<'a> {
         policy: Option<&'a Policy>,
         work: u64,
         visited: usize,
         entries: Vec<Entry>,
+        xattr_scratch: XattrScratch,
         used: Summary,
         limits: Limits,
     }
@@ -1354,7 +1363,7 @@ mod linux {
                 }
                 link.extend_from_slice(&b[..n as usize]);
             }
-            let attrs = attrs(ctx, &src, true, c)?;
+            let attrs = attrs(ctx, &src, true, &mut self.xattr_scratch, c)?;
             let metadata = link.len() as u64
                 + attrs
                     .iter()
@@ -1424,11 +1433,15 @@ mod linux {
         root: &File,
         p: &[u8],
         source: bool,
+        scratch: &mut XattrScratch,
         c: &impl Fn() -> bool,
     ) -> Result<Vec<(CString, Vec<u8>)>, Error> {
         let follow = p.is_empty();
         let (_d, p) = attr_path(root, p, source)?;
-        let mut names = vec![0u8; 65536];
+        let XattrScratch { names, value } = scratch;
+        if names.is_empty() {
+            names.resize(65536, 0);
+        }
         let n = unsafe {
             if follow {
                 libc::listxattr(p.as_ptr(), names.as_mut_ptr().cast(), names.len())
@@ -1457,43 +1470,50 @@ mod linux {
                 return Err(Error::Unsupported("xattr namespace or ACL"));
             }
             let name = cs(name)?;
-            let mut value = vec![0; 65536 - total];
+            if value.is_empty() {
+                value.resize(65536, 0);
+            }
+            let remaining = 65536 - total;
             let n = unsafe {
                 if follow {
                     libc::getxattr(
                         p.as_ptr(),
                         name.as_ptr(),
                         value.as_mut_ptr().cast(),
-                        value.len(),
+                        remaining,
                     )
                 } else {
                     libc::lgetxattr(
                         p.as_ptr(),
                         name.as_ptr(),
                         value.as_mut_ptr().cast(),
-                        value.len(),
+                        remaining,
                     )
                 }
             };
             if n < 0 {
                 return Err(io::Error::last_os_error().into());
             }
-            if n as usize > value.len() {
+            if n as usize > remaining {
                 return Err(Error::Limit("xattr bytes"));
             }
-            value.truncate(n as usize);
-            total += value.len();
+            total += n as usize;
             if total == 65536 {
                 return Err(Error::Limit("xattr bytes"));
             }
-            result.push((name, value.into_boxed_slice().into_vec()));
+            result.push((name, value[..n as usize].to_vec()));
         }
         Ok(result)
     }
-    fn restore(f: &File, e: &Entry, c: &impl Fn() -> bool) -> Result<(), Error> {
+    fn restore(
+        f: &File,
+        e: &Entry,
+        scratch: &mut XattrScratch,
+        c: &impl Fn() -> bool,
+    ) -> Result<(), Error> {
         // user.* requires inode write permission, even through an open writable FD.
         metadata(f, e.mode | 0o600, e.uid, e.gid)?;
-        for (name, _) in attrs(f, b"", false, c)? {
+        for (name, _) in attrs(f, b"", false, scratch, c)? {
             cv(unsafe { libc::fremovexattr(f.as_raw_fd(), name.as_ptr()) })?;
         }
         for capability in [false, true] {
@@ -1666,6 +1686,7 @@ mod linux {
             work: crate::dockerignore::WORK,
             visited: 0,
             entries: Vec::new(),
+            xattr_scratch: XattrScratch::default(),
             used: Summary::default(),
             limits,
         };
@@ -1711,7 +1732,7 @@ mod linux {
                     fingerprinting,
                 ) {
                     Ok(_) => {
-                        attrs(image, ancestor, false, c)?;
+                        attrs(image, ancestor, false, &mut plan.xattr_scratch, c)?;
                     }
                     Err(e) if missing(&e) => (),
                     Err(e) => return Err(e),
@@ -1723,7 +1744,7 @@ mod linux {
             }
             match open(image, &e.dst, libc::O_PATH | libc::O_NOFOLLOW, false) {
                 Ok(f) => {
-                    attrs(image, &e.dst, false, c)?;
+                    attrs(image, &e.dst, false, &mut plan.xattr_scratch, c)?;
                     if e.kind == libc::S_IFDIR && !f.metadata()?.is_dir() {
                         return Err(Error::Invalid("directory destination collision"));
                     }
@@ -1749,7 +1770,7 @@ mod linux {
     ) -> Result<Summary, Error> {
         let ctx = root(ctx)?;
         let image = root(image)?;
-        let (plan, owner) = prepare_copy(
+        let (mut plan, owner) = prepare_copy(
             &ctx,
             &image,
             sources,
@@ -1935,7 +1956,7 @@ mod linux {
                 if input.read(&mut buffer[..1])? != 0 {
                     return Err(Error::Invalid("source grew"));
                 }
-                restore(&out, e, c)?;
+                restore(&out, e, &mut plan.xattr_scratch, c)?;
             }
         }
         for e in plan.entries.iter().filter(|e| e.kind == libc::S_IFDIR) {
@@ -1956,7 +1977,7 @@ mod linux {
                 continue;
             }
             if let Some(metadata_entry) = directory_metadata.get(&(m.dev(), m.ino())) {
-                restore(&f, metadata_entry, c)?;
+                restore(&f, metadata_entry, &mut plan.xattr_scratch, c)?;
             }
             cv(unsafe { libc::futimens(f.as_raw_fd(), e.times.as_ptr()) })?;
         }
@@ -1967,6 +1988,242 @@ mod linux {
             metadata(&f, options.chmod.unwrap_or(0o755), uid, gid)?;
         }
         Ok(plan.used)
+    }
+
+    #[cfg(test)]
+    mod xattr_tests {
+        use super::*;
+        use std::{cell::Cell, fs};
+
+        fn set_attr(file: &File, name: &CStr, value: &[u8]) {
+            // SAFETY: the FD, NUL-terminated name and value slice remain valid for the call.
+            cv(unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            })
+            .unwrap();
+        }
+
+        fn remove_attr(file: &File, name: &CStr) {
+            // SAFETY: the FD and NUL-terminated name remain valid for the call.
+            cv(unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) }).unwrap();
+        }
+
+        #[test]
+        fn owned_values_survive_populated_empty_and_shorter_reads() {
+            for follow in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let dir = root(temp.path()).unwrap();
+                let populated = File::create(temp.path().join("populated")).unwrap();
+                let empty = File::create(temp.path().join("empty")).unwrap();
+                let shorter = File::create(temp.path().join("shorter")).unwrap();
+                let binary = [0, 255, 1, 0, 128, 42];
+                set_attr(&populated, c"user.long-name", &binary);
+                set_attr(&shorter, c"user.a", &[255, 0]);
+                set_attr(&shorter, c"user.b", &[]);
+                let mut scratch = XattrScratch::default();
+                let read = |file, path: &[u8], scratch: &mut XattrScratch| {
+                    if follow {
+                        attrs(file, b"", true, scratch, &|| false).unwrap()
+                    } else {
+                        attrs(&dir, path, true, scratch, &|| false).unwrap()
+                    }
+                };
+                let first = read(&populated, b"populated", &mut scratch);
+                assert!(read(&empty, b"empty", &mut scratch).is_empty());
+                let mut last = read(&shorter, b"shorter", &mut scratch);
+                last.sort_by(|a, b| a.0.cmp(&b.0));
+                assert_eq!(first, vec![(c"user.long-name".to_owned(), binary.to_vec())]);
+                assert_eq!(
+                    last,
+                    vec![
+                        (c"user.a".to_owned(), vec![255, 0]),
+                        (c"user.b".to_owned(), Vec::new()),
+                    ]
+                );
+            }
+        }
+
+        #[test]
+        fn scratch_is_lazy_bounded_and_reused() {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = root(temp.path()).unwrap();
+            let file = File::create(temp.path().join("file")).unwrap();
+            let mut scratch = XattrScratch::default();
+            assert!(attrs(&dir, b"missing/file", true, &mut scratch, &|| false).is_err());
+            assert_eq!((scratch.names.capacity(), scratch.value.capacity()), (0, 0));
+            assert!(
+                attrs(&dir, b"file", true, &mut scratch, &|| false)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                (scratch.names.len(), scratch.names.capacity()),
+                (65536, 65536)
+            );
+            assert_eq!((scratch.value.len(), scratch.value.capacity()), (0, 0));
+            let names = scratch.names.as_ptr();
+            set_attr(&file, c"user.value", &[7; 128]);
+            let first = attrs(&dir, b"file", true, &mut scratch, &|| false).unwrap();
+            let value = scratch.value.as_ptr();
+            for bytes in [&[0, 255][..], &[][..], &[42][..]] {
+                set_attr(&file, c"user.value", bytes);
+                assert_eq!(
+                    attrs(&dir, b"file", true, &mut scratch, &|| false).unwrap(),
+                    vec![(c"user.value".to_owned(), bytes.to_vec())]
+                );
+                assert_eq!(
+                    (scratch.names.as_ptr(), scratch.value.as_ptr()),
+                    (names, value)
+                );
+                assert_eq!((scratch.names.len(), scratch.value.len()), (65536, 65536));
+                assert_eq!(
+                    (scratch.names.capacity(), scratch.value.capacity()),
+                    (65536, 65536)
+                );
+            }
+            remove_attr(&file, c"user.value");
+            assert!(
+                attrs(&dir, b"file", true, &mut scratch, &|| false)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                (scratch.names.as_ptr(), scratch.value.as_ptr()),
+                (names, value)
+            );
+            assert_eq!(first, vec![(c"user.value".to_owned(), vec![7; 128])]);
+        }
+
+        #[test]
+        fn false_callback_observes_mutation_and_removal_before_value_read() {
+            for follow in [false, true] {
+                for remove in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let dir = root(temp.path()).unwrap();
+                    let file = File::create(temp.path().join("file")).unwrap();
+                    set_attr(&file, c"user.value", b"old value");
+                    let calls = Cell::new(0);
+                    let result = attrs(
+                        if follow { &file } else { &dir },
+                        if follow { b"" } else { b"file" },
+                        true,
+                        &mut XattrScratch::default(),
+                        &|| {
+                            calls.set(calls.get() + 1);
+                            if remove {
+                                remove_attr(&file, c"user.value");
+                            } else {
+                                set_attr(&file, c"user.value", &[0, 255]);
+                            }
+                            false
+                        },
+                    );
+                    assert_eq!(calls.get(), 1);
+                    if remove {
+                        assert!(
+                            matches!(result, Err(Error::Io(e)) if e.raw_os_error() == Some(libc::ENODATA))
+                        );
+                    } else {
+                        assert_eq!(
+                            result.unwrap(),
+                            vec![(c"user.value".to_owned(), vec![0, 255])]
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn true_callback_cancels_before_reading_mutated_or_removed_value() {
+            for follow in [false, true] {
+                for remove in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let dir = root(temp.path()).unwrap();
+                    let file = File::create(temp.path().join("file")).unwrap();
+                    set_attr(&file, c"user.value", b"old value");
+                    let calls = Cell::new(0);
+                    let result = attrs(
+                        if follow { &file } else { &dir },
+                        if follow { b"" } else { b"file" },
+                        true,
+                        &mut XattrScratch::default(),
+                        &|| {
+                            calls.set(calls.get() + 1);
+                            if remove {
+                                remove_attr(&file, c"user.value");
+                            } else {
+                                set_attr(&file, c"user.value", &[0, 255]);
+                            }
+                            true
+                        },
+                    );
+                    assert_eq!(calls.get(), 1);
+                    assert!(matches!(result, Err(Error::Cancelled)));
+                }
+            }
+        }
+
+        #[test]
+        fn per_attr_callback_can_run_an_independent_copy() {
+            let outer = tempfile::tempdir().unwrap();
+            let file = File::create(outer.path().join("file")).unwrap();
+            set_attr(&file, c"user.a", &[0, 255]);
+            set_attr(&file, c"user.b", b"outer");
+            let inner = tempfile::tempdir().unwrap();
+            let image = tempfile::tempdir().unwrap();
+            fs::create_dir(inner.path().join("dir")).unwrap();
+            let child = File::create(inner.path().join("dir/file")).unwrap();
+            set_attr(&child, c"user.inner", &[42; 128]);
+            let inner_dir = File::open(inner.path().join("dir")).unwrap();
+            set_attr(&inner_dir, c"user.directory", b"nested");
+            let calls = Cell::new(0);
+            let mut result = attrs(&file, b"", true, &mut XattrScratch::default(), &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    copy_stage(
+                        inner.path(),
+                        image.path(),
+                        &["dir"],
+                        "/out",
+                        Limits {
+                            max_bytes: 1024,
+                            max_entries: 10,
+                            max_metadata_bytes: 8192,
+                        },
+                        || false,
+                    )
+                    .unwrap();
+                }
+                false
+            })
+            .unwrap();
+            result.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(calls.get(), 2);
+            assert_eq!(
+                result,
+                vec![
+                    (c"user.a".to_owned(), vec![0, 255]),
+                    (c"user.b".to_owned(), b"outer".to_vec()),
+                ]
+            );
+            let mut scratch = XattrScratch::default();
+            for (path, name, value) in [
+                ("out/file", c"user.inner", &[42; 128][..]),
+                ("out", c"user.directory", &b"nested"[..]),
+            ] {
+                let copied = File::open(image.path().join(path)).unwrap();
+                assert_eq!(
+                    attrs(&copied, b"", false, &mut scratch, &|| false).unwrap(),
+                    vec![(name.to_owned(), value.to_vec())]
+                );
+            }
+        }
     }
 }
 
