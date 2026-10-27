@@ -2641,6 +2641,14 @@ fn build_stage(
                 phase.tick();
                 cancelled()
             };
+            if cache_hit
+                && let Some(receipt) = &replay_receipt
+                && !receipt.can_record(&root, &verified, applying)?
+            {
+                // Cached-parent handoff is optional; continue verified replay
+                // without recording rather than failing or retrying a partial layer.
+                replay_receipt = None;
+            }
             if let Some(receipt) = &mut replay_receipt {
                 receipt.apply(&root, &mut verified, applying)?;
             } else {

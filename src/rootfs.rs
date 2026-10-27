@@ -162,6 +162,42 @@ impl ReplayReceipt {
         Ok(())
     }
 
+    /// Check optional recording before replay mutates the root. Historical symlink
+    /// targets consume receipt space even when later layers replace those links.
+    pub(crate) fn can_record(
+        &self,
+        root: &Path,
+        layer: &VerifiedLayer,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<bool, Error> {
+        self.validate(root, &self.diff_ids)?;
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let Some(mut remaining) = self.remaining.checked_sub(128) else {
+            return Ok(false);
+        };
+        for entry in layer.entries() {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if entry.kind == crate::layer::EntryKind::Symlink {
+                let target = entry
+                    .link_target
+                    .as_ref()
+                    .ok_or(Error::Invalid("verified symlink has no target"))?;
+                let Some(left) = remaining
+                    .checked_sub(128)
+                    .and_then(|left| left.checked_sub(target.len() as u64))
+                else {
+                    return Ok(false);
+                };
+                remaining = left;
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn apply(
         &mut self,
         root: &Path,
@@ -1144,6 +1180,27 @@ mod tests {
         assert!(receipt.apply(tmp.path(), &mut layer, || false).is_err());
         assert!(!receipt.valid);
         assert!(ReplayReceipt::new(tmp.path(), 1024).is_err());
+    }
+
+    #[test]
+    fn optional_receipt_admission_preserves_root_and_required_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut layer = verified(vec![link("link", "target", false)]);
+        let small = ReplayReceipt::new(tmp.path(), 261).unwrap();
+        assert!(!small.can_record(tmp.path(), &layer, || false).unwrap());
+        assert!(fs::symlink_metadata(tmp.path().join("link")).is_err());
+        small.validate(tmp.path(), &[]).unwrap();
+        assert!(matches!(
+            small.can_record(tmp.path(), &layer, || true),
+            Err(Error::Cancelled)
+        ));
+        let mut exact = ReplayReceipt::new(tmp.path(), 262).unwrap();
+        assert!(exact.can_record(tmp.path(), &layer, || false).unwrap());
+        exact.apply(tmp.path(), &mut layer, || false).unwrap();
+        assert_eq!(exact.metadata_bytes(), 262);
+        assert!(!exact.can_record(tmp.path(), &layer, || false).unwrap());
+        exact.valid = false;
+        assert!(exact.can_record(tmp.path(), &layer, || false).is_err());
     }
 
     #[test]

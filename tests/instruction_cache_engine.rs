@@ -16,6 +16,48 @@ fn never_cancel() -> bool {
 }
 
 #[test]
+fn cached_parent_receipt_exhaustion_falls_back_to_verified_replay() {
+    use std::os::unix::fs::symlink;
+    let t = tempfile::tempdir().unwrap();
+    let mut o = options(t.path());
+    o.export_mode = build::ExportMode::Layered;
+    o.limits.image.max_descriptors = 500;
+    o.limits.export.max_metadata_bytes = 160_000;
+    for name in ["a", "b"] {
+        fs::create_dir(o.context.join(name)).unwrap();
+        symlink(name.repeat(4000), o.context.join(name).join("link")).unwrap();
+    }
+    let mut source = String::from("FROM scratch AS parent\n");
+    for i in 0..60 {
+        source.push_str(&format!(
+            "COPY {}/ /tree/\n",
+            if i % 2 == 0 { "a" } else { "b" }
+        ));
+    }
+    source.push_str("FROM parent\nLABEL version=one\n");
+    let mut cold = None;
+    for phase in ["cold", "warm"] {
+        if phase == "warm" {
+            next(&mut o, t.path(), phase);
+        }
+        build::build(&source, &o, never_cancel).unwrap();
+        let output = image::load_layout(&o.output, None, o.limits.image, never_cancel).unwrap();
+        if let Some(manifest) = &cold {
+            assert_eq!(
+                &output.selected, manifest,
+                "warm replay preserves exact output"
+            );
+        } else {
+            cold = Some(output.selected.clone());
+        }
+        assert_eq!(
+            fs::read_link(o.work.join("rootfs/tree/link")).unwrap(),
+            PathBuf::from("b".repeat(4000))
+        );
+    }
+}
+
+#[test]
 fn layered_instruction_checkpoints_reuse_prefix_and_apply_only_the_next_delta() {
     use std::os::unix::fs::MetadataExt;
     let t = tempfile::tempdir().unwrap();
