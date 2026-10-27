@@ -112,13 +112,21 @@ cache entries, 16.61 seconds exporting checkpoints and 6.23 seconds verifying
 checkpoint deltas. Reducing serialized bytes has not removed repeated reads of
 the unchanged dependency.
 
-The next optimization targets are reducing repeated verification of the same
-owned blob within one locked publication operation, and reducing repeated
-full-tree inventories where COPY provides an exact changed-path set. Any such
-change must preserve verification on consumption, inode ownership, cache
-corruption detection, metadata and cancellation behavior. The benchmark does not
-authorize bypassing those checks or assuming arbitrary RUN commands have known
-writes.
+A subsequent attempt to reuse blob verification within one locked publication
+was rejected and rolled back. Inode and size checks did not detect same-size
+content changes at the required boundaries: some probes accepted corruption,
+and others left newly owned corrupt blobs that prevented a healthy retry.
+The original verification remains, with regression tests for these cases.
+Test instrumentation counts eight full payload hash reads for a newly ingested
+unique layer and six for a reused layer during publication. Those are baseline
+counts, not a retained reduction or a new Pod timing result. Post-ownership
+corruption can still poison retries under the existing stable-store contract.
+
+The next investigation is reducing repeated full-tree inventories where COPY
+provides an exact changed-path set. Any change must preserve verification on
+consumption, inode ownership, cache corruption detection, metadata and
+cancellation behavior. The benchmark does not authorize bypassing those checks
+or assuming arbitrary RUN commands have known writes.
 
 ## Scope
 
