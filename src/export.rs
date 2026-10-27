@@ -27,7 +27,16 @@ pub(crate) struct Encoding {
 pub(crate) struct Exported {
     pub manifest: Descriptor,
     pub layer: EncodedLayer,
+    pub owned_checkpoint: Option<OwnedCheckpoint>,
 }
+
+#[cfg(target_os = "linux")]
+#[path = "export_owned.rs"]
+mod owned;
+#[cfg(target_os = "linux")]
+pub(crate) use owned::OwnedCheckpoint;
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct OwnedCheckpoint;
 
 /// Required resource budgets. Layer bytes include tar headers/padding. Metadata
 /// counts path/link bytes, PAX records, headers and serialized OCI JSON in total.
@@ -360,6 +369,87 @@ mod tests {
     }
     fn config() -> Value {
         json!({"os":"linux","architecture":"amd64","config":{"Env":["A=B"],"Cmd":["/bin/app"],"User":"123:456","OnBuild":["RUN true"]},"future":{"keep":true},"rootfs":{"diff_ids":["stale"]},"history":[{"created_by":"stale"}]})
+    }
+
+    #[test]
+    fn managed_checkpoint_provenance_preserves_bytes_and_closes_writers() {
+        use std::sync::atomic::AtomicBool;
+        for compression in [Compression::Uncompressed, Compression::Gzip] {
+            let f = Fixture::new();
+            let baseline = Baseline::scratch(&f.root, LIMITS, || false).unwrap();
+            fs::write(f.root.join("file"), b"checkpoint payload").unwrap();
+            let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+            for path in [&f.root, &f.root.join("file")] {
+                fs::File::open(path)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_accessed(stamp + std::time::Duration::from_secs(1))
+                            .set_modified(stamp),
+                    )
+                    .unwrap();
+            }
+            let encoding = Encoding {
+                compression,
+                max_blob_bytes: LIMITS.max_layer_bytes,
+            };
+            let legacy_path = f.temp.path().join("legacy");
+            let (legacy, _) = export_checkpoint(
+                &f.root,
+                &legacy_path,
+                &config(),
+                &baseline,
+                LIMITS,
+                encoding,
+                None,
+                || false,
+            )
+            .unwrap();
+            assert!(legacy.owned_checkpoint.is_none());
+            let cancelled = AtomicBool::new(false);
+            let control = crate::managed_control::ManagedControl::for_test(&cancelled).unwrap();
+            let (managed, _) = export_managed_checkpoint(
+                &f.root,
+                &f.dest,
+                &config(),
+                &baseline,
+                LIMITS,
+                encoding,
+                None,
+                &control,
+                || false,
+            )
+            .unwrap();
+            assert_eq!(legacy.manifest, managed.manifest);
+            assert_eq!(legacy.layer.descriptor, managed.layer.descriptor);
+            let cap = managed.owned_checkpoint.unwrap();
+            cap.validate().unwrap();
+            assert_eq!(cap.path(), f.dest);
+            let image = f.load();
+            for descriptor in &image.layers {
+                let payload = f
+                    .dest
+                    .join("blobs/sha256")
+                    .join(descriptor.digest.strip_prefix("sha256:").unwrap());
+                let expected = fs::metadata(payload).unwrap();
+                for entry in fs::read_dir("/proc/self/fd").unwrap() {
+                    let entry = entry.unwrap();
+                    let Ok(observed) = fs::metadata(entry.path()) else {
+                        continue;
+                    };
+                    if (observed.dev(), observed.ino()) != (expected.dev(), expected.ino()) {
+                        continue;
+                    }
+                    let fd: i32 = entry.file_name().to_str().unwrap().parse().unwrap();
+                    // SAFETY: this test reads flags only; a concurrent close is harmless.
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                    assert!(
+                        flags < 0 || flags & libc::O_ACCMODE == libc::O_RDONLY,
+                        "export retained a writable payload descriptor"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1258,6 +1348,38 @@ pub(crate) fn export_checkpoint(
         );
         Err(Error::Invalid("export requires Linux"))
     }
+}
+
+/// Only the closed managed engine may carry exporter provenance into a session.
+/// This is not content evidence: publication still verifies every new physical copy.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn export_managed_checkpoint(
+    root: &Path,
+    destination: &Path,
+    config: &Value,
+    baseline: &Baseline,
+    limits: Limits,
+    encoding: Encoding,
+    resources: Option<&crate::build_resources::Policy>,
+    control: &crate::managed_control::ManagedControl<'_>,
+    cancelled: impl Fn() -> bool,
+) -> Result<(Exported, Baseline), Error> {
+    control.check_output().map_err(io::Error::other)?;
+    let (mut exported, next) = export_checkpoint(
+        root,
+        destination,
+        config,
+        baseline,
+        limits,
+        encoding,
+        resources,
+        cancelled,
+    )?;
+    // All spool, ingest and index writers have been consumed and closed on return.
+    control.check_output().map_err(io::Error::other)?;
+    exported.owned_checkpoint = OwnedCheckpoint::finished(destination)?;
+    Ok((exported, next))
 }
 
 #[cfg(target_os = "linux")]
@@ -2165,6 +2287,7 @@ mod linux {
         Ok(Exported {
             manifest,
             layer: encoded,
+            owned_checkpoint: None,
         })
     }
 }
