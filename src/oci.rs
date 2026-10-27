@@ -286,15 +286,6 @@ impl BlobStore {
     ) -> Result<File, Error> {
         let (digest, size) = descriptor.expected(max_size)?;
         check_cancel(&cancelled)?;
-        let mut file = self.open_file(&digest)?;
-        verify_stream(&mut file, None, &digest, size, &cancelled)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
-    }
-
-    // Structural opening only. Cache publication may use this for a verified
-    // ingest stream or an inode already verified within its publication lock.
-    fn open_file(&self, digest: &Sha256Digest) -> Result<File, Error> {
         check_directories(&self.directory)?;
         let path = self.directory.join(digest.encoded());
         let metadata = fs::symlink_metadata(&path)?;
@@ -308,10 +299,12 @@ impl BlobStore {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        let file = options.open(&path)?;
+        let mut file = options.open(&path)?;
         if !file.metadata()?.is_file() {
             return Err(Error::UnsafePath(path));
         }
+        verify_stream(&mut file, None, &digest, size, &cancelled)?;
+        file.seek(SeekFrom::Start(0))?;
         Ok(file)
     }
 

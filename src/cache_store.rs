@@ -6,7 +6,7 @@ use crate::{
     build_cache::{self, COPY_TARGETS},
     build_record::{Identity, identity, open_dir},
     image,
-    oci::{BlobStore, Descriptor, Sha256Digest},
+    oci::{BlobStore, Descriptor},
     store_access,
     store_lease::StoreLease,
 };
@@ -71,61 +71,6 @@ struct Entry {
     manifest: String,
     receipt: String,
     instructions: usize,
-}
-
-// Evidence for immutable owned content within one locked publication only.
-// No handles are retained per layer; the map is bounded by image descriptors.
-struct VerifiedBlob {
-    digest: Sha256Digest,
-    size: u64,
-    inode: Identity,
-}
-
-impl VerifiedBlob {
-    fn open(
-        &self,
-        store: &BlobStore,
-        descriptor: &Descriptor,
-        cap: u64,
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<File> {
-        // Validate every occurrence, including duplicate digests with new limits.
-        let (digest, size) = descriptor.expected(cap)?;
-        check(cancelled)?;
-        if digest != self.digest || size != self.size {
-            return Err("cache verified descriptor mismatch".into());
-        }
-        let file = store.open_file(&digest)?;
-        let meta = file.metadata()?;
-        if identity(&meta) != self.inode || meta.len() != self.size {
-            return Err("cache verified inode changed".into());
-        }
-        Ok(file)
-    }
-
-    fn link(
-        &self,
-        source: &BlobStore,
-        destination: &BlobStore,
-        descriptor: &Descriptor,
-        cap: u64,
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<()> {
-        self.open(source, descriptor, cap, cancelled)?.sync_all()?;
-        check(cancelled)?;
-        super::check_directories(&destination.directory)?;
-        match fs::hard_link(
-            source.directory.join(self.digest.encoded()),
-            destination.directory.join(self.digest.encoded()),
-        ) {
-            Ok(()) => (),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(e) => return Err(e.into()),
-        }
-        // An existing name must be this owned inode, not merely equal bytes.
-        self.open(destination, descriptor, cap, cancelled)?;
-        Ok(())
-    }
 }
 
 /// Explicit authority for `STORE/cache-v2`. Borrowing the lease prevents safe
@@ -303,15 +248,10 @@ impl<'a> ManagedCache<'a> {
         let source_store = BlobStore::open(source)?;
         let pool = BlobStore::open(self.root.join("content"))?;
         let target = BlobStore::open(temp.path())?;
-        let mut verified = BTreeMap::new();
         for (descriptor, cap) in descriptors(&metadata, limits) {
             check(cancelled)?;
-            let blob = match verified.entry(descriptor.digest.clone()) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => entry
-                    .insert(self.ensure_blob(&source_store, &pool, descriptor, cap, cancelled)?),
-            };
-            blob.link(&pool, &target, descriptor, cap, cancelled)?;
+            self.ensure_blob(&source_store, &pool, descriptor, cap, cancelled)?;
+            pool.link_verified(&target, descriptor, cap, cancelled)?;
         }
         // Selected-only layout: never copy unreferenced blobs or unrelated source files.
         write_new(
@@ -409,14 +349,14 @@ impl<'a> ManagedCache<'a> {
         descriptor: &Descriptor,
         cap: u64,
         cancelled: &impl Fn() -> bool,
-    ) -> Result<VerifiedBlob> {
-        let (digest, size) = descriptor.expected(cap)?;
+    ) -> Result<()> {
+        let digest = descriptor.digest.parse::<crate::oci::Sha256Digest>()?;
         let object = self.root.join("objects").join(digest.encoded());
         let pooled = self
             .root
             .join("content/blobs/sha256")
             .join(digest.encoded());
-        let verified = if !exists(&object)? {
+        if !exists(&object)? {
             // An existing pool filename without provenance is never an ingest hit.
             if exists(&pooled)? {
                 return Err("cache pool blob has no inode provenance".into());
@@ -425,11 +365,15 @@ impl<'a> ManagedCache<'a> {
                 .prefix(".ingest-")
                 .tempdir_in(self.root.join("objects"))?;
             let fresh = BlobStore::open(staging.path())?;
-            fresh.ingest(source.open_file(&digest)?, descriptor, cap, cancelled)?;
-            // ingest hashed the stream written to this fresh, private inode.
-            let file = fresh.open_file(&digest)?;
+            fresh.ingest(
+                source.open_verified(descriptor, cap, cancelled)?,
+                descriptor,
+                cap,
+                cancelled,
+            )?;
+            let file = fresh.open_verified(descriptor, cap, cancelled)?;
             let meta = file.metadata()?;
-            if meta.nlink() != 1 || meta.len() != size {
+            if meta.nlink() != 1 {
                 return Err("new cache blob has unexpected aliases".into());
             }
             let owner = BlobOwner {
@@ -448,31 +392,15 @@ impl<'a> ManagedCache<'a> {
             check(cancelled)?;
             rename_new(staging.path(), &object)?;
             let _ = staging.keep();
-            VerifiedBlob {
-                digest,
-                size,
-                inode: identity(&meta),
-            }
-        } else {
-            self.blob_owner(&object, digest.encoded())?;
-            let file = BlobStore::open(&object)?.open_verified(descriptor, cap, cancelled)?;
-            VerifiedBlob {
-                digest,
-                size,
-                inode: identity(&file.metadata()?),
-            }
-        };
-        let (inode, _) = self.blob_owner(&object, verified.digest.encoded())?;
-        if inode != verified.inode {
-            return Err("cache blob inode provenance mismatch".into());
         }
+        self.blob_owner(&object, digest.encoded())?;
         // Reuse may follow a crash after rename but before its parent fsync.
         // Establish the anchor name durably before publishing any new aliases.
         self.sync_objects()?;
         // The durable anchor is published before any pool/entry alias. A crash
         // before this link leaves a reusable owned object, never an adopted inode.
-        verified.link(&BlobStore::open(&object)?, pool, descriptor, cap, cancelled)?;
-        Ok(verified)
+        BlobStore::open(&object)?.link_verified(pool, descriptor, cap, cancelled)?;
+        Ok(())
     }
 
     fn sync_objects(&self) -> Result<()> {
@@ -672,7 +600,6 @@ impl<'a> ManagedCache<'a> {
         for (descriptor, cap) in descriptors(&metadata, limits) {
             let digest = descriptor.digest.parse::<crate::oci::Sha256Digest>()?;
             names.insert(digest.encoded().to_owned());
-            // Linking evidence must not replace this final content check.
             let pooled = pool.open_verified(descriptor, cap, cancelled)?;
             let local = fs::symlink_metadata(path.join("blobs/sha256").join(digest.encoded()))?;
             if identity(&pooled.metadata()?) != identity(&local) {
@@ -1645,65 +1572,17 @@ mod tests {
                 result.unwrap();
                 observations.push((reads, bytes));
             }
-            let expected = 3 * copies as u64 + 1;
+            let new_reads = 7 * copies as u64 + 1;
+            let reused_reads = 7 * copies as u64 - 1;
             eprintln!("payload copies={copies}: new/reused {observations:?}");
             assert_eq!(
                 observations,
-                vec![(expected, expected * layer.size as u64); 2]
+                vec![
+                    (new_reads, new_reads * layer.size as u64),
+                    (reused_reads, reused_reads * layer.size as u64),
+                ]
             );
         }
-    }
-
-    #[test]
-    fn publication_evidence_rejects_descriptor_conflicts_and_other_inodes() {
-        let t = tempfile::tempdir().unwrap();
-        let input = t.path().join("source");
-        let layer = source(&input, 1);
-        let source = BlobStore::open(&input).unwrap();
-        let lease = StoreLease::shared(t.path(), &|| false).unwrap();
-        let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
-        let _lock = cache.lock(&|| false).unwrap();
-        cache.audit_links(&|| false).unwrap();
-        let pool = BlobStore::open(cache.root.join("content")).unwrap();
-        let proof = cache
-            .ensure_blob(&source, &pool, &layer, 4096, &|| false)
-            .unwrap();
-        // Exercise the same evidence with each conflicting descriptor occurrence.
-        for size in [-1, 0, 4095, 4097] {
-            let mut conflict = layer.clone();
-            conflict.size = size;
-            assert!(proof.open(&pool, &conflict, 8192, &|| false).is_err());
-        }
-        assert!(proof.open(&pool, &layer, 4095, &|| false).is_err());
-        assert!(proof.open(&pool, &layer, 4096, &|| true).is_err());
-        let mut conflict = layer.clone();
-        conflict.digest = format!("sha256:{}", "a".repeat(64));
-        assert!(proof.open(&pool, &conflict, 4096, &|| false).is_err());
-
-        let target_dir = tempfile::tempdir_in(t.path()).unwrap();
-        let target = BlobStore::open(target_dir.path()).unwrap();
-        let target_path = target.directory.join(proof.digest.encoded());
-        fs::copy(source.directory.join(proof.digest.encoded()), &target_path).unwrap();
-        let original = identity(&fs::metadata(&target_path).unwrap());
-        assert!(proof.link(&pool, &target, &layer, 4096, &|| false).is_err());
-        assert_eq!(identity(&fs::metadata(&target_path).unwrap()), original);
-        assert_eq!(fs::read(&target_path).unwrap(), vec![42; 4096]);
-
-        fs::remove_file(&target_path).unwrap();
-        std::os::unix::fs::symlink(source.directory.join(proof.digest.encoded()), &target_path)
-            .unwrap();
-        assert!(proof.link(&pool, &target, &layer, 4096, &|| false).is_err());
-        assert!(
-            fs::symlink_metadata(&target_path)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-
-        let pooled = pool.directory.join(proof.digest.encoded());
-        fs::remove_file(&pooled).unwrap();
-        fs::copy(source.directory.join(proof.digest.encoded()), &pooled).unwrap();
-        assert!(proof.open(&pool, &layer, 4096, &|| false).is_err());
     }
 
     #[test]

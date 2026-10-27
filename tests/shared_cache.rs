@@ -582,6 +582,228 @@ enum FinalVerificationBoundary {
     AfterLayoutVerification,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum OwnershipBoundary {
+    SourceBuffer,
+    IngestTemporary,
+    BeforeAnchorRename,
+    AnchorBeforePool,
+    PoolBeforeEntry,
+    RepeatedDescriptor,
+}
+
+fn ownership_boundary_preserves_failure_state(boundary: OwnershipBoundary) {
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    let layer = fixture(&source, 1);
+    let store = BlobStore::open(&source).unwrap();
+    let mut metadata = image::load_layout(&source, None, limits(), || false).unwrap();
+    let tail = blob(
+        &store,
+        "application/vnd.oci.image.layer.v1.tar",
+        &[44; 4096],
+    );
+    let layers = if matches!(boundary, OwnershipBoundary::RepeatedDescriptor) {
+        vec![layer.clone(), layer.clone(), tail.clone()]
+    } else {
+        vec![layer.clone(), tail.clone()]
+    };
+    metadata.config["rootfs"]["diff_ids"] =
+        json!(layers.iter().map(|d| &d.digest).collect::<Vec<_>>());
+    let config = blob(
+        &store,
+        &metadata.config_descriptor.media_type,
+        &serde_json::to_vec(&metadata.config).unwrap(),
+    );
+    metadata.manifest["config"] = json!(config);
+    metadata.manifest["layers"] = json!(layers);
+    let manifest = blob(
+        &store,
+        &metadata.selected.media_type,
+        &serde_json::to_vec(&metadata.manifest).unwrap(),
+    );
+    fs::write(
+        source.join("index.json"),
+        serde_json::to_vec(&json!({"schemaVersion":2,"manifests":[manifest]})).unwrap(),
+    )
+    .unwrap();
+    let mut limits = limits();
+    limits.max_total_layer_bytes = 3 * 4096;
+    let lease = StoreLease::shared(t.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(t.path(), &lease, &|| false).unwrap();
+    let root = t.path().join("cache-v2");
+    let object = root.join("objects").join(&layer.digest[7..]);
+    let pooled = layer_path(&root.join("content"), &layer);
+    let mutated = Cell::new(false);
+    let result = cache.publish(&source, &key(2), limits, &[], 0, &|| {
+        if !mutated.get() {
+            let candidate = match boundary {
+                OwnershipBoundary::SourceBuffer => {
+                    let staging = fs::read_dir(root.join("objects"))
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .any(|e| e.file_name().to_string_lossy().starts_with(".ingest-"));
+                    let path = layer_path(&source, &layer);
+                    let buffered = staging
+                        && fs::read_dir("/proc/self/fd")
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .any(|entry| {
+                                if fs::read_link(entry.path()).ok().as_ref() != Some(&path) {
+                                    return false;
+                                }
+                                let info = fs::read_to_string(
+                                    Path::new("/proc/self/fdinfo").join(entry.file_name()),
+                                )
+                                .unwrap();
+                                info.lines()
+                                    .find_map(|line| line.strip_prefix("pos:"))
+                                    .unwrap()
+                                    .trim()
+                                    .parse::<u64>()
+                                    .unwrap()
+                                    == layer.size as u64
+                            });
+                    buffered.then_some(path)
+                }
+                OwnershipBoundary::IngestTemporary | OwnershipBoundary::BeforeAnchorRename => {
+                    fs::read_dir(root.join("objects"))
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|e| e.file_name().to_string_lossy().starts_with(".ingest-"))
+                        .find_map(|e| {
+                            if matches!(boundary, OwnershipBoundary::BeforeAnchorRename) {
+                                let path = layer_path(&e.path(), &layer);
+                                return (e.path().join("weld-cache-blob.json").exists()
+                                    && path.exists())
+                                .then_some(path);
+                            }
+                            fs::read_dir(e.path().join("blobs/sha256"))
+                                .ok()?
+                                .filter_map(Result::ok)
+                                .find(|e| {
+                                    e.file_name().to_string_lossy().starts_with(".tmp-")
+                                        && e.metadata().is_ok_and(|m| m.len() == layer.size as u64)
+                                })
+                                .map(|e| e.path())
+                        })
+                }
+                OwnershipBoundary::AnchorBeforePool => {
+                    let path = layer_path(&object, &layer);
+                    (path.exists() && !pooled.exists()).then_some(path)
+                }
+                OwnershipBoundary::PoolBeforeEntry | OwnershipBoundary::RepeatedDescriptor => {
+                    let linked = fs::read_dir(root.join("entries"))
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .any(|e| {
+                            e.file_name().to_string_lossy().starts_with(".publish-")
+                                && layer_path(&e.path(), &layer).exists()
+                        });
+                    let want_link = matches!(boundary, OwnershipBoundary::RepeatedDescriptor);
+                    (pooled.exists() && linked == want_link).then_some(pooled.clone())
+                }
+            };
+            if let Some(path) = candidate {
+                let before = fs::metadata(&path).unwrap();
+                fs::write(&path, vec![43; layer.size as usize]).unwrap();
+                let after = fs::metadata(&path).unwrap();
+                assert_eq!(
+                    (before.dev(), before.ino(), before.len()),
+                    (after.dev(), after.ino(), after.len())
+                );
+                mutated.set(true);
+            }
+        }
+        false
+    });
+    assert!(mutated.get(), "injection not reached: {boundary:?}");
+    let error = result.expect_err("corruption must fail before publishing an entry");
+    assert!(
+        error.to_string().contains("SHA-256"),
+        "{boundary:?}: {error}"
+    );
+    assert!(!root.join("entries").join(key(2)).exists());
+    let source_byte = if matches!(boundary, OwnershipBoundary::SourceBuffer) {
+        43
+    } else {
+        42
+    };
+    assert_eq!(
+        fs::read(layer_path(&source, &layer)).unwrap(),
+        vec![source_byte; 4096]
+    );
+    let leftovers = (
+        object.exists(),
+        pooled.exists(),
+        root.join("objects").join(&tail.digest[7..]).exists(),
+        layer_path(&root.join("content"), &tail).exists(),
+    );
+    assert!(!fs::read_dir(root.join("objects")).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".ingest-")
+    }));
+    if matches!(boundary, OwnershipBoundary::SourceBuffer) {
+        fs::write(layer_path(&source, &layer), vec![42; 4096]).unwrap();
+    }
+    let retry = cache.publish(&source, &key(2), limits, &[], 0, &|| false);
+    eprintln!(
+        "{boundary:?}: leftovers(anchor,pool,tail_anchor,tail_pool)={leftovers:?}, retry={retry:?}"
+    );
+    let expected = match boundary {
+        OwnershipBoundary::SourceBuffer | OwnershipBoundary::IngestTemporary => {
+            (false, false, false, false)
+        }
+        OwnershipBoundary::BeforeAnchorRename | OwnershipBoundary::AnchorBeforePool => {
+            (true, false, false, false)
+        }
+        OwnershipBoundary::PoolBeforeEntry | OwnershipBoundary::RepeatedDescriptor => {
+            (true, true, false, false)
+        }
+    };
+    assert_eq!(leftovers, expected, "{boundary:?}");
+    if matches!(
+        boundary,
+        OwnershipBoundary::SourceBuffer | OwnershipBoundary::IngestTemporary
+    ) {
+        image::load_layout(retry.unwrap(), None, limits, || false).unwrap();
+    } else {
+        assert!(retry.unwrap_err().to_string().contains("SHA-256"));
+    }
+}
+
+#[test]
+fn ownership_boundary_source_buffer_corruption_is_rejected_before_ingest() {
+    ownership_boundary_preserves_failure_state(OwnershipBoundary::SourceBuffer);
+}
+
+#[test]
+fn ownership_boundary_ingest_corruption_allows_healthy_retry() {
+    ownership_boundary_preserves_failure_state(OwnershipBoundary::IngestTemporary);
+}
+
+#[test]
+fn ownership_boundary_after_fresh_verification_does_not_publish_pool_alias() {
+    ownership_boundary_preserves_failure_state(OwnershipBoundary::BeforeAnchorRename);
+}
+
+#[test]
+fn ownership_boundary_anchor_corruption_does_not_publish_pool_alias() {
+    ownership_boundary_preserves_failure_state(OwnershipBoundary::AnchorBeforePool);
+}
+
+#[test]
+fn ownership_boundary_pool_corruption_does_not_publish_later_blobs() {
+    ownership_boundary_preserves_failure_state(OwnershipBoundary::PoolBeforeEntry);
+}
+
+#[test]
+fn ownership_boundary_repeated_descriptor_corruption_does_not_publish_later_blobs() {
+    ownership_boundary_preserves_failure_state(OwnershipBoundary::RepeatedDescriptor);
+}
+
 fn corrupt_at_final_verification_boundary(reused: bool, boundary: FinalVerificationBoundary) {
     let t = tempfile::tempdir().unwrap();
     let source = t.path().join("source");
