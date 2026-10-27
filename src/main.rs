@@ -719,6 +719,7 @@ fn run_build(args: &[String], out: &mut impl Write) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let source = read_build_source(&cli.dockerfile)?;
     let lease = prepare_build(&source, &mut cli, early_lease, out)?;
+    #[cfg(target_os = "linux")]
     if let Some(cache) = &cli.options.run_mounts.cache_dir {
         let cache = rpweld::store_access::resolved(cache).map_err(|e| e.to_string())?;
         let auth = rpweld::registry::auth_path(&cli.registry)?;
