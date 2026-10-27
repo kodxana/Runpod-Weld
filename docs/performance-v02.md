@@ -128,6 +128,12 @@ consumption, inode ownership, cache corruption detection, metadata and
 cancellation behavior. The benchmark does not authorize bypassing those checks
 or assuming arbitrary RUN commands have known writes.
 
+One allocation-only follow-up borrows anchor paths and symlink targets in the
+temporary inventory grouping map instead of cloning them. The owned inventory,
+logical budget charges, filesystem reads, hashes and cancellation checks remain
+unchanged. This removes temporary allocations but has no measured Pod timing
+benefit yet; it is not included in the speedups reported above.
+
 ## Scope
 
 Every completed comparison verifies descriptor hashes and diff IDs, exact
