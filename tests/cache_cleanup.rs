@@ -149,6 +149,9 @@ impl CacheFixture {
         path
     }
     fn prune(&self) -> cleanup_apply::Report {
+        self.prune_with(|| false)
+    }
+    fn prune_with(&self, cancelled: impl Fn() -> bool) -> cleanup_apply::Report {
         use std::time::{Duration, Instant};
         // Parallel subprocess tests can inherit this fixture's dropped lease until exec.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -157,7 +160,7 @@ impl CacheFixture {
                 &self.store,
                 cleanup_plan::Request::CachePrune,
                 Default::default(),
-                || false,
+                &cancelled,
             )
             .unwrap();
             if report.status != "store_busy" {
@@ -240,20 +243,14 @@ fn unreferenced_anchor_without_pool_is_retired_without_chmod_or_truncation() {
     f.tag();
     let journal = f.store.join("cache-v2/retirement.json");
     let armed = Cell::new(false);
-    let r = cleanup_apply::apply(
-        &f.store,
-        cleanup_plan::Request::CachePrune,
-        Default::default(),
-        || {
-            if journal.exists() {
-                armed.set(true);
-                false
-            } else {
-                armed.get()
-            }
-        },
-    )
-    .unwrap();
+    let r = f.prune_with(|| {
+        if journal.exists() {
+            armed.set(true);
+            false
+        } else {
+            armed.get()
+        }
+    });
     assert_eq!(r.status, "failed");
     assert!(!f.a.exists() && !journal.exists());
     let retained: std::collections::HashSet<_> = fs::read_dir(f.b.join("blobs/sha256"))
