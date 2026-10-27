@@ -120,7 +120,7 @@ impl PublicationSession<'_, '_, '_> {
         self.evidence.begin();
         let phase = crate::progress::Phase::start(
             self.control.progress_enabled(),
-            "  Publishing instruction checkpoint",
+            "  Publishing instruction cache",
         );
         let result = self.cache.publish_inner(
             source.path(),
