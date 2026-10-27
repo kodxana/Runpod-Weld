@@ -1,5 +1,8 @@
 # COPY xattr scratch reuse: incomplete Pod comparison
 
+This preserves the earlier failed trial. A later [completed balanced comparison](xattr-scratch-balanced-performance.md)
+passed all four builds and both pair checks; its samples are reported separately.
+
 The allocation change is integrated at `e41a8ea`, but this experiment does not
 establish a speedup. Its only completed pair measured **39.89 seconds before
 and 40.22 seconds after**. The reversed pair was interrupted by a parent-agent

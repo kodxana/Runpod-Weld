@@ -61,6 +61,40 @@ Store locks do not exclude hostile same-user writes, writable mappings or bind
 aliases. Overlay is not an immutability certificate. Neither a new session type
 nor a new on-disk schema can substitute for this proof.
 
+### Source-audit result and implementation slices
+
+A follow-up source audit at `5eb1ca7` found a feasible route under that existing
+cooperative contract, but no currently encoded boundary authorizing reuse.
+Stdio alias checks plus CLOEXEC alone are insufficient. The first implementation
+should proceed in independently reviewed slices:
+
+1. Add the concrete managed control path and checked output sinks, with no
+   verification reduction. Cover Phase start/tick/finish/Drop, normal forwarding,
+   quiet inherited output and secret-related parent diagnostics. Compare held
+   sink objects with admitted payloads; an alias error must not be printed through
+   the offending sink.
+2. Introduce the exporter-owned capability only after closing every writable
+   spool/ingest handle. Track private inherited aliases and independent cache
+   copies separately. Bound retained handles against the current soft FD limit,
+   existing descriptors and worker headroom, as well as metadata limits.
+3. Add session-wide invalidation before unknown write effects. Uncertain teardown
+   or an alias violation aborts. Budget exhaustion selects conservative checks.
+   Re-admission requires quiescent writers and complete verification; matching
+   digest names cannot transfer evidence between physical copies.
+4. Enable narrowly scoped reuse only after fixed-path fault, alias, durability,
+   crash-prefix and fallback tests pass. Measure the actual managed CLI afterward.
+
+The worker guard closes extra descriptors and the workload child closes its
+lease descriptor. Session descriptors must remain CLOEXEC. However, the traced
+application deliberately retains outer `/dev` and `/proc` directory handles;
+this is not an OS isolation proof. Writable mappings, proc-mediated writes,
+bind aliases and an output consumer writing back into the store remain outside
+the cooperative contract. If those writers must be supported, invalidate before
+RUN and fully verify afterward; do not enable cross-RUN reuse. Final hashing
+cannot retroactively protect an earlier durable commit.
+
+This was a read-only source audit, not a runtime proof or implemented fast path.
+
 ## Commit and failure behavior
 
 Hold the existing shared store lease across the build; acquire the publication

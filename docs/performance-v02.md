@@ -135,6 +135,14 @@ reading, and 0.28 seconds in cancellation callbacks. SHA-NI was already selected
 Those instrumented results identify repeated checkpoint hashing as the target;
 they are not an additional release speedup.
 
+The later [balanced xattr-scratch comparison](xattr-scratch-balanced-performance.md)
+passed four cold builds and both pair checks. It observed 94.34 versus 92.31
+seconds on the 100,000-file fixture, a modest 2.15% mean elapsed reduction across
+two pairs. This does not establish a general or large-image speedup. The
+[checkpoint-session proposal](checkpoint-verification-design.md) targets the
+larger repeated-verification cost; its writer-boundary enforcement is not yet
+implemented.
+
 One allocation-only follow-up borrows anchor paths and symlink targets in the
 temporary inventory grouping map instead of cloning them. The owned inventory,
 logical budget charges, filesystem reads, hashes and cancellation checks remain
