@@ -117,6 +117,45 @@ space, and limits. `summary.json` retains raw repeated values and paired wall-ti
 ratios. Artifact data itself is disposable; copy the evidence to the controller
 before teardown. Do not infer full Nemotron timing from these measurements.
 
+## Startup-stall diagnostics for a new sealed run
+
+`cold_metrics.py` makes the sampler used in the managed-session comparison
+available here: allocation inventories run only before/after the timed child,
+and half-second process samples, `wait4`, deadlines and group cleanup remain.
+It is separate from the original allocation-sampling `metrics.measure` above.
+Neither prior sealed bundles nor their measurements are modified.
+
+For a diagnostic run, call this sampler with one fresh observer per build:
+
+```python
+from cold_metrics import measure
+from proc_stall import ProcStallObserver
+
+result = measure(command, env, roots, log_dir, timeout=300,
+                 stall_observer=ProcStallObserver())
+```
+
+The observer consumes the existing `seconds`, `stat` and `io` sample. After at
+least one second of consecutive D-state samples with unchanged CPU/I/O counters,
+it reads only bounded `wchan`, `syscall` and identity-check `stat` files. It saves
+the wait-channel symbol and syscall number/status; syscall arguments, pointers,
+FD targets, payloads and stacks are not collected by this observer. Process
+identity is checked before/after capture. Permission failures, malformed values
+and exit races are diagnostic statuses, not build failures. Detection resets on
+progress, invalid input, nonincreasing time or a sample gap over 1.5 seconds.
+
+Captures are limited to one per second and 16 per build, held in memory until
+the normal measurement write. Each includes capture duration. These observations
+are neither atomic nor proof of the cause of a wait. Use the same settings for
+both benchmark arms, record observer source hashes in a newly sealed bundle,
+and report the extra sampling overhead. Default calls remain observer-free.
+Actual Pod access to these proc files must be checked on that kernel. This
+instrumentation does not resolve or remove the previously reported edit outlier.
+
+```sh
+python3 -B -m unittest -v test_proc_stall
+```
+
 ## Local checks (no candidate)
 
 Linux root, Python >= 3.11, GNU tar and an existing **static** BusyBox are needed.
