@@ -22,7 +22,7 @@ import uuid
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-UNSUPPORTED = "rpweld has no build command; candidate compatibility is untested"
+UNSUPPORTED = "this reference corpus has no Weld candidate adapter; compatibility is untested"
 
 
 def command_prefix(value):

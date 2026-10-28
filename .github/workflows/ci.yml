@@ -43,4 +43,5 @@ jobs:
       - run: python3 tests/scan_cli.py "$CARGO_TARGET_DIR/debug/rpweld"
       - run: python3 tests/compatibility.py --self-test
       - name: Check bounded process diagnostics
-        run: python3 -B -m unittest discover -s tests/fixtures/v02-performance -p test_proc_stall.py
+        # Final /proc counters for the terminated child require root.
+        run: sudo python3 -B -m unittest discover -s tests/fixtures/v02-performance -p test_proc_stall.py

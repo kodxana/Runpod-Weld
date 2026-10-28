@@ -152,8 +152,11 @@ and report the extra sampling overhead. Default calls remain observer-free.
 Actual Pod access to these proc files must be checked on that kernel. This
 instrumentation does not resolve or remove the previously reported edit outlier.
 
+Run the sampler tests as Linux root: final `/proc/<pid>/io` counters after
+child termination can otherwise be unreadable, even by the child's owner.
+
 ```sh
-python3 -B -m unittest -v test_proc_stall
+sudo python3 -B -m unittest discover -s tests/fixtures/v02-performance -p test_proc_stall.py
 ```
 
 ## Local checks (no candidate)

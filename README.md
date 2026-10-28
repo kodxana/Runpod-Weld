@@ -228,7 +228,7 @@ Exit 0 means no known issues were found by these partial static checks. Exit 2 m
 
 ## Development checks
 
-The internal `oci::BlobStore` supports verified SHA-256 blob ingestion and reads with fixed buffers, explicit size limits and cooperative cancellation. It publishes only verified content and rejects existing corrupt blobs. Store directories must be caller-owned and stable; blocking input reads need their own timeout. This is the artifact foundation; the user-facing build command is still in development.
+The internal `oci::BlobStore` supports verified SHA-256 blob ingestion and reads with fixed buffers, explicit size limits and cooperative cancellation. It publishes only verified content and rejects existing corrupt blobs. Store directories must be caller-owned and stable; blocking input reads need their own timeout. These primitives also back the user-facing build command.
 
 `image::load_layout` selects an unambiguous Linux/amd64 OCI image from a local layout and verifies its manifest, config and compressed layer blobs within caller-supplied limits. It preserves inherited image configuration. Uncompressed diff IDs are declarations only until layer decompression verifies them; successful metadata loading does not establish a valid or runnable rootfs.
 
@@ -240,11 +240,22 @@ The development example `cargo run --example replay_layout -- LAYOUT REFERENCE D
 ```sh
 cargo fmt --all -- --check
 cargo test --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 python tests/compatibility.py --self-test
 ```
 
-The [compatibility fixtures](tests/fixtures/README.md) define an explicit Docker reference workflow. Candidate comparisons fail as unsupported until an image-build implementation exists.
+CI and release builds also run the real managed worker, secret/cache cleanup,
+descriptor-isolation and blocked-output cancellation fixtures explicitly. In a
+disposable Linux root environment with static BusyBox and a static C compiler:
+
+```sh
+cargo test --locked --test managed_control --test run_mounts_cli --test worker_cli -- --include-ignored --test-threads=1
+```
+
+These checks require permitted chroot, credential changes and child ptrace.
+Ordinary `cargo test` leaves those environment-dependent cases ignored.
+
+The [compatibility fixtures](tests/fixtures/README.md) define an explicit Docker reference workflow. That reference corpus does not yet have a Weld candidate adapter, so its report marks candidate comparisons unsupported; this is separate from the implemented build command and its integration tests.
 
 `export::export_layout` writes a flattened Linux/amd64 OCI layout containing one uncompressed full-tree layer. It preserves supported metadata and hardlinks under explicit byte/entry/metadata limits, and publishes the index last. Supply a stable, quiescent tree and a new output path; unsupported special files, nested mounts, external hardlinks and symlink/empty xattrs are rejected. Export writes one owned temporary layer, verifies it, and publishes that same file without a second payload copy; failed output may remain partial.
 
