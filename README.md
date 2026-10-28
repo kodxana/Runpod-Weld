@@ -458,7 +458,9 @@ when reads cannot use O_NOATIME.
 This removes cold layered checkpoint reconstruction and retained duplicate roots.
 Checkpoint exports still scan and fingerprint the current tree. Private immutable
 instruction layouts share already-owned inherited blob inodes; public outputs and
-cache ingestion retain independent copies. Incremental COPY inventories remain future work.
+cache ingestion retain independent copies. Managed COPY checkpoints can reuse
+untouched payload hashes while retaining the complete metadata walk, as described
+below.
 
 Managed Linux builds retain bounded verification evidence for owned layer payloads
 within a stage. Later instruction publications can reuse it; every new physical
@@ -469,6 +471,9 @@ the existing cooperative store/trusted-RUN contract; callback-based library APIs
 remain conservative. See [the publication-session contract](docs/publication-session-implementation.md).
 Managed single-COPY checkpoints also use bounded write evidence to reuse untouched
 payload hashes and committed inherited layers; see [the COPY reuse contract](docs/copy-checkpoint-reuse.md).
+The subsequent [balanced COPY comparison](docs/copy-checkpoint-performance.md)
+measured 32.4% less cold time and 8.5% less edit time on a 1 GiB synthetic fixture;
+warm and no-cache controls were essentially unchanged. All 16 outputs passed.
 
 A balanced 16-build Pod comparison measured cold builds at 48.9 → 32.4 seconds
 (33.6% less time) for a 1 GiB dependency plus 2,048 small files. Application-edit

@@ -4,8 +4,10 @@ Candidate: `5204299e1340a2ca8b5401ad8ec751843d96cfa4`, 2026-10-28.
 Comparison baseline: `a3ce37f6a951a388a1c81d19ae93597fbd74914e`.
 
 The [managed COPY change](copy-checkpoint-reuse.md) passed correctness checks and
-independent review. **Pod timing and real Nemotron acceptance remain pending.**
-This is candidate validation, not a stable-release or large-image speed claim.
+independent review. The [16-build Pod comparison](copy-checkpoint-performance.md)
+also passed: cold time fell 32.4%, edit time 8.5%, with warm/no-cache controls
+essentially unchanged. **Real Nemotron acceptance remains pending.**
+This is candidate validation, not a stable-release or general large-image speed claim.
 The [implementation gaps](implementation-gaps.md) remain the release checklist.
 
 ## Integrated correctness
@@ -71,6 +73,7 @@ original build receipts, all 15 bundled runtime helpers and BusyBox were verifie
 | Baseline binary | `62387416347edb39b1adfe607be4a8efdb66c152adc7ea6be272427c69a72717` |
 | Candidate binary | `9b28f802a9ab87a9f5075565f5a5bd2dc6804273457506f2b8c54bdaef73bdd6` |
 | First comparison bundle | `9c60acd4028690780d072bfd97be1b95c55e2f1ab962964ed3c7a44c48a7d3ac` |
+| Corrected comparison bundle | `e5559ca3a9d25ed5941f571cb36cdb912bcd9c9a6194c72504cbf35d114ffefd` |
 
 ## First Pod attempt: readiness failure, zero builds
 
@@ -86,6 +89,27 @@ failure evidence are retained unchanged. Delete returned 204, a fresh get return
 404, and the complete Pod inventory was empty; the cleanup reminder was removed.
 Evidence: `.research-private/copy-checkpoint-20261028/pod-5204299/`.
 
-A corrected, independently reviewed readiness helper and a newly sealed trial
-are required before obtaining timings. The unchanged real Nemotron timeout and
-missing cold/warm/edit final-image acceptance remain unresolved.
+## Corrected readiness gate
+
+The private readiness helper now resolves a partition to its exact parent device
+before checking RAID members. It checks every member, rejects mapping errors and
+cycles, and bounds traversal to 16 levels and 256 visits. Other runtime gates,
+binary identities, fixture/oracle assertions and benchmark deadlines are unchanged.
+Independent review passed, including 53 tests on Windows (six skipped), 57 under
+WSL root (two skipped), and three additional probes. All 43 original tests and
+332 protected files remained intact.
+
+The newly sealed payload uses the same frozen binaries above. On fresh Pod
+`4q09qlqo1c0vh6`, actual readiness passed before any builder: live and exited-child
+I/O counters, `wait4` and reaping; local backing through the XFS RAID partition
+and synced-write accounting; 85,780,533,248 available bytes; and more than 100,000
+free inodes. This qualifies that Pod for the comparison, not arbitrary Pod
+storage or full-workload capacity.
+
+The unchanged real Nemotron timeout and missing cold/warm/edit final-image
+acceptance remain unresolved.
+
+The corrected trial completed all 16 builds and both full paired acceptance
+checks. All 150 collected evidence files were hash-verified. The Pod was deleted;
+fresh get returned 404 and complete inventory was empty. Exact timings, method,
+artifact hashes and cleanup are in the [comparison report](copy-checkpoint-performance.md).

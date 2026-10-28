@@ -8,8 +8,14 @@ Concurrent small-COPY performance work is outside this snapshot.
 
 Follow-up: the managed COPY and inherited-payload reuse candidate passed
 [correctness validation and review](copy-checkpoint-validation.md) at `5204299e`.
-Its first Pod attempt stopped before any build at a readiness-helper defect.
-No new large-image timing or real Nemotron acceptance result supersedes this audit.
+Its corrected [16-build Pod comparison](copy-checkpoint-performance.md) passed:
+cold time fell 32.4% and edit time 8.5% on the 1 GiB synthetic fixture; warm and
+no-cache controls were essentially unchanged. Actual native-storage and final
+process-accounting readiness passed. The first readiness-only failure remains
+recorded. These results address the narrow COPY and measurement gates; the real
+Nemotron timeout and missing final-image acceptance remain unresolved. Historical
+"missing" statements below describe the pinned audit baseline, not a rollback
+of this implemented change.
 
 **The next stable candidate should improve small-COPY checkpoint cost and clear
 the real-image acceptance gate before adding compatibility features.** Candidate
