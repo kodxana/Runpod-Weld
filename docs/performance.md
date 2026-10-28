@@ -3,6 +3,11 @@
 Measurements below are from Linux Runpod Pods with native container storage,
 optimized Weld binaries, and layered export. They are not Docker parity claims.
 
+The latest [real managed Nemotron attempt](real-nemotron-5860971.md) reached its
+60-minute cold-build limit during final export. No final image, warm/edit result,
+or full-image acceptance was produced. Older no-cache timings below are not a
+matched baseline for that run.
+
 ## Incremental instruction checkpoints (2026-10-27)
 
 The v0.2 candidate adds incremental instruction layers and extends verified-root

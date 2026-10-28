@@ -7,6 +7,11 @@ workflow artifacts. **No new public release or version tag was published.**
 The packages still identify themselves as version `0.1.0`; these artifacts must
 not replace the existing release under that version.
 
+**Follow-up:** the original managed Nemotron cold build subsequently hit its
+60-minute cap during final image export, with no published output. Warm/edit
+and full-image acceptance did not run. See [the real-workload result and sampler
+fix](real-nemotron-5860971.md). The real large-image gate is therefore still open.
+
 Exact measurements, artifact hashes and validation receipts are summarized in
 [stable-candidate-5860971.json](stable-candidate-5860971.json).
 

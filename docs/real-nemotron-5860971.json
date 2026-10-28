@@ -1,0 +1,333 @@
+{
+  "schema": 1,
+  "candidate_commit": "586097166166fb4849e3102be802d0d0cc585284",
+  "source_commit": "91ee1316e21f624082c90cc07fcbbec1d9499550",
+  "binary_sha256": "e095208dca1146c0d60f5f03b97e75369695601fe1373d48691077c67a0d1c8c",
+  "portable_archive_sha256": "5e35862cc4f3ea5d7ac1556a4c331198e5f3aefdeaca89ceb8aff76ec64f8d81",
+  "source_archive_sha256": "13d7ef64e39070a3e4f64b74597a66627d2837aed0edc112b40336ffa31a81e0",
+  "runner_archive_sha256": "06109ea06db30dffee68d016cbeb4cc0e8fbfb67599e6904e4c23d65ec034230",
+  "result": "cold_timeout_no_published_image",
+  "cold_limit_seconds": 3600,
+  "cold_timed_out": true,
+  "warm": "not_started",
+  "edit": "not_started",
+  "full_image_oracle": "not_run",
+  "gpu_inference": "not_run",
+  "command": [
+    "/var/tmp/weld-nemotron-input-f0a986bd853e44a980abcbcc0d7f98ea/portable/rpweld-0.1.0-linux-amd64/bin/rpweld",
+    "build",
+    "--progress",
+    "plain",
+    "-t",
+    "local/nemotron-f0a986bd853e44a980abcbcc0d7f98ea:cold",
+    "--run-timeout-seconds",
+    "3600",
+    "/var/tmp/weld-nemotron-input-f0a986bd853e44a980abcbcc0d7f98ea/source"
+  ],
+  "final_process_metrics_unavailable": true,
+  "sampler_error": "[Errno 13] Permission denied: '/proc/258/io'",
+  "last_live_sample": {
+    "seconds": 3599.929117065971,
+    "proc_io": {
+      "rchar": 2935734721265,
+      "wchar": 477692020389,
+      "syscr": 59689812,
+      "syscw": 15406534,
+      "read_bytes": 965823193088,
+      "write_bytes": 476557230080,
+      "cancelled_write_bytes": 33411190784
+    },
+    "status": "State:\tD (disk sleep)\nVmHWM:\t  581204 kB\nVmRSS:\t  522620 kB\nThreads:\t1",
+    "note": "Observed sample, not final counters. rchar is read-request volume, not physical disk reads."
+  },
+  "sample_count": 7129,
+  "stall_diagnostics": [],
+  "stages": [
+    {
+      "stage": 1,
+      "state": "DONE",
+      "seconds": 1176.008
+    },
+    {
+      "stage": 2,
+      "state": "DONE",
+      "seconds": 1351.593
+    },
+    {
+      "stage": 3,
+      "state": "FAILED/INTERRUPTED",
+      "seconds": 994.307
+    }
+  ],
+  "completed_instruction_timings": [
+    {
+      "stage": 1,
+      "instruction": 1,
+      "kind": "FROM",
+      "seconds": 135.03
+    },
+    {
+      "stage": 1,
+      "instruction": 3,
+      "kind": "WORKDIR",
+      "seconds": 62.325
+    },
+    {
+      "stage": 1,
+      "instruction": 5,
+      "kind": "COPY",
+      "seconds": 58.597
+    },
+    {
+      "stage": 1,
+      "instruction": 6,
+      "kind": "RUN",
+      "seconds": 126.674
+    },
+    {
+      "stage": 1,
+      "instruction": 7,
+      "kind": "COPY",
+      "seconds": 65.997
+    },
+    {
+      "stage": 1,
+      "instruction": 8,
+      "kind": "RUN",
+      "seconds": 96.452
+    },
+    {
+      "stage": 1,
+      "instruction": 9,
+      "kind": "COPY",
+      "seconds": 68.083
+    },
+    {
+      "stage": 1,
+      "instruction": 10,
+      "kind": "COPY",
+      "seconds": 68.013
+    },
+    {
+      "stage": 1,
+      "instruction": 11,
+      "kind": "COPY",
+      "seconds": 67.74
+    },
+    {
+      "stage": 1,
+      "instruction": 12,
+      "kind": "COPY",
+      "seconds": 70.074
+    },
+    {
+      "stage": 1,
+      "instruction": 13,
+      "kind": "RUN",
+      "seconds": 72.615
+    },
+    {
+      "stage": 2,
+      "instruction": 1,
+      "kind": "FROM",
+      "seconds": 136.451
+    },
+    {
+      "stage": 2,
+      "instruction": 2,
+      "kind": "COPY",
+      "seconds": 86.692
+    },
+    {
+      "stage": 2,
+      "instruction": 3,
+      "kind": "RUN",
+      "seconds": 595.25
+    },
+    {
+      "stage": 3,
+      "instruction": 4,
+      "kind": "COPY",
+      "seconds": 612.796
+    },
+    {
+      "stage": 3,
+      "instruction": 5,
+      "kind": "COPY",
+      "seconds": 191.467
+    }
+  ],
+  "completed_subphase_timings": {
+    "Preparing base layers": {
+      "count": 2,
+      "sum_seconds": 383.668,
+      "seconds": [
+        164.822,
+        218.846
+      ]
+    },
+    "Capturing verified base filesystem": {
+      "count": 3,
+      "sum_seconds": 113.916,
+      "seconds": [
+        30.719,
+        31.961,
+        51.236
+      ]
+    },
+    "Exporting instruction checkpoint": {
+      "count": 16,
+      "sum_seconds": 1342.108,
+      "seconds": [
+        53.525,
+        51.884,
+        48.35,
+        59.145,
+        54.063,
+        57.874,
+        55.362,
+        55.279,
+        54.936,
+        56.548,
+        57.289,
+        59.568,
+        73.604,
+        221.853,
+        228.891,
+        153.937
+      ]
+    },
+    "Verifying checkpoint delta (keeping working filesystem)": {
+      "count": 16,
+      "sum_seconds": 341.546,
+      "seconds": [
+        8.674,
+        8.516,
+        8.501,
+        14.006,
+        10.205,
+        11.525,
+        10.684,
+        10.695,
+        10.682,
+        11.47,
+        10.819,
+        10.578,
+        11.009,
+        82.937,
+        85.869,
+        35.376
+      ]
+    },
+    "Publishing instruction cache": {
+      "count": 16,
+      "sum_seconds": 612.899,
+      "seconds": [
+        71.373,
+        0.278,
+        0.285,
+        13.935,
+        0.191,
+        3.392,
+        0.341,
+        0.347,
+        0.344,
+        0.352,
+        0.371,
+        64.652,
+        0.392,
+        194.594,
+        261.688,
+        0.364
+      ]
+    },
+    "Publishing stage image (export or verified cache reuse)": {
+      "count": 2,
+      "sum_seconds": 13.452,
+      "seconds": [
+        3.379,
+        10.073
+      ]
+    },
+    "Verifying stage checkpoint (keeping working filesystem)": {
+      "count": 2,
+      "sum_seconds": 48.724999999999994,
+      "seconds": [
+        11.794,
+        36.931
+      ]
+    }
+  },
+  "timing_note": "Stage/instruction/subphase times overlap and must not be added together.",
+  "post_run": {
+    "uid": 0,
+    "uid_map": "         0     231072      65536\n",
+    "build_phase": "failed",
+    "manifest": null,
+    "output_index_exists": false,
+    "space_available": 765020655616,
+    "warm_started": false,
+    "edit_started": false,
+    "supervisor_cleanup": {
+      "elapsed_seconds": 0.0001652589999139309,
+      "initial_descendants": 0,
+      "parent_must_delete_pod": false,
+      "signalled_pids": [],
+      "survivors": []
+    },
+    "live_io_readable": true,
+    "zombie_io_metadata": {
+      "uid": 65534,
+      "gid": 65534,
+      "mode": "0o400"
+    },
+    "zombie_io_error": {
+      "errno": 13,
+      "type": "PermissionError"
+    },
+    "wait4": {
+      "returncode": 0,
+      "wall_seconds": 0.2157067529624328,
+      "cpu_user_seconds": 0.009401999999999999,
+      "cpu_system_seconds": 0.006268,
+      "maxrss_kib": 11576
+    }
+  },
+  "pod": {
+    "id": "9u3jdd603gobam",
+    "created_at": "2026-10-28T11:04:06.597Z",
+    "deleted_at": "2026-10-28T12:14:13Z",
+    "data_center": "EU-SE-1",
+    "gpu": "NVIDIA A40",
+    "cpu_quota_cores": 7.65,
+    "memory_limit_bytes": 49999998976,
+    "disk_requested": 1000,
+    "storage": "overlay with XFS-backed container mounts and observed block I/O",
+    "initial_available_bytes": 1073657020416,
+    "compute_usd_per_hour": 0.59,
+    "teardown": {
+      "delete_status": 204,
+      "fresh_get_status": 404,
+      "complete_inventory_empty": true,
+      "reminder_removed": true
+    }
+  },
+  "collection": {
+    "pass": true,
+    "files": 21,
+    "bytes": 602426,
+    "sha256": "f7a2d8e058cdaf588c13d4ed312584dc97a0598062a38fd64ac7960e9b0b5608",
+    "omitted": []
+  },
+  "evidence_directory": ".research-private/real-nemotron-20261028/verified-evidence",
+  "production_changes_for_this_validation": false,
+  "followup_sampler_fix": {
+    "commit": "d9aa87b",
+    "red_cases": 3,
+    "observer_test_methods_passed": 13,
+    "fixture_tests_passed": 8,
+    "optional_fixture_tests_skipped": 1,
+    "preserves_strict_counter_requirement": true,
+    "rewrites_historical_evidence": false
+  }
+}
