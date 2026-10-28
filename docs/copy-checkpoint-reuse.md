@@ -62,3 +62,5 @@ corruption, cancellation, alias binding and conservative fallback.
 These correctness checks do not establish a large-image speedup. The real cold,
 warm and edited Nemotron outputs still need independent acceptance, as listed
 in [implementation gaps](implementation-gaps.md).
+See the [candidate validation record](copy-checkpoint-validation.md) for exact
+test counts, binary hashes, review scope and Pod readiness results.

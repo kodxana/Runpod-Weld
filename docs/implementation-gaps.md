@@ -6,6 +6,11 @@ tests and recorded validation, not an exhaustive Docker/BuildKit compatibility
 audit or a new benchmark. Source links below are pinned to that revision.
 Concurrent small-COPY performance work is outside this snapshot.
 
+Follow-up: the managed COPY and inherited-payload reuse candidate passed
+[correctness validation and review](copy-checkpoint-validation.md) at `5204299e`.
+Its first Pod attempt stopped before any build at a readiness-helper defect.
+No new large-image timing or real Nemotron acceptance result supersedes this audit.
+
 **The next stable candidate should improve small-COPY checkpoint cost and clear
 the real-image acceptance gate before adding compatibility features.** Candidate
 `5860971` passed synthetic and packaging gates, but its real managed Nemotron
