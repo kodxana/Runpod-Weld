@@ -193,6 +193,39 @@ class SamplerTests(unittest.TestCase):
             self.assertEqual(result['returncode'], -9)
             self.assertNotIn('cleanup_error', result)
 
+    def test_final_counter_denial_preserves_exit_and_wait4_evidence(self):
+        import cold_metrics
+        for code, timeout, expected_code in (('pass', 5, 0),
+                ('raise SystemExit(7)', 5, 7), ('import time; time.sleep(30)', .1, -9)):
+            with self.subTest(expected_code=expected_code), \
+                    tempfile.TemporaryDirectory(prefix='weld-cold-denied-') as directory:
+                root = Path(directory)
+                reaped = []
+                real_wait4 = os.wait4
+                def reap(pid, options):
+                    result = real_wait4(pid, options)
+                    reaped.append(pid)
+                    return result
+                error = PermissionError(errno.EACCES, 'final counters denied')
+                with patch('metrics.proc_counters', side_effect=error), \
+                        patch.object(cold_metrics.os, 'wait4', reap), \
+                        self.assertRaises(PermissionError if expected_code == 0 else AssertionError):
+                    cold_metrics.measure([sys.executable, '-c', code], dict(os.environ),
+                                         [root], root / 'logs', timeout=timeout)
+                result = json.loads((root / 'logs/measurement.json').read_text())
+                self.assertEqual(result['returncode'], expected_code)
+                self.assertEqual(result['timed_out'], expected_code == -9)
+                self.assertIsNone(result['proc_io'])
+                self.assertEqual(result['proc_io_error'], {'errno': errno.EACCES, 'type': 'PermissionError'})
+                self.assertGreater(result['wall_seconds'], 0)
+                self.assertGreaterEqual(result['cpu_user_seconds'], 0)
+                self.assertGreaterEqual(result['cpu_system_seconds'], 0)
+                self.assertGreater(result['maxrss_kib'], 0)
+                self.assertEqual(len(reaped), 1)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(reaped[0], os.WNOHANG)
+                self.assertNotIn('cleanup_error', result)
+
 
 if __name__ == '__main__':
     unittest.main()

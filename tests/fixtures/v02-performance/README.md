@@ -154,6 +154,14 @@ instrumentation does not resolve or remove the previously reported edit outlier.
 
 Run the sampler tests as Linux root: final `/proc/<pid>/io` counters after
 child termination can otherwise be unreadable, even by the child's owner.
+Container root alone is not sufficient: on a user-namespaced Pod the zombie's
+counter file was owned by unmapped UID 65534 and returned `EACCES`. Probe both
+live and exited-child counter access on the actual Pod before a long run.
+If final counters are unavailable, the sampler still reaps with `wait4` and
+saves wall time, exit status, CPU/RSS and `proc_io_error`; `proc_io` is null.
+It preserves a failed build/timeout as the primary error, and still refuses
+successful benchmark acceptance without the required final counters. Never
+substitute the last live sample or zeroes for missing final counters.
 
 ```sh
 sudo python3 -B -m unittest discover -s tests/fixtures/v02-performance -p test_proc_stall.py

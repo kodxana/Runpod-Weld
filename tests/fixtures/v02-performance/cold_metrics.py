@@ -76,7 +76,14 @@ def measure(command, env, roots, log_dir, timeout=300, *, stall_observer=None):
                         raise TimeoutError('builder not reapable within 5s after SIGKILL')
                     time.sleep(0.01)
             elapsed = time.monotonic() - started
-            counters = proc_counters(process.pid)
+            counters, counter_error = None, None
+            try:
+                counters = proc_counters(process.pid)
+            except OSError as error:
+                # User-namespaced root can lose procfs access when a child exits.
+                # Reap and retain wait4 evidence before reporting that failure.
+                counter_error = error
+                result['proc_io_error'] = {'errno': error.errno, 'type': type(error).__name__}
             result['proc_samples'].append({'seconds': elapsed, **proc_sample(process.pid)})
             _, status, ru = os.wait4(process.pid, 0)
             process.returncode = os.waitstatus_to_exitcode(status)
@@ -96,6 +103,8 @@ def measure(command, env, roots, log_dir, timeout=300, *, stall_observer=None):
         write(log_dir / 'measurement.json', result)
         result['allocated_retained'] = usage(*roots)
         assert process.returncode == 0 and not result['timed_out'], f'build failed: {log_dir}'
+        if counter_error is not None:
+            raise counter_error
         assert 'read_bytes' in counters and 'write_bytes' in counters
         return result
     except BaseException as error:
