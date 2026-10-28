@@ -61,6 +61,8 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    # Release directory and metadata permissions must not depend on the caller.
+    os.umask(0o022)
     repo = Path(__file__).resolve().parent.parent
     os.chdir(repo)
     version = tomllib.loads((repo/'Cargo.toml').read_text())['package']['version']
