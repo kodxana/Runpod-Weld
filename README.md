@@ -96,6 +96,10 @@ Both release packages carry Skopeo, private shared libraries/loader and fallback
 
 To build release packages on Ubuntu 24.04 amd64 with Rust 1.90, Skopeo, CA certificates, binutils, Python 3.11+ and `dpkg-deb`, run `bash scripts/package-deb.sh`. The [release workflow](.github/workflows/release.yml) builds, tests, collects corresponding sources and publishes on version tags.
 
+The [offline package checks](docs/release-packaging-checks.md) cover portable and
+Debian installs, artifact identity, permissions, gzip builds, managed caches and
+secret/cache mounts in disposable containers with networking disabled.
+
 ## Build and inspect
 
 Install Rust through rustup and a system C linker. The repository pins its Rust toolchain; dependencies are pinned in `Cargo.lock`.
