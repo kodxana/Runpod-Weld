@@ -1,10 +1,589 @@
 use crate::oci::publication_session::faults::{self, Timing};
 use std::sync::atomic::AtomicBool;
 
+fn checkpoint_layers(path: &Path, layers: &[Descriptor]) {
+    let store = BlobStore::open(path).unwrap();
+    let mut metadata = image::load_layout(path, None, limits(), || false).unwrap();
+    metadata.config["rootfs"]["diff_ids"] =
+        serde_json::json!(layers.iter().map(|layer| &layer.digest).collect::<Vec<_>>());
+    let config = blob(
+        &store,
+        "application/vnd.oci.image.config.v1+json",
+        &serde_json::to_vec(&metadata.config).unwrap(),
+    );
+    metadata.manifest["config"] = serde_json::to_value(config).unwrap();
+    metadata.manifest["layers"] = serde_json::to_value(layers).unwrap();
+    let manifest = blob(
+        &store,
+        "application/vnd.oci.image.manifest.v1+json",
+        &serde_json::to_vec(&metadata.manifest).unwrap(),
+    );
+    fs::write(
+        path.join("index.json"),
+        serde_json::to_vec(&serde_json::json!({"schemaVersion":2,"manifests":[manifest]})).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn session_checkpoint_aliases_preserve_first_and_final_hash_counts() {
+    for copies in [1, 4] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let next = temp.path().join("next");
+        let layer = source_layers(&path, 1, &[42; 4096], copies);
+        source_layers(&next, 2, &[42; 4096], copies);
+        let mut limits = limits();
+        limits.max_total_layer_bytes = 4096 * copies as u64;
+        let source = owned(&path, limits);
+        let destination = BlobStore::open(&next).unwrap();
+        let target = next.join("blobs/sha256").join(&layer.digest[7..]);
+        fs::remove_file(&target).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let control = ManagedControl::for_test(&cancelled).unwrap();
+        let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+        let mut session = cache.publication_session(&control, limits);
+        let (result, count, bytes) = super::super::hash_reads::observe(&layer.digest, || {
+            session.load_checkpoint(&source, limits)
+        });
+        assert_eq!(result.unwrap().layers.len(), copies);
+        assert_eq!((count, bytes), (copies as u64, copies as u64 * 4096));
+        assert_eq!(session.evidence.files().count(), 0);
+        assert!(
+            !session
+                .try_link_inherited(&source, &destination, &layer, 4096)
+                .unwrap()
+        );
+        assert!(!target.exists());
+        let first = 7 * copies as u64 + 1;
+        assert_eq!(
+            session_read_count(&mut session, &source, &layer, limits, 'a'),
+            (first, first * 4096)
+        );
+        let retained = session.evidence.files().count();
+        for _ in 0..2 {
+            let (result, count, bytes) = super::super::hash_reads::observe(&layer.digest, || {
+                session.try_link_inherited(&source, &destination, &layer, 4096)
+            });
+            assert!(result.unwrap());
+            assert_eq!((count, bytes), (0, 0));
+        }
+        assert_eq!(
+            identity(&fs::metadata(&target).unwrap()),
+            identity(&fs::metadata(path.join("blobs/sha256").join(&layer.digest[7..])).unwrap())
+        );
+        let next = owned(&next, limits);
+        let (result, count, bytes) = super::super::hash_reads::observe(&layer.digest, || {
+            session.load_checkpoint(&next, limits)
+        });
+        assert_eq!(result.unwrap().layers.len(), copies);
+        assert_eq!((count, bytes), (0, 0));
+        assert_eq!(session.evidence.files().count(), retained);
+        assert_eq!(
+            session_read_count(&mut session, &next, &layer, limits, 'b'),
+            (0, 0)
+        );
+        session.invalidate();
+        let (result, count, bytes) = super::super::hash_reads::observe(&layer.digest, || {
+            cache.publish(next.path(), &"c".repeat(64), limits, &[], 0, &|| false)
+        });
+        result.unwrap();
+        let final_reads = 7 * copies as u64 - 1;
+        assert_eq!((count, bytes), (final_reads, final_reads * 4096));
+    }
+}
+
+#[test]
+fn session_checkpoint_new_inode_delta_and_cache_alias_are_not_admitted() {
+    for cache_alias in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let next = temp.path().join("next");
+        let layer = source_layers(&path, 1, &[42; 2048], 1);
+        source_layers(&next, 2, &[42; 2048], 1);
+        let source = owned(&path, limits());
+        let store = BlobStore::open(&next).unwrap();
+        let delta = blob(
+            &store,
+            "application/vnd.oci.image.layer.v1.tar",
+            &[13; 2048],
+        );
+        checkpoint_layers(&next, &[layer.clone(), layer.clone(), delta.clone()]);
+        let cancelled = AtomicBool::new(false);
+        let control = ManagedControl::for_test(&cancelled).unwrap();
+        let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+        let mut session = cache.publication_session(&control, limits());
+        session_read_count(&mut session, &source, &layer, limits(), 'a');
+        if cache_alias {
+            let target = next.join("blobs/sha256").join(&layer.digest[7..]);
+            fs::remove_file(&target).unwrap();
+            fs::hard_link(
+                cache
+                    .root
+                    .join("content/blobs/sha256")
+                    .join(&layer.digest[7..]),
+                &target,
+            )
+            .unwrap();
+        }
+        let next = owned(&next, limits());
+        let retained = session.evidence.files().count();
+        for descriptor in [&layer, &delta] {
+            for _ in 0..2 {
+                let (result, count, bytes) =
+                    super::super::hash_reads::observe(&descriptor.digest, || {
+                        session.load_checkpoint(&next, limits())
+                    });
+                let metadata = result.unwrap();
+                assert_eq!(
+                    metadata
+                        .layers
+                        .iter()
+                        .map(|layer| layer.digest.as_str())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        layer.digest.as_str(),
+                        layer.digest.as_str(),
+                        delta.digest.as_str()
+                    ]
+                );
+                let expected = if descriptor.digest == layer.digest {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!((count, bytes), (expected, expected * 2048));
+                assert_eq!(session.evidence.files().count(), retained);
+            }
+            assert!(
+                !session
+                    .try_link_inherited(&next, &store, descriptor, 4096)
+                    .unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn session_inheritance_different_target_falls_back_without_adopting_it() {
+    for corrupt in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let next = temp.path().join("next");
+        let layer = source(&path, 1);
+        source(&next, 2);
+        let source = owned(&path, limits());
+        let destination = BlobStore::open(&next).unwrap();
+        let target = next.join("blobs/sha256").join(&layer.digest[7..]);
+        if corrupt {
+            fs::write(&target, [99; 4096]).unwrap();
+        }
+        let before = fs::read(&target).unwrap();
+        let before_id = identity(&fs::metadata(&target).unwrap());
+        let cancelled = AtomicBool::new(false);
+        let control = ManagedControl::for_test(&cancelled).unwrap();
+        let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+        let mut session = cache.publication_session(&control, limits());
+        session_read_count(&mut session, &source, &layer, limits(), 'a');
+        let retained = session.evidence.files().count();
+        let (result, count, bytes) = super::super::hash_reads::observe(&layer.digest, || {
+            session.try_link_inherited(&source, &destination, &layer, 4096)
+        });
+        assert!(!result.unwrap());
+        assert_eq!((count, bytes), (0, 0));
+        assert_eq!(fs::read(&target).unwrap(), before);
+        assert_eq!(identity(&fs::metadata(&target).unwrap()), before_id);
+        assert_eq!(session.evidence.files().count(), retained);
+        assert_eq!(
+            destination.open_verified(&layer, 4096, || false).is_err(),
+            corrupt
+        );
+    }
+}
+
+#[test]
+fn session_checkpoint_corruption_and_path_changes_end_reuse() {
+    for link in [false, true] {
+        for change in ["corrupt", "directory", "symlink", "cancel"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("source");
+            let next = temp.path().join("next");
+            let layer = source(&path, 1);
+            fs::create_dir(&next).unwrap();
+            let destination = BlobStore::open(&next).unwrap();
+            let source = owned(&path, limits());
+            let cancelled = AtomicBool::new(false);
+            let control = ManagedControl::for_test(&cancelled).unwrap();
+            let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+            let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+            let mut session = cache.publication_session(&control, limits());
+            session_read_count(&mut session, &source, &layer, limits(), 'a');
+            let payload = path.join("blobs/sha256").join(&layer.digest[7..]);
+            match change {
+                "corrupt" => fs::write(&payload, [99; 4096]).unwrap(),
+                "directory" => {
+                    fs::rename(path.join("blobs/sha256"), path.join("blobs/old")).unwrap();
+                    fs::create_dir(path.join("blobs/sha256")).unwrap();
+                }
+                "symlink" => {
+                    let saved = path.join("saved");
+                    fs::rename(&payload, &saved).unwrap();
+                    std::os::unix::fs::symlink(saved, &payload).unwrap();
+                }
+                "cancel" => cancelled.store(true, std::sync::atomic::Ordering::Relaxed),
+                _ => unreachable!(),
+            }
+            let result = if link {
+                session
+                    .try_link_inherited(&source, &destination, &layer, 4096)
+                    .map(|_| ())
+            } else {
+                session.load_checkpoint(&source, limits()).map(|_| ())
+            };
+            assert!(result.is_err(), "{change}, link={link}");
+            assert!(session.ended);
+            assert_eq!(session.evidence.files().count(), 0);
+            assert!(!next.join("blobs/sha256").join(&layer.digest[7..]).exists());
+        }
+    }
+}
+
+#[test]
+fn session_checkpoint_rechecks_all_metadata_and_descriptor_limits() {
+    for change in ["size", "layer_cap", "total_cap", "count", "metadata"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let layer = source_layers(&path, 1, &[42; 2048], 2);
+        let source = owned(&path, limits());
+        let cancelled = AtomicBool::new(false);
+        let control = ManagedControl::for_test(&cancelled).unwrap();
+        let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+        let mut session = cache.publication_session(&control, limits());
+        session_read_count(&mut session, &source, &layer, limits(), 'a');
+        let mut cap = limits();
+        match change {
+            "size" => {
+                let mut wrong = layer.clone();
+                wrong.size -= 1;
+                checkpoint_layers(&path, &[layer.clone(), wrong]);
+            }
+            "layer_cap" => cap.max_layer_bytes = 2047,
+            "total_cap" => cap.max_total_layer_bytes = 4095,
+            "count" => cap.max_descriptors = 3,
+            "metadata" => {
+                fs::write(path.join("index.json"), b"{}").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(session.load_checkpoint(&source, cap).is_err(), "{change}");
+        assert!(session.ended);
+    }
+}
+
+#[test]
+fn session_inheritance_declared_size_and_cap_cannot_use_evidence() {
+    for too_small_cap in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let next = temp.path().join("next");
+        let mut layer = source(&path, 1);
+        let source = owned(&path, limits());
+        fs::create_dir(&next).unwrap();
+        let destination = BlobStore::open(&next).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let control = ManagedControl::for_test(&cancelled).unwrap();
+        let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+        let mut session = cache.publication_session(&control, limits());
+        session_read_count(&mut session, &source, &layer, limits(), 'a');
+        if too_small_cap {
+            assert!(
+                session
+                    .try_link_inherited(&source, &destination, &layer, 4095)
+                    .is_err()
+            );
+            assert!(session.ended);
+        } else {
+            layer.size -= 1;
+            assert!(
+                !session
+                    .try_link_inherited(&source, &destination, &layer, 4096)
+                    .unwrap()
+            );
+            assert!(
+                BlobStore::open(&path)
+                    .unwrap()
+                    .open_verified(&layer, 4096, || false)
+                    .is_err()
+            );
+        }
+        assert!(!next.join("blobs/sha256").join(&layer.digest[7..]).exists());
+    }
+}
+
+#[test]
+fn session_checkpoint_repeated_descriptor_checks_precede_later_layers() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source");
+    let layer = source_layers(&path, 1, &[42; 2048], 2);
+    let store = BlobStore::open(&path).unwrap();
+    let later = blob(
+        &store,
+        "application/vnd.oci.image.layer.v1.tar",
+        &[13; 2048],
+    );
+    let source = owned(&path, limits());
+    let cancelled = AtomicBool::new(false);
+    let control = ManagedControl::for_test(&cancelled).unwrap();
+    let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+    let mut session = cache.publication_session(&control, limits());
+    session_read_count(&mut session, &source, &layer, limits(), 'a');
+    checkpoint_layers(&path, &[layer.clone(), layer.clone(), later.clone()]);
+    let fault = faults::arm(Boundary::Checkpoint, Timing::Before, &layer.digest, 1);
+    let (result, count, bytes) = super::super::hash_reads::observe(&later.digest, || {
+        session.load_checkpoint(&source, limits())
+    });
+    assert!(result.is_err());
+    assert!(
+        fault.fired(),
+        "must visit the second occurrence before the later layer"
+    );
+    assert_eq!((count, bytes), (0, 0));
+    assert!(session.ended);
+}
+
+#[test]
+fn session_checkpoint_replaced_inode_is_hashed_without_retention() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source");
+    let layer = source_layers(&path, 1, &[42; 2048], 2);
+    let source = owned(&path, limits());
+    let cancelled = AtomicBool::new(false);
+    let control = ManagedControl::for_test(&cancelled).unwrap();
+    let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+    let mut session = cache.publication_session(&control, limits());
+    session_read_count(&mut session, &source, &layer, limits(), 'a');
+    let payload = path.join("blobs/sha256").join(&layer.digest[7..]);
+    let original = identity(&fs::metadata(&payload).unwrap());
+    fs::remove_file(&payload).unwrap();
+    fs::write(&payload, [42; 2048]).unwrap();
+    assert_ne!(identity(&fs::metadata(&payload).unwrap()), original);
+    let retained = session.evidence.files().count();
+    for _ in 0..2 {
+        let (result, count, bytes) = super::super::hash_reads::observe(&layer.digest, || {
+            session.load_checkpoint(&source, limits())
+        });
+        result.unwrap();
+        assert_eq!((count, bytes), (2, 4096));
+        assert_eq!(session.evidence.files().count(), retained);
+    }
+    assert!(
+        !session
+            .try_link_inherited(&source, &BlobStore::open(&path).unwrap(), &layer, 4096)
+            .unwrap()
+    );
+}
+
+#[test]
+fn session_checkpoint_winner_and_metadata_budget_disable_reuse() {
+    for winner in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let layer = source(&path, 1);
+        let source = owned(&path, limits());
+        let cancelled = AtomicBool::new(false);
+        let control = ManagedControl::for_test(&cancelled).unwrap();
+        let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+        let mut budget = limits();
+        if !winner {
+            budget.max_total_metadata_bytes = 511;
+        }
+        let mut session = cache.publication_session(&control, budget);
+        session_read_count(&mut session, &source, &layer, limits(), 'a');
+        if winner {
+            session_read_count(&mut session, &source, &layer, limits(), 'a');
+        }
+        assert_eq!(session.evidence.files().count(), 0);
+        let (result, count, bytes) = super::super::hash_reads::observe(&layer.digest, || {
+            session.load_checkpoint(&source, limits())
+        });
+        result.unwrap();
+        assert_eq!((count, bytes), (1, 4096));
+        assert_eq!(session.evidence.files().count(), 0);
+        assert!(
+            !session
+                .try_link_inherited(&source, &BlobStore::open(&path).unwrap(), &layer, 4096)
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn session_checkpoint_fault_after_verification_invalidates() {
+    for link in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let next = temp.path().join("next");
+        let layer = source(&path, 1);
+        let source = owned(&path, limits());
+        fs::create_dir(&next).unwrap();
+        let destination = BlobStore::open(&next).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let control = ManagedControl::for_test(&cancelled).unwrap();
+        let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+        let mut session = cache.publication_session(&control, limits());
+        session_read_count(&mut session, &source, &layer, limits(), 'a');
+        let boundary = if link {
+            Boundary::Inherited
+        } else {
+            Boundary::Checkpoint
+        };
+        let fault = faults::arm(boundary, Timing::After, &layer.digest, 0);
+        let result = if link {
+            session
+                .try_link_inherited(&source, &destination, &layer, 4096)
+                .map(|_| ())
+        } else {
+            session.load_checkpoint(&source, limits()).map(|_| ())
+        };
+        assert!(result.is_err());
+        assert!(fault.fired());
+        assert!(session.ended);
+    }
+}
+
 fn owned(path: &Path, limits: image::Limits) -> OwnedCheckpoint {
     OwnedCheckpoint::verified_for_test(path, limits)
         .unwrap()
         .expect("test has FD headroom")
+}
+
+#[test]
+fn session_checkpoint_fd_fallback_keeps_full_verification() {
+    const CHILD: &str = "RPWELD_CHECKPOINT_FD_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "oci::cache_store::tests::session_checkpoint_fd_fallback_keeps_full_verification",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source");
+    let next = temp.path().join("next");
+    let layer = source_layers(&path, 1, &[42; 2048], 2);
+    let source = owned(&path, limits());
+    fs::create_dir(&next).unwrap();
+    let destination = BlobStore::open(&next).unwrap();
+    let cancelled = AtomicBool::new(false);
+    let control = ManagedControl::for_test(&cancelled).unwrap();
+    let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+    let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+    let mut session = cache.publication_session(&control, limits());
+    session_read_count(&mut session, &source, &layer, limits(), 'a');
+    let mut cap = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: valid output pointer, and only this subprocess changes its limit.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, cap.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: getrlimit initialized the value.
+    let mut cap = unsafe { cap.assume_init() };
+    cap.rlim_cur = 200;
+    // SAFETY: soft limit stays below the inherited hard ceiling.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &cap) }, 0);
+    assert!(
+        !session
+            .try_link_inherited(&source, &destination, &layer, 4096)
+            .unwrap()
+    );
+    assert!(!next.join("blobs/sha256").join(&layer.digest[7..]).exists());
+    let (result, count, bytes) = super::super::hash_reads::observe(&layer.digest, || {
+        session.load_checkpoint(&source, limits())
+    });
+    result.unwrap();
+    assert_eq!((count, bytes), (2, 4096));
+    assert_eq!(
+        session_read_count(&mut session, &source, &layer, limits(), 'b').0,
+        13
+    );
+    assert_eq!(session.evidence.files().count(), 0);
+}
+
+#[test]
+fn session_checkpoint_checks_actual_pinned_output_alias() {
+    const CHILD: &str = "RPWELD_CHECKPOINT_OUTPUT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "oci::cache_store::tests::session_checkpoint_checks_actual_pinned_output_alias",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    for link in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let next = temp.path().join("next");
+        let layer = source(&path, 1);
+        let source = owned(&path, limits());
+        fs::create_dir(&next).unwrap();
+        let destination = BlobStore::open(&next).unwrap();
+        let payload = path.join("blobs/sha256").join(&layer.digest[7..]);
+        let write = OpenOptions::new().append(true).open(&payload).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let admission_control = ManagedControl::for_test(&cancelled).unwrap();
+        // SAFETY: only this isolated child temporarily replaces its stderr.
+        let saved = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(saved >= 0);
+        // SAFETY: both descriptors are live.
+        assert_eq!(unsafe { libc::dup2(write.as_raw_fd(), 2) }, 2);
+        let output = crate::progress::Output::capture().unwrap();
+        // SAFETY: restore stderr before the test harness can report failures.
+        assert_eq!(unsafe { libc::dup2(saved, 2) }, 2);
+        // SAFETY: this test owns saved.
+        assert_eq!(unsafe { libc::close(saved) }, 0);
+        let scope = output.enter();
+        let alias_control = ManagedControl::for_test(&cancelled).unwrap();
+        drop(scope);
+        let lease = StoreLease::shared(temp.path(), &|| false).unwrap();
+        let cache = ManagedCache::open(temp.path(), &lease, &|| false).unwrap();
+        let mut session = cache.publication_session(&admission_control, limits());
+        session_read_count(&mut session, &source, &layer, limits(), 'a');
+        // Test the reuse boundary with the captured alias after admission.
+        session.control = &alias_control;
+        let error = if link {
+            session
+                .try_link_inherited(&source, &destination, &layer, 4096)
+                .map(|_| ())
+        } else {
+            session.load_checkpoint(&source, limits()).map(|_| ())
+        }
+        .unwrap_err();
+        assert!(error.to_string().contains("output disabled"));
+        assert!(error.to_string().contains("stopped operation:"));
+        assert!(session.ended);
+        output.diagnostic(format_args!("must not append to checkpoint"));
+        assert_eq!(fs::read(payload).unwrap(), vec![42; 4096]);
+        assert!(!next.join("blobs/sha256").join(&layer.digest[7..]).exists());
+    }
 }
 
 fn session_read_count(

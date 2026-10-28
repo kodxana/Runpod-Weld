@@ -1,9 +1,9 @@
 //! Ephemeral evidence for the closed managed publication path only.
-use super::{BlobStore, Descriptor, check_cancel, check_directories, verify_stream};
+use super::{BlobStore, Descriptor, Sha256Digest, check_cancel, check_directories, verify_stream};
 use crate::{build::Error, export::OwnedCheckpoint, image, managed_control::ManagedControl};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, File, Metadata},
     io::{self, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
     path::Path,
@@ -18,6 +18,10 @@ const FD_HEADROOM: usize = 272;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) enum Boundary {
+    #[cfg(test)]
+    Inherited,
+    #[cfg(test)]
+    Checkpoint,
     Source,
     IngestSource,
     #[cfg(test)]
@@ -42,11 +46,60 @@ struct Object {
     generation: u64,
 }
 
+impl Object {
+    fn validate(&self, control: &ManagedControl<'_>, actual: &Metadata) -> Result<()> {
+        let retained = self.file.metadata()?;
+        control.check_payload(&self.file)?;
+        if !retained.is_file()
+            || retained.dev() != actual.dev()
+            || retained.ino() != actual.ino()
+            || retained.len() != self.size
+            || (retained.mtime(), retained.mtime_nsec()) != self.modified
+        {
+            return Err("retained publication payload changed".into());
+        }
+        Ok(())
+    }
+}
+
+fn layer_payload(descriptor: &Descriptor) -> bool {
+    matches!(
+        descriptor.media_type.as_str(),
+        "application/vnd.oci.image.layer.v1.tar"
+            | "application/vnd.oci.image.layer.v1.tar+gzip"
+            | "application/vnd.oci.image.layer.v1.tar+zstd"
+    )
+}
+
+fn same_payload(actual: &Metadata, expected: &Metadata) -> bool {
+    actual.is_file()
+        && actual.dev() == expected.dev()
+        && actual.ino() == expected.ino()
+        && actual.len() == expected.len()
+        && (actual.mtime(), actual.mtime_nsec()) == (expected.mtime(), expected.mtime_nsec())
+}
+
+// Re-opened descriptors and fresh names must still denote the checked object.
+fn check_binding(
+    store: &BlobStore,
+    digest: &Sha256Digest,
+    file: &File,
+    expected: &Metadata,
+) -> Result<()> {
+    check_directories(&store.directory)?;
+    let named = fs::symlink_metadata(store.directory.join(digest.encoded()))?;
+    if !same_payload(&named, expected) || !same_payload(&file.metadata()?, expected) {
+        return Err("checkpoint payload binding changed".into());
+    }
+    Ok(())
+}
+
 type ObjectKey = (bool, String, u64, u64);
 
 pub(super) struct Evidence {
     objects: BTreeMap<ObjectKey, Object>,
     generation: u64,
+    committed_generation: u64,
     capacity: usize,
     #[cfg(test)]
     pub(super) reads: Vec<(Boundary, u64, u64, u64)>,
@@ -55,6 +108,112 @@ pub(super) struct Evidence {
 }
 
 impl Evidence {
+    // Loading and inheritance consume only source evidence from a successful
+    // publication, including its durability checks; they never admit objects.
+    fn reuses_source(
+        &self,
+        control: &ManagedControl<'_>,
+        descriptor: &Descriptor,
+        size: u64,
+        actual: &Metadata,
+    ) -> Result<bool> {
+        if self.capacity == 0 || !layer_payload(descriptor) || !fd_available() {
+            return Ok(false);
+        }
+        let key = (true, descriptor.digest.clone(), actual.dev(), actual.ino());
+        let Some(held) = self.objects.get(&key) else {
+            return Ok(false);
+        };
+        held.validate(control, actual)?;
+        Ok(held.generation <= self.committed_generation
+            && size == held.size
+            && actual.len() == size
+            && (actual.mtime(), actual.mtime_nsec()) == held.modified)
+    }
+
+    pub(super) fn try_link_inherited(
+        &self,
+        control: &ManagedControl<'_>,
+        source: &OwnedCheckpoint,
+        destination: &BlobStore,
+        descriptor: &Descriptor,
+        cap: u64,
+    ) -> Result<bool> {
+        check_cancel(&|| control.poll())?;
+        source.validate()?;
+        let (digest, size) = descriptor.expected(cap)?;
+        if self.capacity == 0 || self.objects.is_empty() || !fd_available() {
+            return Ok(false);
+        }
+        let store = BlobStore::open(source.path())?;
+        #[cfg(test)]
+        let _fault_scope = faults::enter(&store, descriptor, Boundary::Inherited);
+        #[cfg(test)]
+        faults::hit(faults::Timing::Before)?;
+        let (_, _, file) = store.open_blob(descriptor, cap, &|| control.poll())?;
+        control.check_payload(&file)?;
+        let actual = file.metadata()?;
+        if !self.reuses_source(control, descriptor, size, &actual)? {
+            return Ok(false);
+        }
+        file.sync_all()?;
+        check_cancel(&|| control.poll())?;
+        source.validate()?;
+        check_binding(&store, &digest, &file, &actual)?;
+        check_directories(&destination.directory)?;
+        let target = destination.directory.join(digest.encoded());
+        match fs::hard_link(store.directory.join(digest.encoded()), &target) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !same_payload(&fs::symlink_metadata(&target)?, &actual) {
+                    return Ok(false);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(test)]
+        faults::hit(faults::Timing::After)?;
+        check_binding(destination, &digest, &file, &actual)?;
+        check_binding(&store, &digest, &file, &actual)?;
+        source.validate()?;
+        control.check()?;
+        Ok(true)
+    }
+
+    pub(super) fn load_checkpoint(
+        &self,
+        control: &ManagedControl<'_>,
+        checkpoint: &OwnedCheckpoint,
+        limits: image::Limits,
+    ) -> Result<image::ImageMetadata> {
+        let cancelled = || control.poll();
+        check_cancel(&cancelled)?;
+        checkpoint.validate()?;
+        let store = BlobStore::open(checkpoint.path())?;
+        let metadata =
+            image::load_layout_metadata(checkpoint.path(), &store, None, limits, &cancelled)?;
+        for layer in &metadata.layers {
+            #[cfg(test)]
+            let _fault_scope = faults::enter(&store, layer, Boundary::Checkpoint);
+            #[cfg(test)]
+            faults::hit(faults::Timing::Before)?;
+            checkpoint.validate()?;
+            let (digest, size, mut file) =
+                store.open_blob(layer, limits.max_layer_bytes, &cancelled)?;
+            control.check_payload(&file)?;
+            let actual = file.metadata()?;
+            if !self.reuses_source(control, layer, size, &actual)? {
+                verify_stream(&mut file, None, &digest, size, &cancelled)?;
+            }
+            #[cfg(test)]
+            faults::hit(faults::Timing::After)?;
+            check_binding(&store, &digest, &file, &actual)?;
+        }
+        checkpoint.validate()?;
+        control.check()?;
+        Ok(metadata)
+    }
+
     #[cfg(test)]
     pub(super) fn files(&self) -> impl Iterator<Item = &File> {
         self.objects.values().map(|object| &object.file)
@@ -72,6 +231,7 @@ impl Evidence {
         Self {
             objects: BTreeMap::new(),
             generation: 0,
+            committed_generation: 0,
             capacity,
             #[cfg(test)]
             reads: Vec::new(),
@@ -83,6 +243,11 @@ impl Evidence {
     pub(super) fn clear(&mut self) {
         self.objects.clear();
         self.capacity = 0;
+        self.committed_generation = 0;
+    }
+
+    pub(super) fn commit(&mut self) {
+        self.committed_generation = self.generation;
     }
 
     pub(super) fn begin(&mut self) {
@@ -273,24 +438,10 @@ impl<'state, 'control> Verification<'state, 'control> {
             metadata.dev(),
             metadata.ino(),
         );
-        let payload = matches!(
-            descriptor.media_type.as_str(),
-            "application/vnd.oci.image.layer.v1.tar"
-                | "application/vnd.oci.image.layer.v1.tar+gzip"
-                | "application/vnd.oci.image.layer.v1.tar+zstd"
-        );
+        let payload = layer_payload(descriptor);
         let mut reuse = false;
         if payload && let Some(held) = managed.evidence.objects.get(&key) {
-            let retained = held.file.metadata()?;
-            managed.control.check_payload(&held.file)?;
-            if !retained.is_file()
-                || retained.dev() != metadata.dev()
-                || retained.ino() != metadata.ino()
-                || retained.len() != held.size
-                || (retained.mtime(), retained.mtime_nsec()) != held.modified
-            {
-                return Err("retained publication payload changed".into());
-            }
+            held.validate(managed.control, &metadata)?;
             reuse = held.generation < managed.evidence.generation
                 && size == held.size
                 && metadata.len() == size;
@@ -388,6 +539,65 @@ impl<'state, 'control> Verification<'state, 'control> {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn source_evidence_is_ineligible_until_publication_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(temp.path()).unwrap();
+        let descriptor = Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar".into(),
+            digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .into(),
+            size: 0,
+            annotations: Default::default(),
+            extensions: Default::default(),
+        };
+        store.ingest(&b""[..], &descriptor, 0, || false).unwrap();
+        let file = store.open_verified(&descriptor, 0, || false).unwrap();
+        let actual = file.metadata().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let control = ManagedControl::for_test(&cancelled).unwrap();
+        let mut evidence = Evidence::new(image::Limits {
+            max_metadata_bytes: 4096,
+            max_total_metadata_bytes: 8192,
+            max_descriptors: 4,
+            max_layer_bytes: 4096,
+            max_total_layer_bytes: 4096,
+        });
+        evidence.begin();
+        evidence
+            .retain(
+                (true, descriptor.digest.clone(), actual.dev(), actual.ino()),
+                &file,
+            )
+            .unwrap();
+        assert!(
+            !evidence
+                .reuses_source(&control, &descriptor, 0, &actual)
+                .unwrap()
+        );
+        evidence.commit();
+        assert!(
+            evidence
+                .reuses_source(&control, &descriptor, 0, &actual)
+                .unwrap()
+        );
+        evidence.begin();
+        assert_eq!(evidence.committed_generation, 1);
+        assert_eq!(evidence.generation, 2);
+        evidence.clear();
+        assert!(
+            !evidence
+                .reuses_source(&control, &descriptor, 0, &actual)
+                .unwrap()
+        );
     }
 }
 

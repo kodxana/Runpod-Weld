@@ -106,6 +106,48 @@ impl PublicationSession<'_, '_, '_> {
         self.ended = true;
     }
 
+    /// Reuse a successfully published private payload in a later private export.
+    /// `false` leaves both stores and evidence unchanged; the caller must fully
+    /// verify and link it. The closed exporter must bind `source` to its exact
+    /// baseline layout and supply a private export destination.
+    pub(crate) fn try_link_inherited(
+        &mut self,
+        source: &OwnedCheckpoint,
+        destination: &BlobStore,
+        descriptor: &Descriptor,
+        cap: u64,
+    ) -> Result<bool> {
+        if self.ended {
+            return Err("publication session has ended".into());
+        }
+        self.evidence
+            .try_link_inherited(self.control, source, destination, descriptor, cap)
+            .map_err(|error| self.fail(error))
+    }
+
+    /// Verify every descriptor of the actual exporter-issued checkpoint, reusing
+    /// only prior successful source evidence. This never admits new evidence.
+    pub(crate) fn load_checkpoint(
+        &mut self,
+        checkpoint: &OwnedCheckpoint,
+        limits: image::Limits,
+    ) -> Result<image::ImageMetadata> {
+        if self.ended {
+            return Err("publication session has ended".into());
+        }
+        self.evidence
+            .load_checkpoint(self.control, checkpoint, limits)
+            .map_err(|error| self.fail(error))
+    }
+
+    fn fail(&mut self, error: Error) -> Error {
+        self.invalidate();
+        if let Err(control_error) = self.control.check() {
+            return format!("{control_error}; stopped operation: {error}").into();
+        }
+        error
+    }
+
     pub(crate) fn publish_instruction(
         &mut self,
         source: &OwnedCheckpoint,
@@ -136,16 +178,11 @@ impl PublicationSession<'_, '_, '_> {
         );
         match result {
             Ok(path) => {
+                self.evidence.commit();
                 phase.finish();
                 Ok(path)
             }
-            Err(error) => {
-                self.invalidate();
-                if let Err(control_error) = self.control.check() {
-                    return Err(format!("{control_error}; stopped operation: {error}").into());
-                }
-                Err(error)
-            }
+            Err(error) => Err(self.fail(error)),
         }
     }
 }
