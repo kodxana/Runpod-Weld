@@ -353,6 +353,8 @@ pub(crate) fn copy_filtered_checked(
 ) -> Result<Summary, Error> {
     #[cfg(target_os = "linux")]
     {
+        // Share execution code with the managed path without changing its callback.
+        let stop: &dyn Fn() -> bool = &cancelled;
         linux::copy(
             context_root,
             image_root,
@@ -363,7 +365,7 @@ pub(crate) fn copy_filtered_checked(
             options,
             admission,
             None,
-            &cancelled,
+            &stop,
         )
     }
     #[cfg(not(target_os = "linux"))]
