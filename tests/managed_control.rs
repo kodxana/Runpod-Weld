@@ -1,5 +1,28 @@
 #![cfg(target_os = "linux")]
 
+fn inherit_high_payload_fd(payload_fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: called only in the forked child's pre_exec hook; these operations
+    // are async-signal-safe and affect no parent limits or descriptors.
+    unsafe {
+        let mut limit = std::mem::MaybeUninit::uninit();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut limit = limit.assume_init();
+        // A runner may start with soft NOFILE=1024, which excludes fd 1024.
+        // Raise only the child's soft limit within its existing hard ceiling.
+        limit.rlim_cur = limit.rlim_cur.max(1025);
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 || libc::dup2(payload_fd, 1024) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        limit.rlim_cur = 128;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn pre_admission_stdio_corruption_is_fully_rejected_without_publication() {
     use std::{fs, process::Command};
@@ -90,16 +113,8 @@ fn actual_guard_closes_payload_above_lowered_soft_limit_and_workload_closes_leas
     ));
     unsafe {
         cmd.pre_exec(move || {
-            if libc::dup2(payload_fd, 1024) < 0 || libc::fcntl(lease_fd, libc::F_SETFD, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut limit = std::mem::MaybeUninit::uninit();
-            if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut limit = limit.assume_init();
-            limit.rlim_cur = 128;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+            inherit_high_payload_fd(payload_fd)?;
+            if libc::fcntl(lease_fd, libc::F_SETFD, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -117,7 +132,7 @@ fn actual_guard_closes_payload_above_lowered_soft_limit_and_workload_closes_leas
 #[ignore = "requires root, cc -static and child ptrace"]
 fn actual_managed_build_worker_chain_closes_inherited_payload_handles() {
     use std::{
-        fs, io,
+        fs,
         os::{
             fd::AsRawFd,
             unix::{fs::MetadataExt, process::CommandExt},
@@ -191,19 +206,7 @@ int main(void) {{
         cmd.pre_exec(move || {
             // Non-CLOEXEC deliberately tests guard closure, including descriptors
             // above soft NOFILE. Production session handles are also CLOEXEC.
-            if libc::dup2(fd, 1024) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut limit = std::mem::MaybeUninit::uninit();
-            if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut limit = limit.assume_init();
-            limit.rlim_cur = 128;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
+            inherit_high_payload_fd(fd)
         });
     }
     let result = cmd.output().unwrap();
