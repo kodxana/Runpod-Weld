@@ -1,6 +1,6 @@
 # Compatibility fixtures
 
-These are test inputs, not supported `rpweld build` features. All assertions live
+These are inputs for the reference comparison corpus. All assertions live
 in `expectations.json`. Basic, multistage, numeric non-root, and deletion/config
 fixtures use a caller-supplied digest-pinned Alpine base. Their `RUN` steps have
 network disabled. Base pulls still require registry access or a local registry.
@@ -21,9 +21,9 @@ python tests/compatibility.py --mode compare
 ```
 
 The first command runs stdlib unit tests. The second emits JSON and exits **2**
-because the candidate has no build command. It invokes neither Docker nor the
-candidate. There is intentionally no speculative candidate command adapter.
-Add one only when the engine's actual build/output contract is implemented.
+because this corpus has no Weld command adapter. Weld's build command and its
+separate integration tests exist. Compare mode invokes neither Docker nor Weld;
+adding the adapter and proving equivalent output remains a compatibility gate.
 
 ## Explicit reference run on a Docker-capable Linux worker
 

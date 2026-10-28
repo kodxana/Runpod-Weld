@@ -3,6 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
+#[cfg(test)]
+thread_local! {
+    static INVENTORY_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 // fdopendir owns this O_NOATIME descriptor; one name is allocated at a time.
 pub(super) struct Names(*mut libc::DIR);
 impl Drop for Names {
@@ -62,6 +67,23 @@ pub(super) struct Node {
 }
 pub(super) struct Inventory {
     pub(super) entries: BTreeMap<PathBuf, Node>,
+    root: Option<File>,
+}
+
+pub(crate) fn validate_copy_root(base: &Baseline, current: &Metadata) -> io::Result<()> {
+    let pin = base.state.inventory.root.as_ref()
+        .ok_or_else(|| io::Error::other("COPY baseline root is not pinned"))?;
+    let held = pin.metadata()?;
+    let saved = &base.state.inventory.entries.get(Path::new(""))
+        .ok_or_else(|| io::Error::other("COPY baseline root missing"))?.metadata;
+    if !current.is_dir() || identity(current) != identity(&held) || identity(current) != identity(saved) {
+        return Err(io::Error::other("COPY checkpoint root changed"));
+    }
+    Ok(())
+}
+
+pub(crate) fn has_copy_root(base: &Baseline) -> bool {
+    base.state.inventory.root.is_some()
 }
 
 pub(super) fn exported_receipt(
@@ -185,11 +207,30 @@ fn inventory(
     targets: Option<Targets<'_>>,
     c: &impl Fn() -> bool,
 ) -> Result<Inventory, Error> {
+    inventory_after_copy(root, limits, remaining, targets, None, c)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inventory_after_copy(
+    root: &Path,
+    limits: Limits,
+    remaining: &mut u64,
+    targets: Option<Targets<'_>>,
+    copy: Option<(&Baseline, &crate::context::CopyWrites<'_>, &crate::managed_control::ManagedControl<'_>)>,
+    c: &impl Fn() -> bool,
+) -> Result<Inventory, Error> {
     canonical_dir(root)?;
     if root == Path::new("/") {
         return Err(Error::Invalid("host root refused"));
     }
     let mount = mount_id(root)?;
+    // Optional evidence consumes one FD only with the normal worker allowance
+    // still free. A failed pin leaves the conservative inventory available.
+    let pin = crate::export::owned::pin_budget_available().then(|| {
+        OpenOptions::new().read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root).ok()
+    }).flatten();
     let mut entries = BTreeMap::new();
     #[allow(clippy::too_many_arguments)]
     fn visit(
@@ -268,6 +309,14 @@ fn inventory(
         &mut entries,
         c,
     )?;
+    if let Some((before, writes, _)) = copy {
+        let current = &entries.get(Path::new("")).ok_or(Error::Invalid("inventory root missing"))?.metadata;
+        let previous = &before.state.inventory.entries.get(Path::new("")).ok_or(Error::Invalid("baseline root missing"))?.metadata;
+        writes.validate_root(before, current)?;
+        if identity(current) != identity(previous) {
+            return Err(Error::Invalid("COPY baseline root changed"));
+        }
+    }
     // All aliases' metadata is captured before any readlink can touch atime.
     type LinkGroup<'a> = (&'a Path, u64, u64, Option<[u8; 32]>, Option<&'a Path>);
     let mut groups: HashMap<(u64, u64), LinkGroup<'_>> = HashMap::new();
@@ -309,13 +358,29 @@ fn inventory(
             if identity(&opened) != identity(m) || !opened.is_file() || opened.len() != m.len() {
                 return Err(Error::Invalid("source changed"));
             }
+            let retained_hash = if let Some((before, writes, control)) = copy {
+                control.check_payload(&file).map_err(io::Error::other)?;
+                before.state.inventory.entries.get(path).filter(|old| {
+                    let saved = &old.metadata;
+                    // The write record and closed engine establish the no-write
+                    // interval. These stamps only reject unexpected changes.
+                    saved.is_file() && identity(saved) == identity(m)
+                        && saved.len() == m.len() && !writes.contains(m)
+                        && (saved.mtime(), saved.mtime_nsec(), saved.ctime(), saved.ctime_nsec())
+                            == (m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec())
+                }).and_then(|old| old.hash)
+            } else {
+                None
+            };
             let mut hash = Sha256::new();
-            let mut left = m.len();
+            let mut left = if retained_hash.is_some() { 0 } else { m.len() };
             let mut buffer = [0u8; 65536];
             while left != 0 {
                 check(c)?;
                 let n = left.min(buffer.len() as u64) as usize;
                 file.read_exact(&mut buffer[..n])?;
+                #[cfg(test)]
+                INVENTORY_READ_BYTES.with(|bytes| bytes.set(bytes.get() + n as u64));
                 hash.update(&buffer[..n]);
                 left -= n as u64;
             }
@@ -328,7 +393,7 @@ fn inventory(
             {
                 return Err(Error::Invalid("source changed"));
             }
-            node.hash = Some(hash.finalize().into());
+            node.hash = Some(retained_hash.unwrap_or_else(|| hash.finalize().into()));
         } else {
             node.target = Some(if let Some(targets) = &targets {
                 let target = match targets {
@@ -366,7 +431,13 @@ fn inventory(
         return Err(Error::Invalid("hardlinks outside source tree"));
     }
     drop(groups);
-    Ok(Inventory { entries })
+    if let Some(pin) = &pin {
+        let observed = &entries.get(Path::new("")).ok_or(Error::Invalid("inventory root missing"))?.metadata;
+        if identity(&pin.metadata()?) != identity(observed) {
+            return Err(Error::Invalid("inventory root changed"));
+        }
+    }
+    Ok(Inventory { entries, root: pin })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -733,9 +804,11 @@ pub(super) fn plan(
     base: &Baseline,
     limits: Limits,
     remaining: &mut u64,
+    copy: Option<(&crate::context::CopyWrites<'_>, &crate::managed_control::ManagedControl<'_>)>,
     c: &impl Fn() -> bool,
 ) -> Result<Plan, Error> {
-    let inventory = inventory(root, limits, remaining, None, c)?;
+    let inventory = inventory_after_copy(root, limits, remaining, None,
+        copy.map(|(writes, control)| (base, writes, control)), c)?;
     let mut changed = BTreeSet::new();
     let mut groups = BTreeSet::new();
     for (path, node) in &inventory.entries {
@@ -826,7 +899,7 @@ pub(super) fn inherit(
     remaining: &mut u64,
     c: &impl Fn() -> bool,
 ) -> Result<Vec<Descriptor>, Error> {
-    inherit_with_sharing(base, store, delta, diff_id, output, remaining, false, c)
+    inherit_with_sharing(base, store, delta, diff_id, output, remaining, false, None, c)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -838,6 +911,7 @@ pub(super) fn inherit_with_sharing(
     output: &mut Value,
     remaining: &mut u64,
     share_owned: bool,
+    mut managed: Option<&mut ManagedCheckpoint<'_, '_, '_, '_>>,
     c: &impl Fn() -> bool,
 ) -> Result<Vec<Descriptor>, Error> {
     let state = &base.state;
@@ -850,6 +924,17 @@ pub(super) fn inherit_with_sharing(
         let source = BlobStore::open(layout)?;
         for descriptor in &state.layers {
             check(c)?;
+            if share_owned && state.shareable
+                && let Some((session, checkpoint)) = managed.as_mut().and_then(|m| m.inherited.as_mut())
+            {
+                if checkpoint.path() != layout {
+                    return Err(Error::Invalid("checkpoint inheritance owner differs from baseline"));
+                }
+                if session.try_link_inherited(checkpoint, store, descriptor, state.blob_limit)
+                    .map_err(io::Error::other)? {
+                    continue;
+                }
+            }
             // Public outputs and cache inputs are never adopted as owned inodes.
             let file = source.open_verified(descriptor, state.blob_limit, c)?;
             // Repeated descriptors retain their order but need only one payload.
@@ -1031,6 +1116,137 @@ mod tests {
         for (path, node) in &a.entries {
             assert!(equal(node, &b.entries[path]), "different entry: {path:?}");
         }
+    }
+
+    fn copy_baseline(root: &Path) -> Baseline {
+        Baseline { state: State {
+            inventory: snapshot(root), layout: None, layers: Vec::new(), diff_ids: Vec::new(),
+            history: None, blob_limit: LIMITS.max_layer_bytes, shareable: false,
+        } }
+    }
+
+    #[test]
+    fn managed_copy_reuses_only_unwritten_payloads_with_full_metadata_accounting() {
+        use std::sync::atomic::AtomicBool;
+        for case in ["file", "hardlink", "directory", "raw", "overwrites"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let source = temp.path().join("source");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(root.join("dir")).unwrap();
+            fs::write(root.join("unchanged"), vec![7; 128 * 1024]).unwrap();
+            fs::write(root.join("dir/item"), b"old!").unwrap();
+            fs::hard_link(root.join("dir/item"), root.join("alias")).unwrap();
+            symlink("dir", root.join("via")).unwrap();
+            symlink("unchanged", root.join("link")).unwrap();
+            attr(&root.join("unchanged"), c"user.proof", &[0, 255, 42]);
+            fs::write(source.join("one"), b"new!").unwrap();
+            fs::write(source.join("two"), b"last").unwrap();
+            fs::create_dir(source.join("tree")).unwrap();
+            fs::write(source.join("tree").join(OsString::from_vec(b"raw-\xff".to_vec())), b"bytes").unwrap();
+            symlink("../unchanged", source.join("tree/link")).unwrap();
+            for path in ["", "dir", "unchanged", "dir/item", "alias", "via", "link"] {
+                times(&root.join(path), true);
+            }
+            let baseline = copy_baseline(&root);
+            assert!(baseline.has_copy_root());
+            let cancelled = AtomicBool::new(false);
+            let control = crate::managed_control::ManagedControl::for_test(&cancelled).unwrap();
+            let (sources, destination): (&[&str], &str) = match case {
+                "file" => (&["one"], "/via/fresh"),
+                "hardlink" => (&["one"], "/via/item"),
+                "directory" => (&["tree"], "/new/parents/"),
+                "raw" => (&["tree"], "/via/"),
+                "overwrites" => (&["*o*"], "/via/item"),
+                _ => unreachable!(),
+            };
+            let (_, writes) = crate::context::copy_managed(
+                &source, &root, sources, destination,
+                crate::context::Limits { max_bytes: LIMITS.max_layer_bytes, max_entries: LIMITS.max_entries, max_metadata_bytes: LIMITS.max_metadata_bytes },
+                None, Default::default(), &baseline, None, &control,
+            ).unwrap();
+            let writes = writes.unwrap();
+            let mut full_budget = LIMITS.max_metadata_bytes;
+            INVENTORY_READ_BYTES.set(0);
+            let full = plan(&root, &baseline, LIMITS, &mut full_budget, None, &|| false).unwrap();
+            let full_bytes = INVENTORY_READ_BYTES.get();
+            restore_observed_links(&root, &full.inventory, &|| false).unwrap();
+            let mut reused_budget = LIMITS.max_metadata_bytes;
+            INVENTORY_READ_BYTES.set(0);
+            let reused = plan(&root, &baseline, LIMITS, &mut reused_budget, Some((&writes, &control)), &|| control.poll()).unwrap();
+            let reused_bytes = INVENTORY_READ_BYTES.get();
+            equivalent(&full.inventory, &reused.inventory);
+            assert_eq!(full.changed, reused.changed, "{case}");
+            assert_eq!(full.whiteouts, reused.whiteouts, "{case}");
+            assert_eq!(full_budget, reused_budget, "logical charges changed: {case}");
+            assert!(reused_bytes > 0, "new COPY payload must be read: {case}");
+            assert!(full_bytes - reused_bytes >= 128 * 1024, "unchanged payload was reread: {case}");
+        }
+    }
+
+    #[test]
+    fn managed_copy_rejects_stale_baseline_and_root() {
+        use std::sync::atomic::AtomicBool;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let source = temp.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(root.join("old"), b"old").unwrap();
+        fs::write(source.join("new"), b"new").unwrap();
+        let baseline = copy_baseline(&root);
+        let other = copy_baseline(&root);
+        let cancelled = AtomicBool::new(false);
+        let control = crate::managed_control::ManagedControl::for_test(&cancelled).unwrap();
+        let limits = crate::context::Limits { max_bytes: LIMITS.max_layer_bytes, max_entries: LIMITS.max_entries, max_metadata_bytes: LIMITS.max_metadata_bytes };
+        let (_, writes) = crate::context::copy_managed(&source, &root, &["new"], "/new", limits, None, Default::default(), &baseline, None, &control).unwrap();
+        let writes = writes.unwrap();
+        assert!(plan(&root, &other, LIMITS, &mut LIMITS.max_metadata_bytes.clone(), Some((&writes, &control)), &|| false).is_err());
+        fs::rename(&root, temp.path().join("saved")).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert!(plan(&root, &baseline, LIMITS, &mut LIMITS.max_metadata_bytes.clone(), Some((&writes, &control)), &|| false).is_err());
+        assert!(crate::context::copy_managed(&source, &root, &["new"], "/new", limits, None, Default::default(), &baseline, None, &control).is_err());
+        assert!(!root.join("new").exists());
+    }
+
+    #[test]
+    fn managed_copy_without_root_pin_falls_back_and_cancellation_has_no_evidence() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let source = temp.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(root.join("old"), vec![42; 65536]).unwrap();
+        fs::write(source.join("new"), b"new").unwrap();
+        let mut baseline = copy_baseline(&root);
+        // Optional descriptor exhaustion must not change COPY acceptance.
+        baseline.state.inventory.root = None;
+        let cancelled = AtomicBool::new(false);
+        let control = crate::managed_control::ManagedControl::for_test(&cancelled).unwrap();
+        let limits = crate::context::Limits {
+            max_bytes: LIMITS.max_layer_bytes,
+            max_entries: LIMITS.max_entries,
+            max_metadata_bytes: LIMITS.max_metadata_bytes,
+        };
+        let (summary, writes) = crate::context::copy_managed(
+            &source, &root, &["new"], "/new", limits, None, Default::default(),
+            &baseline, None, &control,
+        ).unwrap();
+        assert_eq!(summary.bytes_written, 3);
+        assert!(writes.is_none());
+        INVENTORY_READ_BYTES.set(0);
+        let mut remaining = LIMITS.max_metadata_bytes;
+        plan(&root, &baseline, LIMITS, &mut remaining, None, &|| false).unwrap();
+        assert_eq!(INVENTORY_READ_BYTES.get(), 65539);
+        cancelled.store(true, Ordering::Relaxed);
+        let error = crate::context::copy_managed(
+            &source, &root, &["new"], "/cancelled", limits, None, Default::default(),
+            &baseline, None, &control,
+        ).err().expect("cancelled COPY cannot return a proof");
+        assert!(matches!(error, crate::context::Error::Cancelled));
+        assert!(!root.join("cancelled").exists());
     }
     fn delta_entries(layout: &Path, work: &Path) -> crate::layer::VerifiedLayer {
         let image = load(layout);

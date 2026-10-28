@@ -80,6 +80,16 @@ pub(crate) enum CaptureAllocation<'a> {
 }
 
 impl Baseline {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_copy_root(&self) -> bool {
+        linux::delta::has_copy_root(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_copy_root(&self, root: &std::fs::Metadata) -> io::Result<()> {
+        linux::delta::validate_copy_root(self, root)
+    }
+
     /// Retain symlink evidence for a private checkpoint whose root was not replayed.
     pub(crate) fn receipt(
         &self,
@@ -293,6 +303,7 @@ pub(crate) fn export_delta_layout_created(
             Some(baseline),
             None,
             linux::SourceState::Observed,
+            None,
         )
         .map(|result| result.manifest)
     }
@@ -415,8 +426,12 @@ mod tests {
                 LIMITS,
                 encoding,
                 None,
-                &control,
-                || false,
+                ManagedCheckpoint {
+                    control: &control,
+                    phase: &crate::progress::Phase::start(false, "test checkpoint"),
+                    writes: None,
+                    inherited: None,
+                },
             )
             .unwrap();
             assert_eq!(legacy.manifest, managed.manifest);
@@ -1243,6 +1258,7 @@ pub(crate) fn export_layout_created(
             None,
             None,
             linux::SourceState::Observed,
+            None,
         )
         .map(|result| result.manifest)
     }
@@ -1280,6 +1296,7 @@ pub(crate) fn export_created_with_resources(
             baseline,
             resources,
             linux::SourceState::Archived(receipt),
+            None,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -1317,6 +1334,7 @@ pub(crate) fn export_checkpoint(
     {
         // Share the large exporter across engine and test callback types.
         let stop: &dyn Fn() -> bool = &cancelled;
+        let created: fn() -> io::Result<()> = || Ok(());
         let mut next = None;
         let manifest = linux::export(
             root,
@@ -1325,10 +1343,11 @@ pub(crate) fn export_checkpoint(
             limits,
             encoding,
             &stop,
-            || Ok(()),
+            created,
             Some(baseline),
             resources,
             linux::SourceState::Checkpoint(&mut next),
+            None,
         )?;
         Ok((
             manifest,
@@ -1351,6 +1370,18 @@ pub(crate) fn export_checkpoint(
     }
 }
 
+/// Closed effects and optional evidence for one managed instruction checkpoint.
+#[cfg(target_os = "linux")]
+pub(crate) struct ManagedCheckpoint<'a, 'cache, 'lease, 'control> {
+    pub(crate) control: &'a crate::managed_control::ManagedControl<'control>,
+    pub(crate) phase: &'a crate::progress::Phase,
+    pub(crate) writes: Option<crate::context::CopyWrites<'a>>,
+    pub(crate) inherited: Option<(
+        &'a mut crate::oci::PublicationSession<'cache, 'lease, 'control>,
+        &'a OwnedCheckpoint,
+    )>,
+}
+
 /// Only the closed managed engine may carry exporter provenance into a session.
 /// This is not content evidence: publication still verifies every new physical copy.
 #[cfg(target_os = "linux")]
@@ -1363,24 +1394,37 @@ pub(crate) fn export_managed_checkpoint(
     limits: Limits,
     encoding: Encoding,
     resources: Option<&crate::build_resources::Policy>,
-    control: &crate::managed_control::ManagedControl<'_>,
-    cancelled: impl Fn() -> bool,
+    managed: ManagedCheckpoint<'_, '_, '_, '_>,
 ) -> Result<(Exported, Baseline), Error> {
+    let control = managed.control;
+    let phase = managed.phase;
     control.check_output().map_err(io::Error::other)?;
-    let (mut exported, next) = export_checkpoint(
+    let stop: &dyn Fn() -> bool = &|| {
+        phase.tick();
+        control.poll()
+    };
+    let mut next = None;
+    let created: fn() -> io::Result<()> = || Ok(());
+    let mut exported = linux::export(
         root,
         destination,
         config,
-        baseline,
         limits,
         encoding,
+        &stop,
+        created,
+        Some(baseline),
         resources,
-        cancelled,
+        linux::SourceState::Checkpoint(&mut next),
+        Some(managed),
     )?;
     // All spool, ingest and index writers have been consumed and closed on return.
     control.check_output().map_err(io::Error::other)?;
     exported.owned_checkpoint = OwnedCheckpoint::finished(destination)?;
-    Ok((exported, next))
+    Ok((
+        exported,
+        next.ok_or(Error::Invalid("checkpoint baseline missing"))?,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1989,6 +2033,7 @@ mod linux {
         baseline: Option<&Baseline>,
         resources: Option<&crate::build_resources::Policy>,
         source_state: SourceState<'_>,
+        mut managed: Option<ManagedCheckpoint<'_, '_, '_, '_>>,
     ) -> Result<Exported, Error> {
         check(c)?;
         // Our writer emits at most PAX + GNU long path + GNU long link + entry
@@ -2051,7 +2096,18 @@ mod linux {
         let mut output: Value = serde_json::from_slice(&input)?;
         drop(input);
         let plan = baseline
-            .map(|base| delta::plan(root, base, limits, &mut remaining, c))
+            .map(|base| {
+                delta::plan(
+                    root,
+                    base,
+                    limits,
+                    &mut remaining,
+                    managed
+                        .as_ref()
+                        .and_then(|m| m.writes.as_ref().map(|w| (w, m.control))),
+                    c,
+                )
+            })
             .transpose()?;
         let mut preflight = Preflight {
             forbidden: parent
@@ -2204,6 +2260,7 @@ mod linux {
                     &mut output,
                     &mut remaining,
                     true,
+                    managed.as_mut(),
                     c,
                 )?
             } else {

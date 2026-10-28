@@ -20,7 +20,7 @@ pub(crate) struct OwnedCheckpoint {
 const FD_HEADROOM: u64 = 272;
 const DIRECTORY_PINS: u64 = 3;
 
-fn pin_budget_available() -> bool {
+pub(in crate::export) fn pin_budget_available() -> bool {
     let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     // SAFETY: getrlimit initializes the pointed-to rlimit on success.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } != 0 {

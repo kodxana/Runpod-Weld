@@ -1530,9 +1530,13 @@ fn verify_fresh_checkpoint(
     resources: Option<&crate::build_resources::Policy>,
     measurements: &mut LayerMeasurements,
     apply_to: Option<&Path>,
+    managed_metadata: Option<image::ImageMetadata>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<(image::ImageMetadata, (u64, usize))> {
-    let metadata = image::load_layout(layout, None, limits.image, cancelled)?;
+    let metadata = match managed_metadata {
+        Some(metadata) => metadata,
+        None => image::load_layout(layout, None, limits.image, cancelled)?,
+    };
     let base_layers = base.map_or(&[][..], |m| m.layers.as_slice());
     let base_ids = base.map_or(&[][..], |m| m.diff_ids.as_slice());
     if metadata.config["config"] != *config
@@ -2905,6 +2909,8 @@ fn build_stage(
             None
         };
     let mut last_checkpoint: Option<(PathBuf, Descriptor, Value)> = None;
+    #[cfg(target_os = "linux")]
+    let mut checkpoint_owner: Option<export::OwnedCheckpoint> = None;
     let mut instruction_hits = 0usize;
     let mut instruction_misses = 0usize;
     let mut new_layer_bytes = 0u64;
@@ -3056,6 +3062,10 @@ fn build_stage(
                 copy_targets.push(summary.targets);
             }
             let manifest = if baseline.is_some() {
+                #[cfg(target_os = "linux")]
+                {
+                    checkpoint_owner = None;
+                }
                 let (checkpoint, usage) = verify_fresh_checkpoint(
                     entry,
                     &boundary.config,
@@ -3066,6 +3076,7 @@ fn build_stage(
                     resources,
                     measurements,
                     Some(&root),
+                    None,
                     &cancelled,
                 )?;
                 let manifest = checkpoint.selected.clone();
@@ -3128,6 +3139,8 @@ fn build_stage(
             }
         }
         let receipt_start = copy_targets.len();
+        #[cfg(target_os = "linux")]
+        let mut copy_writes = None;
         let run_label = format!("stage {} instruction {} RUN", index + 1, boundary.ordinal);
         for (index, step) in steps.iter().enumerate().take(boundary.end).skip(start) {
             check(&cancelled)?;
@@ -3169,24 +3182,62 @@ fn build_stage(
                         )
                         .map_err(|e| context::Error::Io(io::Error::other(e)))
                     };
-                    let summary = context::copy_filtered_checked(
-                        stage_root.as_deref().unwrap_or(&options.context),
-                        &root,
-                        &sources.iter().map(String::as_str).collect::<Vec<_>>(),
-                        destination,
-                        copy_limits(options.limits, &copied),
-                        if from.is_some() || inline.is_some() {
-                            None
-                        } else {
-                            Some(policy)
-                        },
-                        context::CopyOptions {
-                            chown: chown.as_deref(),
-                            chmod: *chmod,
-                        },
-                        resources.map(|_| &admission as &dyn Fn(u64, u64) -> _),
-                        &cancelled,
-                    )?;
+                    let sources = sources.iter().map(String::as_str).collect::<Vec<_>>();
+                    let source = stage_root.as_deref().unwrap_or(&options.context);
+                    let selected_policy = if from.is_some() || inline.is_some() {
+                        None
+                    } else {
+                        Some(policy)
+                    };
+                    let copy_options = context::CopyOptions {
+                        chown: chown.as_deref(),
+                        chmod: *chmod,
+                    };
+                    #[cfg(target_os = "linux")]
+                    let managed_copy = control
+                        .zip(baseline.as_ref())
+                        .filter(|_| instruction_steps.len() == 1 && publication_session.is_some());
+                    #[cfg(not(target_os = "linux"))]
+                    let managed_copy: Option<(
+                        &ManagedControl<'_>,
+                        &export::Baseline,
+                    )> = None;
+                    let summary = if let Some((control, base)) = managed_copy {
+                        #[cfg(target_os = "linux")]
+                        {
+                            let (summary, writes) = context::copy_managed(
+                                source,
+                                &root,
+                                &sources,
+                                destination,
+                                copy_limits(options.limits, &copied),
+                                selected_policy,
+                                copy_options,
+                                base,
+                                resources,
+                                control,
+                            )?;
+                            copy_writes = writes;
+                            summary
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            let _ = (control, base);
+                            unreachable!("managed COPY is Linux-only");
+                        }
+                    } else {
+                        context::copy_filtered_checked(
+                            source,
+                            &root,
+                            &sources,
+                            destination,
+                            copy_limits(options.limits, &copied),
+                            selected_policy,
+                            copy_options,
+                            resources.map(|_| &admission as &dyn Fn(u64, u64) -> _),
+                            &cancelled,
+                        )?
+                    };
                     copied.bytes_written += summary.bytes_written;
                     copied.entries += summary.entries;
                     copied.metadata_bytes += summary.metadata_bytes;
@@ -3246,31 +3297,36 @@ fn build_stage(
                     cancelled()
                 };
                 #[cfg(target_os = "linux")]
-                let (mut manifest, next) =
-                    if let Some(control) = control.filter(|_| publication_session.is_some()) {
-                        export::export_managed_checkpoint(
-                            &root,
-                            &snapshot,
-                            &checkpoint_config,
-                            base,
-                            options.limits.export,
-                            encoding,
-                            resources,
+                let (mut manifest, next) = if let Some(control) =
+                    control.filter(|_| publication_session.is_some())
+                {
+                    export::export_managed_checkpoint(
+                        &root,
+                        &snapshot,
+                        &checkpoint_config,
+                        base,
+                        options.limits.export,
+                        encoding,
+                        resources,
+                        export::ManagedCheckpoint {
                             control,
-                            exporting,
-                        )?
-                    } else {
-                        export::export_checkpoint(
-                            &root,
-                            &snapshot,
-                            &checkpoint_config,
-                            base,
-                            options.limits.export,
-                            encoding,
-                            resources,
-                            exporting,
-                        )?
-                    };
+                            phase: &phase,
+                            writes: copy_writes.take(),
+                            inherited: publication_session.as_mut().zip(checkpoint_owner.as_ref()),
+                        },
+                    )?
+                } else {
+                    export::export_checkpoint(
+                        &root,
+                        &snapshot,
+                        &checkpoint_config,
+                        base,
+                        options.limits.export,
+                        encoding,
+                        resources,
+                        exporting,
+                    )?
+                };
                 #[cfg(not(target_os = "linux"))]
                 let (manifest, next) = export::export_checkpoint(
                     &root,
@@ -3310,6 +3366,8 @@ fn build_stage(
                     || Ok(()),
                 )?
             };
+            #[cfg(target_os = "linux")]
+            drop(copy_writes);
             phase.finish();
             // Layered engine export repairs only its own readlink observations;
             // the live root already has the archived filesystem state.
@@ -3326,6 +3384,16 @@ fn build_stage(
                 cancelled()
             };
             let manifest = if baseline.is_some() {
+                #[cfg(target_os = "linux")]
+                let managed_metadata = publication_session
+                    .as_mut()
+                    .zip(owned_checkpoint.as_ref())
+                    .map(|(session, checkpoint)| {
+                        session.load_checkpoint(checkpoint, options.limits.image)
+                    })
+                    .transpose()?;
+                #[cfg(not(target_os = "linux"))]
+                let managed_metadata = None;
                 let (checkpoint, usage) = verify_fresh_checkpoint(
                     &snapshot,
                     &boundary.config,
@@ -3336,6 +3404,7 @@ fn build_stage(
                     resources,
                     measurements,
                     None,
+                    managed_metadata,
                     &verifying,
                 )?;
                 let manifest = checkpoint.selected.clone();
@@ -3422,6 +3491,10 @@ fn build_stage(
                     )?;
                     publication.finish();
                 }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                checkpoint_owner = owned_checkpoint;
             }
             // Even an unkeyable COPY must replace the prior filesystem identity.
             prior_identity = Some(manifest.digest.to_string());
@@ -3599,6 +3672,7 @@ fn build_stage(
                 options.limits,
                 resources,
                 measurements,
+                None,
                 None,
                 &verification_cancelled,
             )?;
@@ -4534,6 +4608,7 @@ mod tests {
             Some(&policy),
             &mut measurements,
             None,
+            None,
             &|| false,
         )
         .err()
@@ -4553,6 +4628,7 @@ mod tests {
             o.limits,
             Some(&policy),
             &mut measurements,
+            None,
             None,
             &|| false,
         )

@@ -4,6 +4,10 @@
 
 **Linux amd64 release:** multi-stage builds from registry images, local OCI images or scratch are available. Authenticated pulls/pushes use the bundled Skopeo backend. Named stages, COPY --from, target selection and local completed-stage caching are supported. This remains an early release, not complete Docker compatibility. A container run command is not implemented. Trusted workloads only; this is not a security sandbox.
 
+See the [implementation gaps and stable-release gates](docs/implementation-gaps.md)
+for supported features, missing compatibility, known performance blockers and
+validation still required.
+
 Download the offline `.deb` or portable archive from [GitHub Releases](https://github.com/kodxana/Runpod-Weld/releases/latest). See [installation and release notes](docs/releases/v0.1.0.md). Weld is licensed under [Apache-2.0](LICENSE); bundled dependencies retain their original licenses.
 
 ## Build, tag and publish
@@ -463,12 +467,15 @@ Each completed instruction remains durably cached. Low descriptor budgets fall
 back to full verification. This applies to the concrete CLI control path under
 the existing cooperative store/trusted-RUN contract; callback-based library APIs
 remain conservative. See [the publication-session contract](docs/publication-session-implementation.md).
+Managed single-COPY checkpoints also use bounded write evidence to reuse untouched
+payload hashes and committed inherited layers; see [the COPY reuse contract](docs/copy-checkpoint-reuse.md).
 
 A balanced 16-build Pod comparison measured cold builds at 48.9 → 32.4 seconds
 (33.6% less time) for a 1 GiB dependency plus 2,048 small files. Application-edit
 wall time was mixed, including a 53-second run with a blocked startup interval;
 its median was worse. All output checks passed. See [raw measurements and limits](docs/managed-session-performance.md);
-the full Nemotron image has not been remeasured with this change.
+the later [real Nemotron run](docs/real-nemotron-5860971.md) reached its one-hour
+cold-build cap during final export. Warm/edit and final-image acceptance did not run.
 
 With `--no-cache`, intermediate stages used only by `COPY --from` retain their
 owned filesystem without baseline inventory, image serialization, or checkpoint
@@ -699,8 +706,9 @@ Multiple heredocs, mixed inline/local COPY sources, COPY --from with inline
 contents, command-bearing RUN (`RUN cat <<EOF` or `RUN <<EOF bash`), fd-prefixed
 heredocs, bare RUN shebangs, ADD/ONBUILD heredocs and non-identifier delimiters
 are explicitly unsupported. Other `<<` occurrences retain the existing
-fail-closed restriction, including quoted literals. Parser directives remain
-outside the parser's supported profile. RUN CRLF scripts may fail in their
+fail-closed restriction, including quoted literals. Parser directives other than
+the exact first-line `# syntax=docker/dockerfile:1` declaration remain unsupported.
+RUN CRLF scripts may fail in their
 selected shell just as they do in Docker; Weld does not normalize them.
 
 Semantics were checked against the [Dockerfile reference](https://docs.docker.com/reference/dockerfile/#here-documents),

@@ -164,8 +164,7 @@ fn gzip_cli_preserves_prefix_cache_modes_and_independent_public_blobs() {
     index["manifests"][0]["digest"] = json!(digest);
     index["manifests"][0]["size"] = json!(bytes.len());
     fs::write(base.join("index.json"), serde_json::to_vec(&index).unwrap()).unwrap();
-    let source =
-        "FROM fixture\nCOPY app /app\nENV GREETING=hello\nLABEL purpose=gzip\nCMD [\"/app\"]\n";
+    let source = "FROM fixture\nCOPY app /app\nCOPY app /app-copy\nENV GREETING=hello\nLABEL purpose=gzip\nCMD [\"/app\"]\n";
     fs::write(context.join("Dockerfile"), source).unwrap();
     let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
     for path in [&context, &context.join("Dockerfile"), &context.join("app")] {
@@ -249,6 +248,10 @@ fn gzip_cli_preserves_prefix_cache_modes_and_independent_public_blobs() {
             replay(&output, &root, temp.path());
             assert_eq!(fs::read(root.join("base")).unwrap(), vec![17; 1 << 20]);
             assert_eq!(fs::read(root.join("app")).unwrap(), b"application payload");
+            assert_eq!(
+                fs::read(root.join("app-copy")).unwrap(),
+                b"application payload"
+            );
             let app = fs::metadata(root.join("app")).unwrap();
             assert_eq!((app.atime(), app.mtime()), (2_000_000_001, 2_000_000_000));
             assert_eq!(config["config"]["Env"], json!(["GREETING=hello"]));

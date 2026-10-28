@@ -131,6 +131,34 @@ pub struct Summary {
     pub(crate) targets: Vec<Vec<u8>>,
 }
 
+/// Records physical payload writes, not a filesystem inventory. Metadata and
+/// hardlink topology must still be observed after COPY. Only the closed managed
+/// engine may use this across an otherwise mutation-free checkpoint boundary.
+#[cfg(target_os = "linux")]
+pub(crate) struct CopyWrites<'baseline> {
+    baseline: &'baseline crate::export::Baseline,
+    files: std::collections::BTreeSet<(u64, u64)>,
+}
+
+#[cfg(target_os = "linux")]
+impl CopyWrites<'_> {
+    pub(crate) fn validate_root(
+        &self,
+        baseline: &crate::export::Baseline,
+        root: &std::fs::Metadata,
+    ) -> io::Result<()> {
+        if !std::ptr::eq(self.baseline, baseline) {
+            return Err(io::Error::other("COPY checkpoint baseline changed"));
+        }
+        baseline.validate_copy_root(root)
+    }
+
+    pub(crate) fn contains(&self, file: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.files.contains(&(file.dev(), file.ino()))
+    }
+}
+
 // Reuse execution's resolved destination roots, which may depend on earlier RUNs
 // or image symlinks. Rewalk sources so ignored entries still consume budgets.
 pub(crate) fn validate_copy_budget(
@@ -334,6 +362,7 @@ pub(crate) fn copy_filtered_checked(
             policy,
             options,
             admission,
+            None,
             &cancelled,
         )
     }
@@ -352,6 +381,55 @@ pub(crate) fn copy_filtered_checked(
         );
         Err(Error::Unsupported("local COPY requires Linux"))
     }
+}
+
+/// Record one closed COPY interval against a continuously pinned baseline.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_managed<'baseline>(
+    context_root: &Path,
+    image_root: &Path,
+    sources: &[&str],
+    destination: &str,
+    limits: Limits,
+    policy: Option<&Policy>,
+    options: CopyOptions<'_>,
+    baseline: &'baseline crate::export::Baseline,
+    resources: Option<&crate::build_resources::Policy>,
+    control: &crate::managed_control::ManagedControl<'_>,
+) -> Result<(Summary, Option<CopyWrites<'baseline>>), Error> {
+    let mut writes = baseline.has_copy_root().then(|| CopyWrites {
+        baseline,
+        files: std::collections::BTreeSet::new(),
+    });
+    let admission = |bytes, inodes| {
+        resources.map_or(Ok(()), |policy| {
+            policy
+                .recheck(
+                    "COPY prepared allocation",
+                    &[crate::build_resources::Requirement {
+                        path: image_root.to_owned(),
+                        bytes,
+                        inodes,
+                    }],
+                )
+                .map_err(|e| Error::Io(io::Error::other(e)))
+        })
+    };
+    let stop: &dyn Fn() -> bool = &|| control.poll();
+    let summary = linux::copy(
+        context_root,
+        image_root,
+        sources,
+        destination,
+        limits,
+        policy,
+        options,
+        resources.map(|_| &admission as &dyn Fn(u64, u64) -> _),
+        writes.as_mut(),
+        &stop,
+    )?;
+    Ok((summary, writes))
 }
 
 #[cfg(target_os = "linux")]
@@ -1766,10 +1844,14 @@ mod linux {
         policy: Option<&Policy>,
         options: CopyOptions<'_>,
         admission: Option<&dyn Fn(u64, u64) -> Result<(), Error>>,
+        mut record: Option<&mut CopyWrites<'_>>,
         c: &impl Fn() -> bool,
     ) -> Result<Summary, Error> {
         let ctx = root(ctx)?;
         let image = root(image)?;
+        if let Some(record) = record.as_ref() {
+            record.validate_root(record.baseline, &image.metadata()?)?;
+        }
         let (mut plan, owner) = prepare_copy(
             &ctx,
             &image,
@@ -1941,6 +2023,11 @@ mod linux {
                 )?;
                 if !out.metadata()?.is_file() {
                     return Err(Error::Invalid("destination is not regular"));
+                }
+                if let Some(record) = record.as_mut() {
+                    let metadata = out.metadata()?;
+                    // Bounded by prepared entries (already charged 512 bytes each).
+                    record.files.insert((metadata.dev(), metadata.ino()));
                 }
                 out.set_len(0)?;
                 let mut left = e.size;
