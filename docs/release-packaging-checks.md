@@ -1,5 +1,9 @@
 # Offline Linux package checks
 
+The later [exact-commit candidate validation](stable-candidate-validation.md)
+records a successful GitHub packaging workflow, TLS push/pull and temporary Pod
+acceptance at `5860971`, including downloadable workflow artifacts and hashes.
+
 The packaging gate checks both the portable archive and Debian installation in
 fresh `python:3.12-bookworm` containers, with networking disabled and no system
 Skopeo. The image must already be present: the gate uses `--pull never` and does

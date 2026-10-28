@@ -1,5 +1,9 @@
 # Managed checkpoint reuse on a Pod
 
+The subsequent [startup diagnostic validation](stable-candidate-validation.md)
+passed eight exact-candidate Pod builds. No qualifying startup stall was captured;
+that single-candidate run does not replace the balanced comparison below.
+
 Cold builds used **33.6% less elapsed time** (1.51× speed ratio) in this
 balanced, same-Pod comparison. Both execution orders improved. Application-edit
 wall time was mixed: one candidate run took 53 seconds, so its two-run median

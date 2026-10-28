@@ -1,0 +1,210 @@
+{
+  "revision": "586097166166fb4849e3102be802d0d0cc585284",
+  "date": "2026-10-28",
+  "scope": "candidate validation; no release publication, no baseline comparison, no full Nemotron build",
+  "github": {
+    "revision": "586097166166fb4849e3102be802d0d0cc585284",
+    "run_id": 40669087130,
+    "run_url": "https://github.com/kodxana/Runpod-Weld/actions/runs/40669087130",
+    "status": "success",
+    "publish": "skipped",
+    "standard": {
+      "passed": 671,
+      "failed": 0,
+      "ignored": 62
+    },
+    "runtime": {
+      "passed": 14,
+      "failed": 0,
+      "ignored": 0
+    },
+    "artifact_id": 12807694820,
+    "artifact_zip_sha256": "2ab9885079eaebaaf8400b9f0fc3e7d162a8932e7db89d0b1375c377c8f415bf",
+    "checks": [
+      "fmt",
+      "strict clippy",
+      "rustdoc",
+      "offline portable/deb installation",
+      "gzip/cache/mount package checks",
+      "registry preflight HTTPS per package",
+      "full authenticated TLS push/pull",
+      "corresponding sources",
+      "final checksums"
+    ]
+  },
+  "artifacts": {
+    "status": "PASS",
+    "archive_sha256": "2ab9885079eaebaaf8400b9f0fc3e7d162a8932e7db89d0b1375c377c8f415bf",
+    "files": {
+      "rpweld-0.1.0-linux-amd64.tar.gz": "5e35862cc4f3ea5d7ac1556a4c331198e5f3aefdeaca89ceb8aff76ec64f8d81",
+      "rpweld_0.1.0_amd64.deb": "0768c315d199587245d043c97355afd826bfcee9976cd91dbe0811ea62adaf19",
+      "build-info.json": "aa0230ea78510650f16f1fa733bbfa691799b53137f675a205525d11f3780e38",
+      "rpweld-0.1.0-sources.tar.xz": "99cb2859eb2005841fe37de291fb0b5ce02bd074f2ffd577caf7e1e5748b8d32"
+    },
+    "build_info_keys": [
+      "version",
+      "commit",
+      "target",
+      "crt_static",
+      "rustc",
+      "skopeo",
+      "source_date_epoch",
+      "distribution",
+      "packages",
+      "crates",
+      "files"
+    ]
+  },
+  "ci_binary_sha256": "e095208dca1146c0d60f5f03b97e75369695601fe1373d48691077c67a0d1c8c",
+  "pod_binary_sha256": "5bd0d35c8b5a03c4af951d258b633cc9fba58c5269ae6e121debe0d6d5e037d9",
+  "binary_provenance_note": "Separate static builds of the same source revision; no bit-for-bit reproducibility claim.",
+  "pod": {
+    "id": "g2tsqlfvc4nqvp",
+    "shape": "Secure cpu3g, 8 vCPU / 32 GB, EU-RO-1, 80 GB ephemeral disk",
+    "fixture": "1024 MiB deterministic incompressible dependency + 2048 small files; three COPY/RUN pairs",
+    "storage": "overlay with XFS host container mounts and md0 I/O observed during synced write probe",
+    "supervisor": {
+      "accepted_builds": 8,
+      "adopted_children_reaped": [],
+      "delete_deadline_utc": "2026-10-28T10:56:31.479000+00:00",
+      "elapsed_seconds": 346.12858217098983,
+      "experiment_deadline_utc": "2026-10-28T10:38:24.234384+00:00",
+      "finished_at": "2026-10-28T10:24:25.363284+00:00",
+      "maximum_builds": 8,
+      "maximum_experiment_seconds": 1200,
+      "partial_logs_preserved": true,
+      "per_build_seconds": 300,
+      "pod_id": "g2tsqlfvc4nqvp",
+      "speed_claim": false,
+      "started_at": "2026-10-28T10:18:39.235322+00:00",
+      "status": "PASS"
+    },
+    "evidence": {
+      "verification": "PASS",
+      "files": 115,
+      "sha256": "671ea00c1967fb1bf7ce57e1668ff439587f4fc9a64972e07e6ee63cd559dc56",
+      "bytes": 1938126
+    },
+    "observer_unit_tests": {
+      "expected_tests": 12,
+      "scope": "unit tests including synthetic samples; not real builder defect evidence",
+      "status": "PASS"
+    },
+    "capability_probe": {
+      "capture": {
+        "status": "sampled",
+        "syscall": {
+          "access": "observed",
+          "number": 230,
+          "status": "observed"
+        },
+        "wchan": {
+          "access": "observed",
+          "status": "observed",
+          "symbol": "hrtimer_nanosleep"
+        }
+      },
+      "child_state": "S",
+      "euid": 0,
+      "real_stall": false,
+      "scope": "harmless sleeping child capability probe"
+    },
+    "observations": [
+      {
+        "repetition": 0,
+        "case": "cold",
+        "wall_seconds": 30.05368911899859,
+        "cpu_user_seconds": 23.966641,
+        "cpu_system_seconds": 5.437395,
+        "returncode": 0,
+        "stall_diagnostics": []
+      },
+      {
+        "repetition": 0,
+        "case": "warm",
+        "wall_seconds": 4.151864284009207,
+        "cpu_user_seconds": 3.089186,
+        "cpu_system_seconds": 0.7838229999999999,
+        "returncode": 0,
+        "stall_diagnostics": []
+      },
+      {
+        "repetition": 0,
+        "case": "app-edit",
+        "wall_seconds": 25.234839730954263,
+        "cpu_user_seconds": 21.786647,
+        "cpu_system_seconds": 3.131713,
+        "returncode": 0,
+        "stall_diagnostics": []
+      },
+      {
+        "repetition": 0,
+        "case": "no-cache",
+        "wall_seconds": 4.019048918969929,
+        "cpu_user_seconds": 2.594608,
+        "cpu_system_seconds": 1.206268,
+        "returncode": 0,
+        "stall_diagnostics": []
+      },
+      {
+        "repetition": 1,
+        "case": "cold",
+        "wall_seconds": 30.37101968395291,
+        "cpu_user_seconds": 24.236699,
+        "cpu_system_seconds": 5.52619,
+        "returncode": 0,
+        "stall_diagnostics": []
+      },
+      {
+        "repetition": 1,
+        "case": "warm",
+        "wall_seconds": 3.9410214989911765,
+        "cpu_user_seconds": 3.010825,
+        "cpu_system_seconds": 0.7509509999999999,
+        "returncode": 0,
+        "stall_diagnostics": []
+      },
+      {
+        "repetition": 1,
+        "case": "app-edit",
+        "wall_seconds": 25.052469964022748,
+        "cpu_user_seconds": 21.725247,
+        "cpu_system_seconds": 3.055281,
+        "returncode": 0,
+        "stall_diagnostics": []
+      },
+      {
+        "repetition": 1,
+        "case": "no-cache",
+        "wall_seconds": 3.939588629989885,
+        "cpu_user_seconds": 2.5527509999999998,
+        "cpu_system_seconds": 1.150845,
+        "returncode": 0,
+        "stall_diagnostics": []
+      }
+    ],
+    "median_wall_seconds": {
+      "cold": 30.21235440147575,
+      "warm": 4.046442891500192,
+      "app-edit": 25.143654847488506,
+      "no-cache": 3.979318774479907
+    },
+    "final_root_counters": "present in all 8 zombie samples",
+    "checks": [
+      "independent OCI replay and metadata/content/config parity",
+      "source immutability",
+      "cache prefix preservation",
+      "public inode isolation",
+      "two deliberate output mutation probes",
+      "identical OCI bytes across repetitions"
+    ],
+    "teardown": {
+      "delete_status": 204,
+      "get_status": 404,
+      "complete_inventory": [],
+      "reminder_deleted": true,
+      "observed_utc": "2026-10-28T10:25:26Z"
+    },
+    "previous_stall": "No qualifying D-state stall captured in this sample; previous cause remains unknown."
+  }
+}
