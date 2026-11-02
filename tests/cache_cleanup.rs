@@ -291,64 +291,58 @@ fn every_entry_and_object_crash_boundary_recovers_deletion_only() {
             let journal = f.store.join("cache-v2/retirement.json");
             let armed = Cell::new(false);
             let hit = Cell::new(false);
-            let r = cleanup_apply::apply(
-                &f.store,
-                cleanup_plan::Request::CachePrune,
-                Default::default(),
-                || {
-                    let Ok(bytes) = fs::read(&journal) else {
-                        if phase == 5 && armed.get() {
-                            hit.set(true);
-                            return true;
-                        }
-                        return false;
-                    };
-                    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                    if j["kind"] != kind {
-                        return false;
+            let r = f.prune_with(|| {
+                let Ok(bytes) = fs::read(&journal) else {
+                    if phase == 5 && armed.get() {
+                        hit.set(true);
+                        return true;
                     }
-                    armed.set(true);
-                    let key = j["key"].as_str().unwrap();
-                    let parent = if kind == "entry" {
-                        "entries"
-                    } else {
-                        "objects"
-                    };
-                    let source = f.store.join("cache-v2").join(parent).join(key);
-                    let retired = f
-                        .store
-                        .join("cache-v2")
-                        .join(parent)
-                        .join(format!(".retire-{key}"));
-                    let stop = if kind == "entry" {
-                        let count = fs::read_dir(retired.join("blobs/sha256"))
-                            .map(|d| d.count())
-                            .unwrap_or(0);
-                        match phase {
-                            0 => source.exists(),
-                            1 => retired.exists() && count == 3,
-                            2 => retired.exists() && count > 0 && count < 3,
-                            3 => retired.exists() && count == 0,
-                            4 => !source.exists() && !retired.exists(),
-                            _ => false,
-                        }
-                    } else {
-                        let pool = f.store.join("cache-v2/content/blobs/sha256").join(key);
-                        let anchor = retired.join("blobs/sha256").join(key);
-                        match phase {
-                            0 => source.exists() && pool.exists(),
-                            1 => source.exists() && !pool.exists(),
-                            2 => retired.exists() && anchor.exists(),
-                            3 => retired.exists() && !anchor.exists(),
-                            4 => !source.exists() && !retired.exists(),
-                            _ => false,
-                        }
-                    };
-                    hit.set(stop);
-                    stop
-                },
-            )
-            .unwrap();
+                    return false;
+                };
+                let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                if j["kind"] != kind {
+                    return false;
+                }
+                armed.set(true);
+                let key = j["key"].as_str().unwrap();
+                let parent = if kind == "entry" {
+                    "entries"
+                } else {
+                    "objects"
+                };
+                let source = f.store.join("cache-v2").join(parent).join(key);
+                let retired = f
+                    .store
+                    .join("cache-v2")
+                    .join(parent)
+                    .join(format!(".retire-{key}"));
+                let stop = if kind == "entry" {
+                    let count = fs::read_dir(retired.join("blobs/sha256"))
+                        .map(|d| d.count())
+                        .unwrap_or(0);
+                    match phase {
+                        0 => source.exists(),
+                        1 => retired.exists() && count == 3,
+                        2 => retired.exists() && count > 0 && count < 3,
+                        3 => retired.exists() && count == 0,
+                        4 => !source.exists() && !retired.exists(),
+                        _ => false,
+                    }
+                } else {
+                    let pool = f.store.join("cache-v2/content/blobs/sha256").join(key);
+                    let anchor = retired.join("blobs/sha256").join(key);
+                    match phase {
+                        0 => source.exists() && pool.exists(),
+                        1 => source.exists() && !pool.exists(),
+                        2 => retired.exists() && anchor.exists(),
+                        3 => retired.exists() && !anchor.exists(),
+                        4 => !source.exists() && !retired.exists(),
+                        _ => false,
+                    }
+                };
+                hit.set(stop);
+                stop
+            });
             assert!(hit.get(), "unreached {kind}/{phase}: {r:#?}");
             assert_eq!(r.status, "failed", "{kind}/{phase}: {r:#?}");
             assert!(r.failure.as_deref().unwrap().contains("cancel"), "{r:#?}");
