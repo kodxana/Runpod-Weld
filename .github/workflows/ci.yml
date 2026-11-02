@@ -44,6 +44,8 @@ jobs:
       - run: python3 tests/compatibility.py --self-test
       - name: Check offline package validation assertions
         run: python3 -B -m unittest discover -s tests -p test_release_package.py
+      - name: Check Linux image validator path handling
+        run: python3 -B -m unittest discover -s tests/fixtures/nemotron -p test_paths.py
       - name: Check bounded process diagnostics
         # Final /proc counters for the terminated child require root.
         run: sudo python3 -B -m unittest discover -s tests/fixtures/v02-performance -p test_proc_stall.py

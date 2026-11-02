@@ -51,6 +51,8 @@ jobs:
             cargo test --locked --test managed_control --test run_mounts_cli --test worker_cli -- --include-ignored --test-threads=1
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo doc --locked --no-deps
+      - name: Check Linux image validator path handling
+        run: python3 -B -m unittest discover -s tests/fixtures/nemotron -p test_paths.py
       - name: Build static Weld, offline archive and Debian package
         run: bash scripts/release-linux.sh "$RUNNER_TEMP/artifacts"
       - name: Offline installation, nonroot RUN and bundled registry checks
