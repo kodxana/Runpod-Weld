@@ -1,0 +1,498 @@
+{
+  "revision": "45a398d5212c2eee64a2195a38e0fb103ab1185f",
+  "version": "0.2.0",
+  "date": "2026-11-02",
+  "release_decision": "withhold",
+  "reason": "Cold build exceeded the fixed 3600-second gate during final stage checkpoint verification.",
+  "ci_run": 41501191014,
+  "artifact_workflow_run": 41501233402,
+  "ci_pass": true,
+  "artifact_checks_pass": true,
+  "artifact_publish_job": "skipped",
+  "package": {
+    "status": "PASS",
+    "revision": "45a398d5212c2eee64a2195a38e0fb103ab1185f",
+    "workflow_run": 41501233402,
+    "zip_sha256": "0ad86c123d9ad2831efc474e6f80edc43b4ca7a23de62b9131a9e14fae9c5d0c",
+    "files": {
+      "rpweld-0.2.0-linux-amd64.tar.gz": "6709b4fc7383f9248446401e4dbc05241371268dabae4d15c08b424934a52376",
+      "rpweld_0.2.0_amd64.deb": "ef4fd279816273202787f37f44328267d02162eb0c2075b62d36a6bb1797d99f",
+      "build-info.json": "bcb3db63cd183477b08038f92017e8567191dd9dcb53fb64146f395107326fcf",
+      "rpweld-0.2.0-sources.tar.xz": "bf0335f7ee974233d746b57bb198e39904dbea2b8ef2b5bf34aacc35f6a824ba"
+    },
+    "binary_sha256": "68671f7f25eb7a725504cc96b6f2dcbbce6bcc94917110b691ef12493423e86b",
+    "package_files": 180,
+    "package_directories": 68,
+    "package_bytes": 52092100,
+    "portable_prefix": "rpweld-0.2.0-linux-amd64/"
+  },
+  "runner_sha256": "44b20ffc430218bc908016167a9ad4c9d46193867df76cfe319b16742fcb8736",
+  "runner_code_seal_sha256": "ba200221aca8f46a26aeaf3ba763f8a7cd88e4e8b8abda59096411883db51f58",
+  "source_commit": "91ee1316e21f624082c90cc07fcbbec1d9499550",
+  "source_archive_sha256": "13d7ef64e39070a3e4f64b74597a66627d2837aed0edc112b40336ffa31a81e0",
+  "validation_mode": "correctness",
+  "correctness_pass": false,
+  "accepted_phases": [],
+  "warm_attempted": false,
+  "edit_attempted": false,
+  "oracle_executed": false,
+  "gpu_inference_tested": false,
+  "benchmark_complete": false,
+  "metrics_complete": false,
+  "cold": {
+    "wall_seconds": 3600.103993797209,
+    "timed_out": true,
+    "returncode": 2,
+    "wait4_reaped": true,
+    "cpu_user_seconds": 1787.444816,
+    "cpu_system_seconds": 2158.863865,
+    "maxrss_kib": 2858184,
+    "rusage_input_blocks": 40262208,
+    "rusage_output_blocks": 1003863512,
+    "proc_io": null,
+    "proc_io_error": {
+      "errno": 13,
+      "type": "PermissionError"
+    },
+    "allocated_retained": {
+      "allocated_bytes": 345963044864,
+      "logical_bytes": 899223880616,
+      "unique_inodes": 521080
+    }
+  },
+  "proc_samples": 7125,
+  "stall_diagnostic_snapshots": 0,
+  "timing_scopes": [
+    {
+      "scope": "Waiting for base cache lock:",
+      "status": "DONE",
+      "seconds": 0.0
+    },
+    {
+      "scope": "Verifying downloaded base image:",
+      "status": "DONE",
+      "seconds": 7.562
+    },
+    {
+      "scope": "Storing and verifying base cache blobs:",
+      "status": "DONE",
+      "seconds": 26.505
+    },
+    {
+      "scope": "Verifying base cache publication:",
+      "status": "DONE",
+      "seconds": 7.177
+    },
+    {
+      "scope": "  Capturing verified base filesystem:",
+      "status": "DONE",
+      "seconds": 43.385
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 66.141
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 7.502
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 60.809
+    },
+    {
+      "scope": "[stage 1 instruction 1] FROM",
+      "status": "DONE",
+      "seconds": 138.72
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 48.528
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.442
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.343
+    },
+    {
+      "scope": "[stage 1 instruction 3] WORKDIR",
+      "status": "DONE",
+      "seconds": 53.782
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 33.071
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.437
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.348
+    },
+    {
+      "scope": "[stage 1 instruction 5] COPY",
+      "status": "DONE",
+      "seconds": 38.356
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 62.553
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 6.092
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 12.393
+    },
+    {
+      "scope": "[stage 1 instruction 6] RUN",
+      "status": "DONE",
+      "seconds": 153.406
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 32.156
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.422
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.338
+    },
+    {
+      "scope": "[stage 1 instruction 7] COPY",
+      "status": "DONE",
+      "seconds": 37.253
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 54.387
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 1.927
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 2.93
+    },
+    {
+      "scope": "[stage 1 instruction 8] RUN",
+      "status": "DONE",
+      "seconds": 118.109
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 36.521
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.536
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.414
+    },
+    {
+      "scope": "[stage 1 instruction 9] COPY",
+      "status": "DONE",
+      "seconds": 42.157
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 36.911
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.527
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.39
+    },
+    {
+      "scope": "[stage 1 instruction 10] COPY",
+      "status": "DONE",
+      "seconds": 43.158
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 33.362
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.069
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.138
+    },
+    {
+      "scope": "[stage 1 instruction 11] COPY",
+      "status": "DONE",
+      "seconds": 38.465
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 35.329
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.499
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.396
+    },
+    {
+      "scope": "[stage 1 instruction 12] COPY",
+      "status": "DONE",
+      "seconds": 40.906
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 50.57
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.609
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.511
+    },
+    {
+      "scope": "[stage 1 instruction 13] RUN",
+      "status": "DONE",
+      "seconds": 58.956
+    },
+    {
+      "scope": "  Publishing stage image (export or verified cache reuse):",
+      "status": "DONE",
+      "seconds": 4.302
+    },
+    {
+      "scope": "  Verifying stage checkpoint (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 9.031
+    },
+    {
+      "scope": "Stage 1/3:",
+      "status": "DONE",
+      "seconds": 1208.295
+    },
+    {
+      "scope": "  Capturing verified base filesystem:",
+      "status": "DONE",
+      "seconds": 46.831
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 72.576
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 9.825
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 52.971
+    },
+    {
+      "scope": "[stage 2 instruction 1] FROM",
+      "status": "DONE",
+      "seconds": 140.057
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 35.532
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.492
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.396
+    },
+    {
+      "scope": "[stage 2 instruction 2] COPY",
+      "status": "DONE",
+      "seconds": 41.603
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 195.507
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 64.714
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 157.578
+    },
+    {
+      "scope": "[stage 2 instruction 3] RUN",
+      "status": "DONE",
+      "seconds": 532.461
+    },
+    {
+      "scope": "  Publishing stage image (export or verified cache reuse):",
+      "status": "DONE",
+      "seconds": 12.674
+    },
+    {
+      "scope": "  Verifying stage checkpoint (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 26.136
+    },
+    {
+      "scope": "Stage 2/3:",
+      "status": "DONE",
+      "seconds": 1458.223
+    },
+    {
+      "scope": "  Capturing verified base filesystem:",
+      "status": "DONE",
+      "seconds": 47.209
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 206.801
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 76.709
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 210.45
+    },
+    {
+      "scope": "[stage 3 instruction 4] COPY",
+      "status": "DONE",
+      "seconds": 528.323
+    },
+    {
+      "scope": "  Exporting instruction checkpoint:",
+      "status": "DONE",
+      "seconds": 34.913
+    },
+    {
+      "scope": "  Verifying checkpoint delta (keeping working filesystem):",
+      "status": "DONE",
+      "seconds": 0.506
+    },
+    {
+      "scope": "  Publishing instruction cache:",
+      "status": "DONE",
+      "seconds": 0.416
+    },
+    {
+      "scope": "[stage 3 instruction 5] COPY",
+      "status": "DONE",
+      "seconds": 40.559
+    },
+    {
+      "scope": "  Publishing stage image (export or verified cache reuse):",
+      "status": "DONE",
+      "seconds": 143.32
+    },
+    {
+      "scope": "  Verifying stage checkpoint (keeping working filesystem):",
+      "status": "FAILED/INTERRUPTED",
+      "seconds": 11.384
+    },
+    {
+      "scope": "Stage 3/3:",
+      "status": "FAILED/INTERRUPTED",
+      "seconds": 867.547
+    }
+  ],
+  "timing_scope_warning": "Nested and sequential subphase observations; do not add to whole-build time or infer a matched speedup.",
+  "hardware": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "vcpus_allocated": 32,
+    "memory_gb_allocated": 250,
+    "ephemeral_disk_gb": 1000,
+    "region": "US-WA-1",
+    "filesystem": "overlay backed by local XFS/MD/PCI NVMe"
+  },
+  "collection": {
+    "pass": true,
+    "files": 18,
+    "bytes": 556322,
+    "sha256": "e553c4388e33e169cadaebe2687e76ff6edf8ce4cd2ba9685fa393c589df0ea7",
+    "omitted": []
+  },
+  "cleanup": {
+    "pod_id": "z1pno99yx11ce4",
+    "created_at": "2026-11-02T18:54:08.022Z",
+    "delete_requested_at": "2026-11-02 19:59:33 UTC",
+    "delete_status": 204,
+    "fresh_get_status": 404,
+    "complete_inventory_empty": true,
+    "verified_at": "2026-11-02 19:59:43 UTC",
+    "supervisor_survivors": [],
+    "schedule_exists": false,
+    "observed_lifecycle_seconds": 3924.9779999256134,
+    "estimated_compute_usd": 1.9515862832963466,
+    "estimated_disk_usd": 0.15142662036750051,
+    "cost_is_settled_bill": false
+  }
+}

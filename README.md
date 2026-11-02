@@ -10,6 +10,11 @@ validation still required.
 
 Download the offline `.deb` or portable archive from [GitHub Releases](https://github.com/kodxana/Runpod-Weld/releases/latest). See [installation and release notes](docs/releases/v0.1.0.md). Weld is licensed under [Apache-2.0](LICENSE); bundled dependencies retain their original licenses.
 
+The 0.2.0 candidate passed Linux CI and offline packaging, but publication is
+withheld: its real Nemotron cold build hit the one-hour limit during final
+checkpoint verification. Warm/edit and independent image acceptance did not run.
+See the [2026-11-02 release validation](docs/release-0.2.0-validation.md).
+
 ## Build, tag and publish
 
 ```sh

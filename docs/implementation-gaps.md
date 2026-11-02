@@ -6,6 +6,14 @@ tests and recorded validation, not an exhaustive Docker/BuildKit compatibility
 audit or a new benchmark. Source links below are pinned to that revision.
 Concurrent small-COPY performance work is outside this snapshot.
 
+Release follow-up, 2026-11-02: candidate `45a398d` now has the 0.2.0 identity
+and passed final Linux CI, offline package and authenticated registry gates.
+Its real cold build timed out during final checkpoint verification; no phase
+received independent image acceptance and warm/edit did not run. Publication is
+withheld. See the [exact candidate report](release-0.2.0-validation.md).
+This supersedes the historical missing-version statement below, while the
+real-workload gate and incomplete final I/O measurement remain unresolved.
+
 Follow-up: the managed COPY and inherited-payload reuse candidate passed
 [correctness validation and review](copy-checkpoint-validation.md) at `5204299e`.
 Its corrected [16-build Pod comparison](copy-checkpoint-performance.md) passed:
